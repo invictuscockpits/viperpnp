@@ -9,6 +9,8 @@ a complete change list, only those that may directly interest or affect users.
 
 ## Bug Fixes
 
+* Fix macOS camera permissions [PR 1955](https://github.com/openpnp/openpnp/pull/1955)
+
 
 # Version 2.5
 
