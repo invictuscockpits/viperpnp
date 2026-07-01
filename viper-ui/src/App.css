@@ -383,6 +383,85 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.board {
+  margin: 1.4rem 1.4rem 0;
+}
+
+.board-head {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.8rem;
+}
+
+.import-row {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+  flex: 1;
+  max-width: 640px;
+}
+
+.import-input {
+  flex: 1;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.85rem;
+  font-family: inherit;
+}
+
+.import-input:focus {
+  outline: none;
+  border-color: var(--green);
+}
+
+.board-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-left: auto;
+}
+
+.legend .dot-top,
+.legend .dot-bot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.legend .dot-top {
+  background: var(--green);
+}
+
+.legend .dot-bot {
+  background: #6db3ff;
+  margin-left: 10px;
+}
+
+.boardmap {
+  width: 100%;
+  height: 440px;
+  background: #0b0e12;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: block;
+}
+
 @media (max-width: 760px) {
   .grid {
     grid-template-columns: repeat(2, 1fr);

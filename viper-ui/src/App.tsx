@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { BoardMap, type Placement } from "./BoardMap";
 import "./App.css";
 
 interface DriverInfo {
@@ -37,6 +38,22 @@ interface Status {
   position: Position | null;
 }
 
+interface JobBoard {
+  name: string;
+  side: string;
+  placementCount: number;
+  placements: Placement[];
+}
+
+interface JobInfo {
+  loaded: boolean;
+  boardCount?: number;
+  placementCount?: number;
+  partCount?: number;
+  parts?: string[];
+  boards?: JobBoard[];
+}
+
 const STEPS = [0.1, 1, 10];
 
 function App() {
@@ -45,6 +62,12 @@ function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [step, setStep] = useState(1);
+  const [job, setJob] = useState<JobInfo | null>(null);
+  const [importPath, setImportPath] = useState(
+    "C:/dev/viperpnp/samples/kicad-example-F.Cu.pos",
+  );
+  const [importErr, setImportErr] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
   const loadInventory = useCallback(async () => {
@@ -58,6 +81,19 @@ function App() {
       setInventory(null);
     }
   }, []);
+
+  const loadJob = useCallback(async () => {
+    try {
+      const res = await fetch("/api/job");
+      setJob((await res.json()) as JobInfo);
+    } catch {
+      setJob(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadJob();
+  }, [loadJob]);
 
   useEffect(() => {
     let closed = false;
@@ -125,6 +161,28 @@ function App() {
       dc: ax === "c" ? d : 0,
       speed: 1.0,
     });
+  };
+
+  const doImport = async () => {
+    setImporting(true);
+    setImportErr(null);
+    try {
+      const res = await fetch("/api/import/kicad", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topFile: importPath }),
+      });
+      const data = await res.json();
+      if (data && (data.event === "error" || data.error)) {
+        setImportErr(String(data.message ?? data.error));
+      } else {
+        setJob(data as JobInfo);
+      }
+    } catch (e) {
+      setImportErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setImporting(false);
+    }
   };
 
   const pos = status?.position;
@@ -239,6 +297,51 @@ function App() {
             )}
           </section>
         </div>
+      )}
+
+      {online && (
+        <section className="board card">
+          <div className="board-head">
+            <h2>Board</h2>
+            <div className="import-row">
+              <input
+                className="import-input"
+                value={importPath}
+                onChange={(e) => setImportPath(e.currentTarget.value)}
+                placeholder="path to a KiCad .pos on the server"
+              />
+              <button
+                className="btn btn-primary"
+                onClick={doImport}
+                disabled={importing}
+              >
+                {importing ? "Importing…" : "Import KiCad"}
+              </button>
+            </div>
+          </div>
+          {importErr && <div className="banner banner-warn">{importErr}</div>}
+          {job?.loaded ? (
+            <>
+              <div className="board-summary">
+                <span className="tag">{job.boards?.[0]?.name}</span>
+                <span className="muted">
+                  {job.placementCount} placements · {job.partCount} parts
+                </span>
+                <span className="legend">
+                  <span className="dot-top" /> Top
+                  <span className="dot-bot" /> Bottom
+                </span>
+              </div>
+              <BoardMap
+                placements={(job.boards ?? []).flatMap((b) => b.placements)}
+              />
+            </>
+          ) : (
+            <div className="muted">
+              No board loaded. Import a KiCad .pos to see its placement map.
+            </div>
+          )}
+        </section>
       )}
 
       {inventory && (
