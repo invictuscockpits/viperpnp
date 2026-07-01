@@ -169,6 +169,16 @@ interface DriverInfo {
   tcpPort?: number;
 }
 
+interface ActuatorInfo {
+  id: string;
+  name: string;
+  mount: string;
+  type: string;
+  driver: string | null;
+  role?: string;
+  state?: boolean | null;
+}
+
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
 const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
 const IMPORT_FORMATS = [
@@ -439,6 +449,7 @@ function App() {
   const [machineCard, setMachineCard] = useState<string | null>(null);
   const [drivers, setDrivers] = useState<DriverInfo[]>([]);
   const [driverPorts, setDriverPorts] = useState<string[]>([]);
+  const [actuators, setActuators] = useState<ActuatorInfo[]>([]);
   const [reference, setReference] = useState("camera");
   const [tab, setTab] = useState<Tab>("board");
   const [feeders, setFeeders] = useState<FeederInfo[]>([]);
@@ -513,8 +524,28 @@ function App() {
     }
   }, []);
 
+  const loadActuators = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/actuators/detail")).json();
+      setActuators(d.actuators ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const actuate = (id: string, on: boolean) => {
+    fetch("/api/actuator", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target: id, on }),
+    })
+      .then(() => setTimeout(loadActuators, 400))
+      .catch(() => {});
+  };
+
   const openCard = (id: string) => {
     if (id === "connection") loadDrivers();
+    if (id === "actuators") loadActuators();
     setMachineCard(id);
   };
 
@@ -3447,7 +3478,80 @@ function App() {
         </div>
       )}
 
-      {machineCard && machineCard !== "connection" && (
+      {machineCard === "actuators" && (
+        <div className="modal-backdrop" onClick={() => setMachineCard(null)}>
+          <div
+            className="modal modal-wide"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3>Actuators &amp; I/O</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setMachineCard(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body plc-body">
+              <table className="ptable">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Wired to</th>
+                    <th>Mount</th>
+                    <th>Type</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {actuators.map((a) => (
+                    <tr key={a.id}>
+                      <td className="mono">{a.name}</td>
+                      <td className={a.role ? "" : "muted"}>{a.role ?? "—"}</td>
+                      <td className="muted">{a.mount}</td>
+                      <td className="muted">{a.type}</td>
+                      <td>
+                        {a.type === "Boolean" ? (
+                          <button
+                            className={`io-btn ${a.state ? "io-on" : ""}`}
+                            disabled={!enabled}
+                            onClick={() => actuate(a.id, !a.state)}
+                          >
+                            <span className="io-state">
+                              {a.state ? "ON" : "OFF"}
+                            </span>
+                          </button>
+                        ) : (
+                          <span className="muted">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {!enabled && (
+                <p className="confirm-text muted">
+                  Connect the machine to toggle actuators.
+                </p>
+              )}
+            </div>
+            <div className="modal-foot">
+              <button
+                className="btn btn-primary"
+                onClick={() => setMachineCard(null)}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {machineCard &&
+        machineCard !== "connection" &&
+        machineCard !== "actuators" && (
         <div className="modal-backdrop" onClick={() => setMachineCard(null)}>
           <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">

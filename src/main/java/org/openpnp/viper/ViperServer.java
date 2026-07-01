@@ -226,6 +226,8 @@ public class ViperServer {
         app.post("/api/job/board-origin", ViperServer::setBoardOriginFromPlacement);
         app.get("/api/drivers/detail", ViperServer::listDrivers);
         app.post("/api/driver", ViperServer::updateDriver);
+        app.get("/api/actuators/detail", ViperServer::listActuators);
+        app.post("/api/actuator", ViperServer::actuateActuator);
         app.get("/api/parts/detail", ViperServer::listPartsDetail);
         app.post("/api/part", ViperServer::updatePart);
         app.post("/api/part/add", ViperServer::addPart);
@@ -1040,6 +1042,114 @@ public class ViperServer {
         Integer baud;
         String ip;
         Integer tcpPort;
+    }
+
+    // -------------------------------------------------------- Actuators / IO
+
+    private static void putRole(Map<String, String> roles, Actuator a, String role) {
+        if (a != null) {
+            roles.putIfAbsent(a.getId(), role);
+        }
+    }
+
+    /** Maps each actuator id to what it's wired to (nozzle vacuum, camera light…). */
+    private static Map<String, String> actuatorRoles() {
+        Map<String, String> roles = new LinkedHashMap<>();
+        try {
+            for (Head h : machine.getHeads()) {
+                for (Nozzle n : h.getNozzles()) {
+                    if (n instanceof ReferenceNozzle) {
+                        ReferenceNozzle rn = (ReferenceNozzle) n;
+                        putRole(roles, rn.getVacuumActuator(), n.getName() + " vacuum");
+                        putRole(roles, rn.getVacuumSenseActuator(), n.getName() + " vacuum sense");
+                        putRole(roles, rn.getBlowOffActuator(), n.getName() + " blow-off");
+                    }
+                }
+                for (Camera c : h.getCameras()) {
+                    putRole(roles, c.getLightActuator(), c.getName() + " light");
+                }
+            }
+            for (Camera c : machine.getCameras()) {
+                putRole(roles, c.getLightActuator(), c.getName() + " light");
+            }
+        }
+        catch (Exception e) {
+            // best effort
+        }
+        return roles;
+    }
+
+    private static void addActuators(List<Map<String, Object>> out, List<Actuator> list,
+            String mount, Map<String, String> roles) {
+        for (Actuator a : list) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", a.getId());
+            m.put("name", a.getName());
+            m.put("mount", mount);
+            m.put("type", a.getValueType() != null ? a.getValueType().name() : "Boolean");
+            m.put("driver", a.getDriver() != null ? a.getDriver().getName() : null);
+            m.put("role", roles.get(a.getId()));
+            m.put("state", a.isActuated());
+            out.add(m);
+        }
+    }
+
+    /** Every actuator (machine + head) with its role and current state. */
+    private static Map<String, Object> describeActuators() {
+        Map<String, String> roles = actuatorRoles();
+        List<Map<String, Object>> out = new ArrayList<>();
+        addActuators(out, machine.getActuators(), "Machine", roles);
+        for (Head h : machine.getHeads()) {
+            addActuators(out, h.getActuators(), h.getName(), roles);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("actuators", out);
+        root.put("enabled", machine.isEnabled());
+        return root;
+    }
+
+    private static void listActuators(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        ctx.result(GSON.toJson(describeActuators()));
+    }
+
+    private static Actuator findActuator(String id) {
+        for (Actuator a : machine.getActuators()) {
+            if (a.getId().equals(id)) {
+                return a;
+            }
+        }
+        try {
+            for (Head h : machine.getHeads()) {
+                for (Actuator a : h.getActuators()) {
+                    if (a.getId().equals(id)) {
+                        return a;
+                    }
+                }
+            }
+        }
+        catch (Exception e) {
+            // ignore
+        }
+        return null;
+    }
+
+    /** POST /api/actuator — toggles a boolean actuator. Body: {id, on}. */
+    private static void actuateActuator(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        IoRequest req = GSON.fromJson(ctx.body(), IoRequest.class);
+        final Actuator a = req != null ? findActuator(req.target) : null;
+        if (a == null) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"actuator not found\"}");
+            return;
+        }
+        final boolean on = req.on;
+        machine.submit(() -> {
+            a.actuate(on);
+            return null;
+        }, broadcastCallback());
+        ctx.result("{\"submitted\":true}");
     }
 
     // --------------------------------------------------------- Part aliases
