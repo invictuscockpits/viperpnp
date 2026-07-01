@@ -651,6 +651,75 @@ body {
   color: #f0dca8;
 }
 
+.banner-ok {
+  border-color: #2a5a3a;
+  background: #16261c;
+  color: #a8e0bc;
+}
+
+.run-panel {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.run-panel-head {
+  font-size: 0.9rem;
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+
+.run-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.run-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.run-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  animation: run-pulse 1s ease-in-out infinite;
+}
+
+@keyframes run-pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.skip-list {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.82rem;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.skip-list li {
+  margin: 0.1rem 0;
+}
+
 .controls {
   display: grid;
   grid-template-columns: 1fr 1fr;

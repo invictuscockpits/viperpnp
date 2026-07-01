@@ -549,6 +549,13 @@ function App() {
     [],
   );
   const [addBoardSel, setAddBoardSel] = useState("");
+  const [jobRunning, setJobRunning] = useState(false);
+  const [jobStatus, setJobStatus] = useState("");
+  const [keepGoing, setKeepGoing] = useState(true);
+  const [jobSkipped, setJobSkipped] = useState<
+    { id: string; part: string | null; board: string }[] | null
+  >(null);
+  const [jobAborted, setJobAborted] = useState(false);
   const [editPlacement, setEditPlacement] = useState<Placement | null>(null);
   const [partsDetail, setPartsDetail] = useState<PartInfo[]>([]);
   const [packages, setPackages] = useState<PackageInfo[]>([]);
@@ -634,6 +641,8 @@ function App() {
     try {
       const d = await (await fetch("/api/jobs")).json();
       setJobs(d.jobs ?? []);
+      const st = await (await fetch("/api/job/state")).json();
+      setJobRunning(!!st.running);
     } catch {
       /* ignore */
     }
@@ -776,6 +785,32 @@ function App() {
         if (d.boards) applyJobBoards(d);
       })
       .catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
+  };
+
+  const runJob = async () => {
+    setJobErr("");
+    setJobSkipped(null);
+    try {
+      const res = await fetch("/api/job/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          errorHandling: keepGoing ? "Defer" : "Alert",
+        }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        setJobErr(d.error ?? "Could not start the job.");
+      }
+    } catch (e) {
+      setJobErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const abortJob = () => {
+    fetch("/api/job/abort", { method: "POST" }).catch((e) =>
+      setError(e instanceof Error ? e.message : String(e)),
+    );
   };
 
   const loadParts = useCallback(async () => {
@@ -1016,6 +1051,18 @@ function App() {
           setScanning(false);
         } else if (data && data.event === "config") {
           setConfigDirty(!!data.dirty);
+        } else if (data && data.event === "jobStarted") {
+          setJobRunning(true);
+          setJobSkipped(null);
+          setJobStatus(String(data.text ?? "Job started"));
+        } else if (data && data.event === "jobStatus") {
+          setJobStatus(String(data.text ?? ""));
+        } else if (data && data.event === "jobComplete") {
+          setJobRunning(false);
+          setJobStatus(data.aborted ? "Job aborted" : "Job complete");
+          setJobSkipped(data.skipped ?? []);
+          setJobAborted(!!data.aborted);
+          loadJobs();
         } else if (data && data.event === "error") {
           setError(String(data.message));
           setScanning(false);
@@ -1038,7 +1085,7 @@ function App() {
       }
       wsRef.current?.close();
     };
-  }, [loadInventory]);
+  }, [loadInventory, loadJobs]);
 
   const post = useCallback(async (path: string, body?: unknown) => {
     try {
@@ -2386,6 +2433,90 @@ function App() {
                   </table>
                 </div>
               )}
+
+              {(() => {
+                const active = jobs.find((j) => j.active);
+                if (!active) return null;
+                return (
+                  <div className="run-panel">
+                    <div className="run-panel-head">
+                      <span>
+                        Run <span className="mono">{active.name}</span> ·{" "}
+                        {active.boardCount} board
+                        {active.boardCount === 1 ? "" : "s"} ·{" "}
+                        {active.placementCount} placements
+                      </span>
+                      {!enabled && (
+                        <span className="muted">
+                          — machine offline; connect to run
+                        </span>
+                      )}
+                    </div>
+                    <div className="run-controls">
+                      {!jobRunning ? (
+                        <button
+                          className="btn btn-primary"
+                          onClick={runJob}
+                          disabled={
+                            !enabled || active.placementCount === 0
+                          }
+                        >
+                          ▶ Run job
+                        </button>
+                      ) : (
+                        <button className="btn btn-danger" onClick={abortJob}>
+                          ■ Abort
+                        </button>
+                      )}
+                      <label
+                        className="run-toggle"
+                        title="On a feeder fault, retry then skip the placement and keep going, instead of pausing the job."
+                      >
+                        <input
+                          type="checkbox"
+                          checked={keepGoing}
+                          disabled={jobRunning}
+                          onChange={(e) => setKeepGoing(e.currentTarget.checked)}
+                        />
+                        Keep going on feeder faults
+                      </label>
+                      {jobRunning && (
+                        <span className="run-live">
+                          <span className="run-dot" /> {jobStatus}
+                        </span>
+                      )}
+                    </div>
+                    {!jobRunning && jobStatus && jobSkipped !== null && (
+                      <div
+                        className={`banner ${
+                          jobAborted || jobSkipped.length > 0
+                            ? "banner-warn"
+                            : "banner-ok"
+                        }`}
+                      >
+                        {jobAborted
+                          ? "Job aborted. "
+                          : jobSkipped.length === 0
+                            ? "Job complete — all placements placed."
+                            : `Job complete — ${jobSkipped.length} placement${
+                                jobSkipped.length === 1 ? "" : "s"
+                              } skipped:`}
+                        {jobSkipped.length > 0 && (
+                          <ul className="skip-list">
+                            {jobSkipped.map((s) => (
+                              <li key={`${s.board}-${s.id}`}>
+                                <span className="mono">{s.id}</span>
+                                {s.part ? ` · ${s.part}` : ""} ·{" "}
+                                <span className="muted">{s.board}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </section>
           )}
 
