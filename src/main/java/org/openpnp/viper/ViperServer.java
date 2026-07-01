@@ -17,6 +17,7 @@ import org.openpnp.machine.photon.PhotonProperties;
 import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.machine.reference.ReferenceNozzle;
 import org.openpnp.machine.reference.ReferencePnpJobProcessor;
+import org.openpnp.machine.reference.camera.ReferenceCamera;
 import org.openpnp.machine.reference.driver.AbstractReferenceDriver;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
 import org.openpnp.machine.reference.feeder.ReferenceRotatedTrayFeeder;
@@ -228,6 +229,8 @@ public class ViperServer {
         app.post("/api/driver", ViperServer::updateDriver);
         app.get("/api/actuators/detail", ViperServer::listActuators);
         app.post("/api/actuator", ViperServer::actuateActuator);
+        app.get("/api/cameras/detail", ViperServer::listCameras);
+        app.post("/api/camera", ViperServer::updateCamera);
         app.get("/api/parts/detail", ViperServer::listPartsDetail);
         app.post("/api/part", ViperServer::updatePart);
         app.post("/api/part/add", ViperServer::addPart);
@@ -1042,6 +1045,112 @@ public class ViperServer {
         Integer baud;
         String ip;
         Integer tcpPort;
+    }
+
+    // ------------------------------------------------------------- Cameras
+
+    private static void addCameras(List<Map<String, Object>> out, List<Camera> list,
+            String mount) {
+        for (Camera c : list) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", c.getId());
+            m.put("name", c.getName());
+            m.put("mount", mount);
+            m.put("looking", c.getLooking() != null ? c.getLooking().name() : "Down");
+            m.put("width", c.getWidth());
+            m.put("height", c.getHeight());
+            Location upp = c.getUnitsPerPixel() != null
+                    ? c.getUnitsPerPixel().convertToUnits(LengthUnit.Millimeters) : null;
+            m.put("uppX", upp != null ? round(upp.getX()) : 0);
+            m.put("uppY", upp != null ? round(upp.getY()) : 0);
+            m.put("rotation", c instanceof ReferenceCamera
+                    ? round(((ReferenceCamera) c).getRotation()) : 0);
+            m.put("light", c.getLightActuator() != null ? c.getLightActuator().getName() : null);
+            out.add(m);
+        }
+    }
+
+    private static Map<String, Object> describeCameras() {
+        List<Map<String, Object>> out = new ArrayList<>();
+        addCameras(out, machine.getCameras(), "Machine");
+        try {
+            for (Head h : machine.getHeads()) {
+                addCameras(out, h.getCameras(), h.getName());
+            }
+        }
+        catch (Exception e) {
+            // best effort
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("cameras", out);
+        return root;
+    }
+
+    private static void listCameras(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        ctx.result(GSON.toJson(describeCameras()));
+    }
+
+    private static Camera findCamera(String id) {
+        for (Camera c : machine.getCameras()) {
+            if (c.getId().equals(id)) {
+                return c;
+            }
+        }
+        try {
+            for (Head h : machine.getHeads()) {
+                for (Camera c : h.getCameras()) {
+                    if (c.getId().equals(id)) {
+                        return c;
+                    }
+                }
+            }
+        }
+        catch (Exception e) {
+            // ignore
+        }
+        return null;
+    }
+
+    /** POST /api/camera — Body: {id, uppX?, uppY?, rotation?, looking?}. */
+    private static void updateCamera(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            CameraUpdate req = GSON.fromJson(ctx.body(), CameraUpdate.class);
+            Camera c = req != null ? findCamera(req.id) : null;
+            if (c == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"camera not found\"}");
+                return;
+            }
+            if (req.uppX != null || req.uppY != null) {
+                Location cur = c.getUnitsPerPixel().convertToUnits(LengthUnit.Millimeters);
+                c.setUnitsPerPixel(new Location(LengthUnit.Millimeters,
+                        req.uppX != null ? req.uppX : cur.getX(),
+                        req.uppY != null ? req.uppY : cur.getY(), 0, 0));
+            }
+            if (req.rotation != null && c instanceof ReferenceCamera) {
+                ((ReferenceCamera) c).setRotation(req.rotation);
+            }
+            if (req.looking != null) {
+                c.setLooking(Camera.Looking.valueOf(req.looking));
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describeCameras()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/camera. */
+    private static class CameraUpdate {
+        String id;
+        Double uppX;
+        Double uppY;
+        Double rotation;
+        String looking;
     }
 
     // -------------------------------------------------------- Actuators / IO

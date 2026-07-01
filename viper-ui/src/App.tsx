@@ -179,6 +179,19 @@ interface ActuatorInfo {
   state?: boolean | null;
 }
 
+interface CameraInfo {
+  id: string;
+  name: string;
+  mount: string;
+  looking: string;
+  width: number;
+  height: number;
+  uppX: number;
+  uppY: number;
+  rotation: number;
+  light: string | null;
+}
+
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
 const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
 const IMPORT_FORMATS = [
@@ -450,6 +463,7 @@ function App() {
   const [drivers, setDrivers] = useState<DriverInfo[]>([]);
   const [driverPorts, setDriverPorts] = useState<string[]>([]);
   const [actuators, setActuators] = useState<ActuatorInfo[]>([]);
+  const [cameras, setCameras] = useState<CameraInfo[]>([]);
   const [reference, setReference] = useState("camera");
   const [tab, setTab] = useState<Tab>("board");
   const [feeders, setFeeders] = useState<FeederInfo[]>([]);
@@ -543,9 +557,32 @@ function App() {
       .catch(() => {});
   };
 
+  const loadCameras = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/cameras/detail")).json();
+      setCameras(d.cameras ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const updateCamera = (id: string, patch: object) => {
+    fetch("/api/camera", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, ...patch }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.cameras) setCameras(d.cameras);
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
   const openCard = (id: string) => {
     if (id === "connection") loadDrivers();
     if (id === "actuators") loadActuators();
+    if (id === "cameras") loadCameras();
     setMachineCard(id);
   };
 
@@ -3549,9 +3586,89 @@ function App() {
         </div>
       )}
 
+      {machineCard === "cameras" && (
+        <div className="modal-backdrop" onClick={() => setMachineCard(null)}>
+          <div
+            className="modal modal-wide"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3>Cameras</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setMachineCard(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body plc-body">
+              {cameras.map((c) => (
+                <div key={c.id} className="teach-block">
+                  <div className="teach-head">
+                    <span className="mono">{c.name}</span> ·{" "}
+                    {c.looking === "Up" ? "Bottom (up)" : "Top (down)"} ·{" "}
+                    {c.mount} · {c.width}×{c.height} · light: {c.light ?? "—"}
+                  </div>
+                  <div className="field-grid">
+                    <label className="loc-field">
+                      <span>mm/px X</span>
+                      <NumberInput
+                        step={0.001}
+                        min={0}
+                        value={c.uppX}
+                        onChange={(v) => updateCamera(c.id, { uppX: v })}
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>mm/px Y</span>
+                      <NumberInput
+                        step={0.001}
+                        min={0}
+                        value={c.uppY}
+                        onChange={(v) => updateCamera(c.id, { uppY: v })}
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Rotation°</span>
+                      <NumberInput
+                        value={c.rotation}
+                        onChange={(v) => updateCamera(c.id, { rotation: v })}
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Looking</span>
+                      <select
+                        className="type-select"
+                        value={c.looking}
+                        onChange={(e) =>
+                          updateCamera(c.id, { looking: e.currentTarget.value })
+                        }
+                      >
+                        <option value="Down">Down (top)</option>
+                        <option value="Up">Up (bottom)</option>
+                      </select>
+                    </label>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="modal-foot">
+              <button
+                className="btn btn-primary"
+                onClick={() => setMachineCard(null)}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {machineCard &&
         machineCard !== "connection" &&
-        machineCard !== "actuators" && (
+        machineCard !== "actuators" &&
+        machineCard !== "cameras" && (
         <div className="modal-backdrop" onClick={() => setMachineCard(null)}>
           <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
