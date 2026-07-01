@@ -1447,6 +1447,37 @@ input[type="number"] {
   border-color: var(--green);
 }
 
+.path-field {
+  position: relative;
+  display: flex;
+  flex: 1;
+}
+
+.path-field .import-input {
+  width: 100%;
+  padding-right: 2rem;
+}
+
+.path-browse {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0.25rem;
+  border-radius: 4px;
+}
+
+.path-browse:hover {
+  color: var(--green);
+}
+
 .board-summary {
   display: flex;
   align-items: center;

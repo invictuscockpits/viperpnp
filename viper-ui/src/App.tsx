@@ -4,6 +4,7 @@ import {
   CameraIcon,
   CrosshairIcon,
   EyeIcon,
+  FolderIcon,
   GearIcon,
   NozzleIcon,
   SearchIcon,
@@ -487,6 +488,41 @@ function App() {
       speed,
       tool: reference,
     });
+  };
+
+  const pickBoardFile = async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const sel = await open({
+        multiple: false,
+        directory: false,
+        title: "Select a board file",
+        filters: [
+          {
+            name: "Board files",
+            extensions: ["pos", "csv", "mnt", "xml", "brd"],
+          },
+          { name: "All files", extensions: ["*"] },
+        ],
+      });
+      if (typeof sel === "string") setImportPath(sel);
+    } catch {
+      setImportErr("The file picker is only available in the desktop app.");
+    }
+  };
+
+  const pickSaveFolder = async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const sel = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose where to save the board file",
+      });
+      if (typeof sel === "string") setSavePath(sel);
+    } catch {
+      setImportErr("The folder picker is only available in the desktop app.");
+    }
   };
 
   const doImport = async () => {
@@ -1271,12 +1307,22 @@ function App() {
               <div className="board-head">
                 <h2>Boards</h2>
                 <div className="import-row">
-                  <input
-                    className="import-input"
-                    value={importPath}
-                    onChange={(e) => setImportPath(e.currentTarget.value)}
-                    placeholder="path to a board file on the server"
-                  />
+                  <div className="path-field">
+                    <input
+                      className="import-input"
+                      value={importPath}
+                      onChange={(e) => setImportPath(e.currentTarget.value)}
+                      placeholder="path to a board file on the server"
+                    />
+                    <button
+                      className="path-browse"
+                      onClick={pickBoardFile}
+                      title="Browse for a board file"
+                      aria-label="Browse for a board file"
+                    >
+                      <FolderIcon size={15} />
+                    </button>
+                  </div>
                   <div className="split-btn">
                     <button
                       className="btn btn-primary split-main"
@@ -1319,12 +1365,22 @@ function App() {
                 </div>
               </div>
               <div className="import-row save-row">
-                <input
-                  className="import-input"
-                  value={savePath}
-                  onChange={(e) => setSavePath(e.currentTarget.value)}
-                  placeholder="save to (default: config/boards) — folder or .board.xml path"
-                />
+                <div className="path-field">
+                  <input
+                    className="import-input"
+                    value={savePath}
+                    onChange={(e) => setSavePath(e.currentTarget.value)}
+                    placeholder="save to (default: config/boards) — folder or .board.xml path"
+                  />
+                  <button
+                    className="path-browse"
+                    onClick={pickSaveFolder}
+                    title="Browse for a save folder"
+                    aria-label="Browse for a save folder"
+                  >
+                    <FolderIcon size={15} />
+                  </button>
+                </div>
               </div>
               {boards.length > 0 && (
                 <div className="run-bar">
