@@ -1237,6 +1237,14 @@ input[type="number"] {
   width: 5.5rem;
 }
 
+.num-input.is-disabled {
+  opacity: 0.45;
+}
+
+.num-input.is-disabled > input {
+  cursor: not-allowed;
+}
+
 .num-spin {
   position: absolute;
   right: 5px;

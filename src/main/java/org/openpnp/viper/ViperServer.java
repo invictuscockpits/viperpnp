@@ -17,6 +17,7 @@ import org.openpnp.machine.photon.PhotonProperties;
 import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.machine.reference.ReferenceNozzle;
 import org.openpnp.machine.reference.ReferencePnpJobProcessor;
+import org.openpnp.machine.reference.axis.ReferenceControllerAxis;
 import org.openpnp.machine.reference.camera.ReferenceCamera;
 import org.openpnp.machine.reference.driver.AbstractReferenceDriver;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
@@ -36,6 +37,7 @@ import org.openpnp.model.Package;
 import org.openpnp.model.Part;
 import org.openpnp.model.Placement;
 import org.openpnp.spi.Actuator;
+import org.openpnp.spi.Axis;
 import org.openpnp.spi.Camera;
 import org.openpnp.spi.Driver;
 import org.openpnp.spi.Feeder;
@@ -234,6 +236,8 @@ public class ViperServer {
         app.get("/api/nozzles/detail", ViperServer::listNozzles);
         app.post("/api/nozzle", ViperServer::updateNozzle);
         app.post("/api/nozzletip", ViperServer::updateNozzleTip);
+        app.get("/api/axes/detail", ViperServer::listAxes);
+        app.post("/api/axis", ViperServer::updateAxis);
         app.get("/api/parts/detail", ViperServer::listPartsDetail);
         app.post("/api/part", ViperServer::updatePart);
         app.post("/api/part/add", ViperServer::addPart);
@@ -1186,6 +1190,109 @@ public class ViperServer {
         String name;
         String vacuum;
         String blowOff;
+    }
+
+    // -------------------------------------------------------- Motion & axes
+
+    private static double mm(Length l) {
+        if (l == null) {
+            return 0;
+        }
+        return l.convertToUnits(LengthUnit.Millimeters).getValue();
+    }
+
+    private static ReferenceControllerAxis findAxis(String id) {
+        for (Axis ax : machine.getAxes()) {
+            if (ax instanceof ReferenceControllerAxis && ax.getId().equals(id)) {
+                return (ReferenceControllerAxis) ax;
+            }
+        }
+        return null;
+    }
+
+    private static Map<String, Object> describeAxes() {
+        List<Map<String, Object>> axes = new ArrayList<>();
+        for (Axis ax : machine.getAxes()) {
+            if (!(ax instanceof ReferenceControllerAxis)) {
+                continue;
+            }
+            ReferenceControllerAxis a = (ReferenceControllerAxis) ax;
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", a.getId());
+            m.put("name", a.getName());
+            m.put("type", a.getType() != null ? a.getType().name() : null);
+            m.put("letter", a.getLetter());
+            m.put("driver", a.getDriver() != null ? a.getDriver().getName() : null);
+            m.put("feedrate", mm(a.getFeedratePerSecond()));
+            m.put("accel", mm(a.getAccelerationPerSecond2()));
+            m.put("jerk", mm(a.getJerkPerSecond3()));
+            m.put("limitLow", mm(a.getSoftLimitLow()));
+            m.put("limitLowOn", a.isSoftLimitLowEnabled());
+            m.put("limitHigh", mm(a.getSoftLimitHigh()));
+            m.put("limitHighOn", a.isSoftLimitHighEnabled());
+            axes.add(m);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("axes", axes);
+        return root;
+    }
+
+    private static void listAxes(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        ctx.result(GSON.toJson(describeAxes()));
+    }
+
+    /** POST /api/axis — Body: {id, feedrate?, accel?, jerk?, limitLow?, limitLowOn?, limitHigh?, limitHighOn?}. */
+    private static void updateAxis(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            AxisUpdate req = GSON.fromJson(ctx.body(), AxisUpdate.class);
+            ReferenceControllerAxis a = req != null ? findAxis(req.id) : null;
+            if (a == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"axis not found\"}");
+                return;
+            }
+            if (req.feedrate != null) {
+                a.setFeedratePerSecond(new Length(req.feedrate, LengthUnit.Millimeters));
+            }
+            if (req.accel != null) {
+                a.setAccelerationPerSecond2(new Length(req.accel, LengthUnit.Millimeters));
+            }
+            if (req.jerk != null) {
+                a.setJerkPerSecond3(new Length(req.jerk, LengthUnit.Millimeters));
+            }
+            if (req.limitLow != null) {
+                a.setSoftLimitLow(new Length(req.limitLow, LengthUnit.Millimeters));
+            }
+            if (req.limitLowOn != null) {
+                a.setSoftLimitLowEnabled(req.limitLowOn);
+            }
+            if (req.limitHigh != null) {
+                a.setSoftLimitHigh(new Length(req.limitHigh, LengthUnit.Millimeters));
+            }
+            if (req.limitHighOn != null) {
+                a.setSoftLimitHighEnabled(req.limitHighOn);
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describeAxes()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/axis. */
+    private static class AxisUpdate {
+        String id;
+        Double feedrate;
+        Double accel;
+        Double jerk;
+        Double limitLow;
+        Double limitHigh;
+        Boolean limitLowOn;
+        Boolean limitHighOn;
     }
 
     // ------------------------------------------------------------- Cameras
@@ -3402,6 +3509,13 @@ public class ViperServer {
 
         root.put("feederCount", m.getFeeders().size());
         root.put("actuatorCount", m.getActuators().size());
+        int axisCount = 0;
+        for (Axis ax : m.getAxes()) {
+            if (ax instanceof ReferenceControllerAxis) {
+                axisCount++;
+            }
+        }
+        root.put("axisCount", axisCount);
         return root;
     }
 }

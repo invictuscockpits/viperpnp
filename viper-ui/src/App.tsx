@@ -32,6 +32,7 @@ interface MachineInfo {
   machineCameras: string[];
   feederCount: number;
   actuatorCount: number;
+  axisCount: number;
 }
 
 interface Position {
@@ -208,6 +209,20 @@ interface ActuatorOpt {
   id: string;
   name: string;
 }
+interface AxisInfo {
+  id: string;
+  name: string;
+  type: string | null;
+  letter: string | null;
+  driver: string | null;
+  feedrate: number;
+  accel: number;
+  jerk: number;
+  limitLow: number;
+  limitLowOn: boolean;
+  limitHigh: number;
+  limitHighOn: boolean;
+}
 
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
 const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
@@ -273,7 +288,7 @@ const MACHINE_CARDS: {
     id: "motion",
     title: "Motion & Axes",
     desc: "Limits, feedrates, homing",
-    ready: false,
+    ready: true,
   },
   {
     id: "nozzles",
@@ -308,35 +323,39 @@ function NumberInput({
   step = 1,
   min,
   className,
+  disabled = false,
 }: {
   value: number;
   onChange: (v: number) => void;
   step?: number;
   min?: number;
   className?: string;
+  disabled?: boolean;
 }) {
   const decimals = (String(step).split(".")[1] || "").length;
   const bump = (dir: 1 | -1) => {
+    if (disabled) return;
     let v = parseFloat((value + dir * step).toFixed(decimals + 3));
     if (min !== undefined && v < min) v = min;
     onChange(v);
   };
   return (
-    <span className={`num-input ${className ?? ""}`}>
+    <span className={`num-input ${disabled ? "is-disabled" : ""} ${className ?? ""}`}>
       <input
         type="number"
         value={value}
         step={step}
         min={min}
+        disabled={disabled}
         onChange={(e) => onChange(parseFloat(e.currentTarget.value) || 0)}
       />
       <span className="num-spin">
-        <button type="button" tabIndex={-1} aria-label="Increase" onClick={() => bump(1)}>
+        <button type="button" tabIndex={-1} aria-label="Increase" disabled={disabled} onClick={() => bump(1)}>
           <svg viewBox="0 0 12 8">
             <path d="M6 2 L10 6.4 L2 6.4 Z" />
           </svg>
         </button>
-        <button type="button" tabIndex={-1} aria-label="Decrease" onClick={() => bump(-1)}>
+        <button type="button" tabIndex={-1} aria-label="Decrease" disabled={disabled} onClick={() => bump(-1)}>
           <svg viewBox="0 0 12 8">
             <path d="M6 6 L2 1.6 L10 1.6 Z" />
           </svg>
@@ -484,6 +503,7 @@ function App() {
   const [nozzles, setNozzles] = useState<NozzleInfo[]>([]);
   const [nzTips, setNzTips] = useState<NozzleTipInfo[]>([]);
   const [nozzleActs, setNozzleActs] = useState<ActuatorOpt[]>([]);
+  const [axes, setAxes] = useState<AxisInfo[]>([]);
   const [reference, setReference] = useState("camera");
   const [tab, setTab] = useState<Tab>("board");
   const [feeders, setFeeders] = useState<FeederInfo[]>([]);
@@ -642,11 +662,34 @@ function App() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
 
+  const loadAxes = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/axes/detail")).json();
+      setAxes(d.axes ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const updateAxis = (id: string, patch: object) => {
+    fetch("/api/axis", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, ...patch }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.axes) setAxes(d.axes);
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
   const openCard = (id: string) => {
     if (id === "connection") loadDrivers();
     if (id === "actuators") loadActuators();
     if (id === "cameras") loadCameras();
     if (id === "nozzles") loadNozzles();
+    if (id === "motion") loadAxes();
     setMachineCard(id);
   };
 
@@ -1786,6 +1829,8 @@ function App() {
                         ? `${inventory.drivers[0]?.type ?? "no driver"} · ${
                             enabled ? "connected" : "offline"
                           }`
+                        : c.id === "motion"
+                          ? `${inventory.axisCount} axes`
                         : c.id === "nozzles"
                           ? `${inventory.heads.flatMap((h) => h.nozzles).length} nozzles`
                           : c.id === "cameras"
@@ -3829,11 +3874,124 @@ function App() {
         </div>
       )}
 
+      {machineCard === "motion" && (
+        <div className="modal-backdrop" onClick={() => setMachineCard(null)}>
+          <div
+            className="modal modal-wide"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3>Motion &amp; Axes</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setMachineCard(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body plc-body">
+              {axes.length === 0 && (
+                <div className="muted">no controller axes defined</div>
+              )}
+              {axes.map((a) => (
+                <div key={a.id} className="teach-block">
+                  <div className="teach-head">
+                    <span className="mono">{a.name}</span> · {a.type ?? "?"} ·
+                    letter {a.letter ?? "—"} · {a.driver ?? "no driver"}
+                  </div>
+                  <div className="field-grid">
+                    <label className="loc-field">
+                      <span>Feedrate mm/s</span>
+                      <NumberInput
+                        step={1}
+                        min={0}
+                        value={a.feedrate}
+                        onChange={(v) => updateAxis(a.id, { feedrate: v })}
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Accel mm/s²</span>
+                      <NumberInput
+                        step={1}
+                        min={0}
+                        value={a.accel}
+                        onChange={(v) => updateAxis(a.id, { accel: v })}
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Jerk mm/s³</span>
+                      <NumberInput
+                        step={1}
+                        min={0}
+                        value={a.jerk}
+                        onChange={(v) => updateAxis(a.id, { jerk: v })}
+                      />
+                    </label>
+                  </div>
+                  <div className="field-grid">
+                    <label className="loc-field">
+                      <span>
+                        <input
+                          type="checkbox"
+                          checked={a.limitLowOn}
+                          onChange={(e) =>
+                            updateAxis(a.id, {
+                              limitLowOn: e.currentTarget.checked,
+                            })
+                          }
+                        />{" "}
+                        Soft limit low
+                      </span>
+                      <NumberInput
+                        step={1}
+                        value={a.limitLow}
+                        disabled={!a.limitLowOn}
+                        onChange={(v) => updateAxis(a.id, { limitLow: v })}
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>
+                        <input
+                          type="checkbox"
+                          checked={a.limitHighOn}
+                          onChange={(e) =>
+                            updateAxis(a.id, {
+                              limitHighOn: e.currentTarget.checked,
+                            })
+                          }
+                        />{" "}
+                        Soft limit high
+                      </span>
+                      <NumberInput
+                        step={1}
+                        value={a.limitHigh}
+                        disabled={!a.limitHighOn}
+                        onChange={(v) => updateAxis(a.id, { limitHigh: v })}
+                      />
+                    </label>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="modal-foot">
+              <button
+                className="btn btn-primary"
+                onClick={() => setMachineCard(null)}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {machineCard &&
         machineCard !== "connection" &&
         machineCard !== "actuators" &&
         machineCard !== "cameras" &&
-        machineCard !== "nozzles" && (
+        machineCard !== "nozzles" &&
+        machineCard !== "motion" && (
         <div className="modal-backdrop" onClick={() => setMachineCard(null)}>
           <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
