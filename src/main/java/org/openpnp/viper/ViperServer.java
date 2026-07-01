@@ -793,30 +793,49 @@ public class ViperServer {
 
     // ---------------------------------------------------------------- Parts
 
-    /** All parts with the fields the Parts page needs; hasHeight flags the issue. */
-    private static Map<String, Object> describePartsDetail() {
-        // A part used only as a fiducial (never a real placement or a feeder) is
-        // never picked, so it doesn't need a height.
-        Set<String> placedParts = new java.util.HashSet<>();
-        Set<String> fiducialParts = new java.util.HashSet<>();
+    /**
+     * The ids of parts that are fiducials — used only as a fiducial (never a
+     * real placement or feeder) or fiducial-named (id/package starts with FID).
+     * A fiducial is never picked, so it needs neither a height nor a nozzle tip.
+     */
+    private static Set<String> fiducialPartIds() {
+        Set<String> placed = new java.util.HashSet<>();
+        Set<String> fiducial = new java.util.HashSet<>();
         for (Board b : Configuration.get().getBoards()) {
             for (Placement p : b.getPlacements()) {
                 if (p.getPart() == null) {
                     continue;
                 }
                 if (p.getType() == Placement.Type.Fiducial) {
-                    fiducialParts.add(p.getPart().getId());
+                    fiducial.add(p.getPart().getId());
                 }
                 else {
-                    placedParts.add(p.getPart().getId());
+                    placed.add(p.getPart().getId());
                 }
             }
         }
         for (Feeder f : machine.getFeeders()) {
             if (f.getPart() != null) {
-                placedParts.add(f.getPart().getId());
+                placed.add(f.getPart().getId());
             }
         }
+        Set<String> result = new java.util.HashSet<>();
+        for (Part p : Configuration.get().getParts()) {
+            String pkgId = p.getPackage() != null ? p.getPackage().getId() : "";
+            boolean named = p.getId().toUpperCase().startsWith("FID")
+                    || pkgId.toUpperCase().startsWith("FID");
+            boolean usedFiducialOnly = fiducial.contains(p.getId())
+                    && !placed.contains(p.getId());
+            if (named || usedFiducialOnly) {
+                result.add(p.getId());
+            }
+        }
+        return result;
+    }
+
+    /** All parts with the fields the Parts page needs; hasHeight flags the issue. */
+    private static Map<String, Object> describePartsDetail() {
+        Set<String> fiducials = fiducialPartIds();
         List<Map<String, Object>> parts = new ArrayList<>();
         for (Part p : Configuration.get().getParts()) {
             Map<String, Object> m = new LinkedHashMap<>();
@@ -824,12 +843,7 @@ public class ViperServer {
             m.put("name", p.getName());
             double h = p.getHeight() != null
                     ? p.getHeight().convertToUnits(LengthUnit.Millimeters).getValue() : 0;
-            boolean usedFiducialOnly = fiducialParts.contains(p.getId())
-                    && !placedParts.contains(p.getId());
-            String pkgId = p.getPackage() != null ? p.getPackage().getId() : "";
-            boolean namedFiducial = p.getId().toUpperCase().startsWith("FID")
-                    || pkgId.toUpperCase().startsWith("FID");
-            boolean fiducial = usedFiducialOnly || namedFiducial;
+            boolean fiducial = fiducials.contains(p.getId());
             m.put("height", round(h));
             m.put("fiducial", fiducial);
             m.put("hasHeight", h > 0 || fiducial);
@@ -1148,6 +1162,15 @@ public class ViperServer {
 
     /** All packages + the machine's nozzle tips; hasNozzle flags the issue. */
     private static Map<String, Object> describePackages() {
+        // Packages used by a real (non-fiducial) part genuinely need a nozzle tip;
+        // fiducial-only / fiducial-named / unused packages don't.
+        Set<String> fiducials = fiducialPartIds();
+        Set<String> realPackages = new java.util.HashSet<>();
+        for (Part p : Configuration.get().getParts()) {
+            if (p.getPackage() != null && !fiducials.contains(p.getId())) {
+                realPackages.add(p.getPackage().getId());
+            }
+        }
         List<Map<String, Object>> pkgs = new ArrayList<>();
         for (Package pk : Configuration.get().getPackages()) {
             Map<String, Object> m = new LinkedHashMap<>();
@@ -1158,7 +1181,10 @@ public class ViperServer {
                 nts.add(nt.getId());
             }
             m.put("nozzleTips", nts);
-            m.put("hasNozzle", !nts.isEmpty());
+            boolean fiducial = pk.getId().toUpperCase().startsWith("FID")
+                    || !realPackages.contains(pk.getId());
+            m.put("fiducial", fiducial);
+            m.put("hasNozzle", !nts.isEmpty() || fiducial);
             pkgs.add(m);
         }
         List<Map<String, Object>> allNts = new ArrayList<>();

@@ -2142,7 +2142,13 @@ function App() {
                           <td className="muted">{p.description ?? "—"}</td>
                           <td className="muted">
                             {p.nozzleTips.length > 0
-                              ? p.nozzleTips.join(", ")
+                              ? p.nozzleTips
+                                  .map(
+                                    (id) =>
+                                      nozzleTips.find((nt) => nt.id === id)
+                                        ?.name ?? id,
+                                  )
+                                  .join(", ")
                               : "—"}
                           </td>
                           <td className="row-actions">
