@@ -674,6 +674,12 @@ public class ViperServer {
             board.setFile(file);
             Configuration.get().saveBoard(board);
             Configuration.get().addBoard(board);
+            // The board file references any parts/packages created above; persist
+            // them too (parts.xml/packages.xml) so they survive a reload. Without
+            // this the board loads with every placement's part unresolved.
+            Configuration.get().save();
+            configDirty = false;
+            broadcast(GSON.toJson(configEvent()));
             syncJob();
             Map<String, Object> resp = describeBoards();
             resp.put("pendingRemaps", pendingRemaps(board));
