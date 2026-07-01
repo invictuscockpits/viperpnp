@@ -55,16 +55,25 @@ interface JobInfo {
   boards?: JobBoard[];
 }
 
-type Tab = "machine" | "board";
+interface FeederInfo {
+  id: string;
+  name: string;
+  type: string;
+  part: string | null;
+  enabled: boolean;
+}
+
+type Tab = "machine" | "board" | "feeders";
 
 const STEPS = [0.01, 0.1, 1, 10, 100];
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "machine", label: "Machine" },
   { id: "board", label: "Board" },
+  { id: "feeders", label: "Feeders" },
 ];
 
-const SOON = ["Feeders", "Vision", "Log"];
+const SOON = ["Vision", "Log"];
 
 function App() {
   const [online, setOnline] = useState(false);
@@ -81,6 +90,10 @@ function App() {
   const [importing, setImporting] = useState(false);
   const [reference, setReference] = useState("camera");
   const [tab, setTab] = useState<Tab>("board");
+  const [feeders, setFeeders] = useState<FeederInfo[]>([]);
+  const [parts, setParts] = useState<string[]>([]);
+  const [feederType, setFeederType] = useState("photon");
+  const [feederName, setFeederName] = useState("");
   const wsRef = useRef<WebSocket | null>(null);
 
   const loadInventory = useCallback(async () => {
@@ -107,6 +120,27 @@ function App() {
   useEffect(() => {
     loadJob();
   }, [loadJob]);
+
+  const loadFeeders = useCallback(async () => {
+    try {
+      const [fr, pr] = await Promise.all([
+        fetch("/api/feeders"),
+        fetch("/api/parts"),
+      ]);
+      const fd = await fr.json();
+      const pd = await pr.json();
+      setFeeders(fd.feeders ?? []);
+      setParts(pd.parts ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (tab === "feeders") {
+      loadFeeders();
+    }
+  }, [tab, loadFeeders]);
 
   useEffect(() => {
     let closed = false;
@@ -220,6 +254,44 @@ function App() {
       }
     } catch (e) {
       setImportErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const addFeeder = async () => {
+    try {
+      const res = await fetch("/api/feeders/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: feederType, name: feederName || undefined }),
+      });
+      const d = await res.json();
+      if (d.feeders) {
+        setFeeders(d.feeders);
+      } else if (d.error || d.event === "error") {
+        setError(String(d.message ?? d.error));
+      }
+      setFeederName("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const updateFeeder = async (
+    id: string,
+    patch: { partId?: string; enabled?: boolean },
+  ) => {
+    try {
+      const res = await fetch("/api/feeder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, ...patch }),
+      });
+      const d = await res.json();
+      if (d.feeders) {
+        setFeeders(d.feeders);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -650,6 +722,89 @@ function App() {
               ) : (
                 <div className="muted">
                   No board loaded. Import a KiCad .pos to see its placement map.
+                </div>
+              )}
+            </section>
+          )}
+
+          {tab === "feeders" && (
+            <section className="card">
+              <div className="board-head">
+                <h2>Feeders</h2>
+                <div className="import-row">
+                  <select
+                    className="type-select"
+                    value={feederType}
+                    onChange={(e) => setFeederType(e.currentTarget.value)}
+                  >
+                    <option value="photon">Photon</option>
+                    <option value="strip">Strip</option>
+                  </select>
+                  <input
+                    className="import-input"
+                    value={feederName}
+                    onChange={(e) => setFeederName(e.currentTarget.value)}
+                    placeholder="feeder name (optional)"
+                  />
+                  <button className="btn btn-primary" onClick={addFeeder}>
+                    Add feeder
+                  </button>
+                </div>
+              </div>
+              {feeders.length === 0 ? (
+                <div className="muted">
+                  No feeders yet. Add one above — on a real LumenPnP, Photon
+                  feeders also appear automatically when the machine scans the bus.
+                </div>
+              ) : (
+                <div className="ptable-wrap">
+                  <table className="ptable">
+                    <thead>
+                      <tr>
+                        <th>On</th>
+                        <th>Name</th>
+                        <th>Type</th>
+                        <th>Part</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {feeders.map((f) => (
+                        <tr key={f.id} className={f.enabled ? "" : "row-off"}>
+                          <td>
+                            <input
+                              type="checkbox"
+                              checked={f.enabled}
+                              onChange={(e) =>
+                                updateFeeder(f.id, {
+                                  enabled: e.currentTarget.checked,
+                                })
+                              }
+                            />
+                          </td>
+                          <td className="mono">{f.name}</td>
+                          <td className="muted">{f.type}</td>
+                          <td>
+                            <select
+                              className="type-select"
+                              value={f.part ?? ""}
+                              onChange={(e) =>
+                                updateFeeder(f.id, {
+                                  partId: e.currentTarget.value,
+                                })
+                              }
+                            >
+                              <option value="">—</option>
+                              {parts.map((p) => (
+                                <option key={p} value={p}>
+                                  {p}
+                                </option>
+                              ))}
+                            </select>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               )}
             </section>
