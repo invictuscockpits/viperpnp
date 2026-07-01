@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { BoardMap, type Placement } from "./BoardMap";
-import { CameraIcon, GearIcon, NozzleIcon, TrashIcon, WarnIcon } from "./Icons";
+import {
+  CameraIcon,
+  GearIcon,
+  NozzleIcon,
+  SearchIcon,
+  TrashIcon,
+  UndoIcon,
+  WarnIcon,
+} from "./Icons";
 import "./App.css";
 
 interface DriverInfo {
@@ -1433,41 +1441,43 @@ function App() {
                             )}
                           </td>
                           <td className="row-actions">
-                            {f.remaining !== undefined && (
-                              <>
-                                <button
-                                  className="btn btn-sm"
-                                  onClick={() => feederCountOp(f.id, "advance")}
-                                  title="Advance to the next part"
-                                >
-                                  +1
-                                </button>
-                                <button
-                                  className="btn btn-sm"
-                                  onClick={() => feederCountOp(f.id, "reset")}
-                                  title="Reset to the first part"
-                                >
-                                  Reset
-                                </button>
-                              </>
+                            {(f.remaining !== undefined ||
+                              f.type === "PhotonFeeder") && (
+                              <button
+                                className="btn btn-sm"
+                                onClick={() =>
+                                  f.type === "PhotonFeeder"
+                                    ? photonAction(f.id, "feed")
+                                    : feederCountOp(f.id, "advance")
+                                }
+                                title={
+                                  f.type === "PhotonFeeder"
+                                    ? "Feed one part"
+                                    : "Advance to the next part"
+                                }
+                              >
+                                +1
+                              </button>
                             )}
                             {f.type === "PhotonFeeder" && (
-                              <>
-                                <button
-                                  className="btn btn-sm"
-                                  onClick={() => photonAction(f.id, "find")}
-                                  title="Locate this feeder's slot on the bus"
-                                >
-                                  Find
-                                </button>
-                                <button
-                                  className="btn btn-sm"
-                                  onClick={() => photonAction(f.id, "feed")}
-                                  title="Advance the feeder by one part"
-                                >
-                                  Feed
-                                </button>
-                              </>
+                              <button
+                                className="btn btn-sm btn-icon"
+                                onClick={() => photonAction(f.id, "find")}
+                                title="Locate this feeder's slot on the bus"
+                                aria-label="Find on the bus"
+                              >
+                                <SearchIcon size={15} />
+                              </button>
+                            )}
+                            {f.remaining !== undefined && (
+                              <button
+                                className="btn btn-sm btn-icon"
+                                onClick={() => feederCountOp(f.id, "reset")}
+                                title="Reset to the first part"
+                                aria-label="Reset count"
+                              >
+                                <UndoIcon size={15} />
+                              </button>
                             )}
                             <button
                               className="btn btn-sm btn-icon"
