@@ -143,6 +143,7 @@ public class ViperServer {
             ctx.contentType("application/json");
             ctx.result(GSON.toJson(describeJob(currentJob)));
         });
+        app.post("/api/job/placement", ViperServer::updatePlacement);
 
         app.ws("/ws/events", ws -> {
             ws.onConnect(sctx -> {
@@ -313,6 +314,58 @@ public class ViperServer {
         }
     }
 
+    /**
+     * Updates a single placement in the current job (its Type and/or enabled
+     * flag) — the core of OpenPnP's board-input editor. Body: {id, type?,
+     * enabled?}. Returns the refreshed job.
+     */
+    private static void updatePlacement(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
+            if (currentJob == null || req == null || req.id == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"no job loaded or missing placement id\"}");
+                return;
+            }
+            Placement found = null;
+            for (BoardLocation bl : currentJob.getBoardLocations()) {
+                for (Placement p : bl.getBoard().getPlacements()) {
+                    if (p.getId().equals(req.id)) {
+                        found = p;
+                        break;
+                    }
+                }
+                if (found != null) {
+                    break;
+                }
+            }
+            if (found == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"placement not found\"}");
+                return;
+            }
+            if (req.type != null) {
+                found.setType(Placement.Type.valueOf(req.type));
+            }
+            if (req.enabled != null) {
+                found.setEnabled(req.enabled);
+            }
+            ctx.result(GSON.toJson(describeJob(currentJob)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/job/placement. */
+    private static class PlacementUpdate {
+        String id;
+        String type;
+        Boolean enabled;
+    }
+
     /** JSON summary of the current job: boards, placements and distinct parts. */
     private static Map<String, Object> describeJob(Job job) {
         Map<String, Object> root = new LinkedHashMap<>();
@@ -337,6 +390,8 @@ public class ViperServer {
                 pm.put("id", p.getId());
                 pm.put("part", p.getPart() != null ? p.getPart().getId() : null);
                 pm.put("side", p.getSide() != null ? p.getSide().toString() : null);
+                pm.put("type", p.getType() != null ? p.getType().toString() : "Placement");
+                pm.put("enabled", p.isEnabled());
                 Location l = p.getLocation().convertToUnits(LengthUnit.Millimeters);
                 pm.put("x", round(l.getX()));
                 pm.put("y", round(l.getY()));
