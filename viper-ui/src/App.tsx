@@ -1413,6 +1413,9 @@ function App() {
       } else {
         setBoards(data.boards ?? []);
         setImportConflict(null);
+        // Parts/packages may have just been created — refresh those views.
+        loadParts();
+        loadPackages();
         const pr = data.pendingRemaps ?? [];
         if (pr.length > 0) {
           setPendingRemaps(pr);
