@@ -1462,6 +1462,163 @@ input[type="number"] {
   margin-top: 0.5rem;
 }
 
+/* ---- Integrated Jobs page ---- */
+.jobs-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding-bottom: 0.8rem;
+  margin-bottom: 0.8rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.run-group,
+.job-picker {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.job-picker .type-select {
+  min-width: 12rem;
+}
+
+.jobs-empty {
+  padding: 1.5rem 0;
+}
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0.9rem 0 0.4rem;
+}
+
+.pane-title {
+  font-size: 0.74rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+  margin-right: auto;
+}
+
+.pane-head-plc {
+  border-top: 1px solid var(--border);
+  padding-top: 0.6rem;
+}
+
+.plc-search {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--muted);
+}
+
+.plc-search-input {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8rem;
+  width: 12rem;
+}
+
+.plc-scroll {
+  max-height: 340px;
+  overflow-y: auto;
+}
+
+.ptable.jobs-boards,
+.ptable.jobs-plc {
+  font-size: 0.8rem;
+}
+
+.ptable.jobs-boards tr,
+.ptable.jobs-plc tr {
+  cursor: default;
+}
+
+.ptable.jobs-boards tbody tr {
+  cursor: pointer;
+}
+
+.ptable.jobs-boards tbody tr:hover {
+  background: var(--panel-2);
+}
+
+.ptable .sel-row,
+.ptable .sel-row:hover {
+  background: var(--green-dim);
+}
+
+.cell-num {
+  width: 4.2rem;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 0.18rem 0.3rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+}
+
+.cell-select {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 0.18rem 0.25rem;
+  font-size: 0.78rem;
+}
+
+.cell-text {
+  width: 100%;
+  min-width: 6rem;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 0.18rem 0.3rem;
+  font-size: 0.78rem;
+}
+
+.cell-center {
+  text-align: center;
+  color: var(--green);
+  font-weight: 700;
+}
+
+.plc-status {
+  display: inline-block;
+  padding: 0.08rem 0.45rem;
+  border-radius: 3px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  background: #16261c;
+  color: #a8e0bc;
+}
+
+.plc-status.status-disabled {
+  background: #23262b;
+  color: var(--muted);
+}
+
+.plc-status.status-placed {
+  background: #14324a;
+  color: #8fd0ff;
+}
+
+.plc-status.status-no-part,
+.plc-status.status-no-height {
+  background: #2a2417;
+  color: #f0dca8;
+}
+
 .detect-grp {
   border-left: 2px solid var(--border);
   padding-left: 0.7rem;

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BoardMap, type Placement } from "./BoardMap";
 import {
   CameraIcon,
@@ -147,10 +147,18 @@ interface JobLibInfo {
   dirty: boolean;
 }
 
+interface JobPlacement extends Placement {
+  placed?: boolean;
+  status?: string;
+  comments?: string;
+}
+
 interface JobBoardLoc {
   uid: string;
   boardFile: string | null;
   boardName: string;
+  width: number;
+  length: number;
   side: string;
   enabled: boolean;
   checkFids: boolean;
@@ -546,7 +554,6 @@ function App() {
   );
   const [jobErr, setJobErr] = useState("");
   const [jobEditFile, setJobEditFile] = useState<string | null>(null);
-  const [jobEditName, setJobEditName] = useState("");
   const [jobBoards, setJobBoards] = useState<JobBoardLoc[]>([]);
   const [jobBoardLib, setJobBoardLib] = useState<{ file: string; name: string }[]>(
     [],
@@ -564,7 +571,12 @@ function App() {
     residual: number;
     points: number;
   } | null>(null);
+  const [selectedBoardUid, setSelectedBoardUid] = useState<string | null>(null);
+  const [jobBoardPlc, setJobBoardPlc] = useState<JobPlacement[]>([]);
+  const [plcSearch, setPlcSearch] = useState("");
+  const [plcRefresh, setPlcRefresh] = useState(0);
   const [jobRunning, setJobRunning] = useState(false);
+  const [jobStepping, setJobStepping] = useState(false);
   const [jobStatus, setJobStatus] = useState("");
   const [keepGoing, setKeepGoing] = useState(true);
   const [jobSkipped, setJobSkipped] = useState<
@@ -727,12 +739,29 @@ function App() {
   }) => {
     if (d.boards) setJobBoards(d.boards);
     if (d.library) setJobBoardLib(d.library);
-    if (d.name) setJobEditName(d.name);
   };
 
-  const openJobEditor = async (file: string | null) => {
-    if (!file) return;
-    setJobErr("");
+  const activeJobFile = useMemo(
+    () => jobs.find((j) => j.active)?.file ?? null,
+    [jobs],
+  );
+
+  const syncJobState = useCallback(async () => {
+    try {
+      const st = await (await fetch("/api/job/state")).json();
+      setJobRunning(!!st.running);
+      setJobStepping(!!st.stepping);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const loadJobBoards = useCallback(async (file: string | null) => {
+    if (!file) {
+      setJobBoards([]);
+      setJobBoardLib([]);
+      return;
+    }
     try {
       const d = await (
         await fetch("/api/job/boards", {
@@ -741,13 +770,58 @@ function App() {
           body: JSON.stringify({ file }),
         })
       ).json();
-      applyJobBoards(d);
-      setAddBoardSel(d.library?.[0]?.file ?? "");
-      setJobEditFile(file);
-    } catch (e) {
-      setJobErr(e instanceof Error ? e.message : String(e));
+      setJobBoards(d.boards ?? []);
+      setJobBoardLib(d.library ?? []);
+      setAddBoardSel((s) => s || d.library?.[0]?.file || "");
+    } catch {
+      /* ignore */
     }
-  };
+  }, []);
+
+  const loadJobPlacements = useCallback(
+    async (file: string | null, uid: string | null) => {
+      if (!file || !uid) {
+        setJobBoardPlc([]);
+        return;
+      }
+      try {
+        const d = await (
+          await fetch("/api/job/board/placements", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ file, uid }),
+          })
+        ).json();
+        setJobBoardPlc(d.placements ?? []);
+      } catch {
+        /* ignore */
+      }
+    },
+    [],
+  );
+
+  // Load the active job's board-locations whenever the active job changes.
+  useEffect(() => {
+    setJobEditFile(activeJobFile);
+    setSelectedBoardUid(null);
+    loadJobBoards(activeJobFile);
+  }, [activeJobFile, loadJobBoards]);
+
+  // Auto-select the first board once boards load (if nothing selected).
+  useEffect(() => {
+    if (jobBoards.length > 0) {
+      setSelectedBoardUid((cur) =>
+        cur && jobBoards.some((b) => b.uid === cur) ? cur : jobBoards[0].uid,
+      );
+    } else {
+      setSelectedBoardUid(null);
+    }
+  }, [jobBoards]);
+
+  // Load placements for the selected board (re-runs after a run bumps plcRefresh).
+  useEffect(() => {
+    loadJobPlacements(activeJobFile, selectedBoardUid);
+  }, [activeJobFile, selectedBoardUid, plcRefresh, loadJobPlacements]);
 
   const postJobBoard = async (url: string, body: object) => {
     setJobErr("");
@@ -889,6 +963,56 @@ function App() {
       setAlignMeasured({});
       setAlignResult(null);
     }
+  };
+
+  const selectedBoard = jobBoards.find((b) => b.uid === selectedBoardUid) ?? null;
+
+  const editJobPlacement = (id: string, patch: object) => {
+    const bf = selectedBoard?.boardFile;
+    if (!bf) return;
+    fetch("/api/job/placement", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ board: bf, id, ...patch }),
+    })
+      .then(() => loadJobPlacements(activeJobFile, selectedBoardUid))
+      .catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
+  };
+
+  const addJobPlacement = () => {
+    const bf = selectedBoard?.boardFile;
+    if (!bf) return;
+    fetch("/api/job/placement/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ board: bf }),
+    })
+      .then(() => loadJobPlacements(activeJobFile, selectedBoardUid))
+      .catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
+  };
+
+  const deleteJobPlacement = (id: string) => {
+    const bf = selectedBoard?.boardFile;
+    if (!bf) return;
+    fetch("/api/job/placement/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ board: bf, ids: [id] }),
+    })
+      .then(() => loadJobPlacements(activeJobFile, selectedBoardUid))
+      .catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
+  };
+
+  const stepJob = () => {
+    setJobErr("");
+    fetch("/api/job/step", { method: "POST" })
+      .then(async (r) => {
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          setJobErr(d.error ?? "Could not step the job.");
+        }
+      })
+      .catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
   };
 
   const runJob = async () => {
@@ -1115,7 +1239,7 @@ function App() {
     }
     if (tab === "jobs") {
       loadJobs();
-      loadBoards();
+      loadParts();
     }
     if (tab === "parts") {
       loadParts();
@@ -1156,17 +1280,18 @@ function App() {
         } else if (data && data.event === "config") {
           setConfigDirty(!!data.dirty);
         } else if (data && data.event === "jobStarted") {
-          setJobRunning(true);
           setJobSkipped(null);
           setJobStatus(String(data.text ?? "Job started"));
+          syncJobState();
         } else if (data && data.event === "jobStatus") {
           setJobStatus(String(data.text ?? ""));
         } else if (data && data.event === "jobComplete") {
-          setJobRunning(false);
           setJobStatus(data.aborted ? "Job aborted" : "Job complete");
           setJobSkipped(data.skipped ?? []);
           setJobAborted(!!data.aborted);
+          syncJobState();
           loadJobs();
+          setPlcRefresh((n) => n + 1);
         } else if (data && data.event === "error") {
           setError(String(data.message));
           setScanning(false);
@@ -1189,7 +1314,7 @@ function App() {
       }
       wsRef.current?.close();
     };
-  }, [loadInventory, loadJobs]);
+  }, [loadInventory, loadJobs, syncJobState]);
 
   const post = useCallback(async (path: string, body?: unknown) => {
     try {
@@ -2436,191 +2561,587 @@ function App() {
           )}
 
           {tab === "jobs" && (
-            <section className="board card">
-              <div className="board-head">
-                <h2>Jobs</h2>
-                <button
-                  className="btn btn-sm"
-                  onClick={() => {
-                    setNewJobName("");
-                    setJobErr("");
-                    setNewJobOpen(true);
-                  }}
-                >
-                  + New job
-                </button>
-              </div>
-              <p className="muted job-hint">
-                A job is a <span className="mono">.job.xml</span> file that
-                places one or more boards on the machine. Set one active to edit
-                or run it. Cross-compatible with OpenPnP.
-              </p>
-              {jobErr && <div className="banner banner-warn">{jobErr}</div>}
-              {jobs.length === 0 ? (
-                <div className="muted">
-                  No jobs yet. Create one, then add boards to it.
-                </div>
-              ) : (
-                <div className="ptable-wrap">
-                  <table className="ptable">
-                    <thead>
-                      <tr>
-                        <th></th>
-                        <th>Job</th>
-                        <th>Boards</th>
-                        <th>Placements</th>
-                        <th></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {jobs.map((j) => (
-                        <tr
-                          key={j.file ?? j.name}
-                          className={j.active ? "job-active-row" : ""}
-                        >
-                          <td>
-                            <input
-                              type="radio"
-                              name="active-job"
-                              checked={j.active}
-                              onChange={() => selectJob(j.file)}
-                              title="Set as the active job"
-                            />
-                          </td>
-                          <td className="mono">
-                            {j.name}
-                            {j.active && (
-                              <span className="job-active-tag">active</span>
-                            )}
-                            {j.dirty && (
-                              <span className="dirty-dot" title="Unsaved edits">
-                                {" "}
-                                •
-                              </span>
-                            )}
-                          </td>
-                          <td className="mono">{j.boardCount}</td>
-                          <td className="mono">{j.placementCount}</td>
-                          <td className="row-actions">
-                            <button
-                              className="btn btn-sm btn-icon"
-                              onClick={() => openJobEditor(j.file)}
-                              title="Edit boards & positions"
-                              aria-label="Edit job boards"
-                            >
-                              <EyeIcon size={15} />
-                            </button>
-                            <button
-                              className="btn btn-sm btn-icon"
-                              onClick={() => {
-                                setRenameJobName(j.name);
-                                setJobErr("");
-                                setRenameJobTarget(j);
-                              }}
-                              title="Rename job"
-                              aria-label="Rename job"
-                            >
-                              <GearIcon size={15} />
-                            </button>
-                            <button
-                              className="btn btn-sm btn-icon btn-trash"
-                              onClick={() => setRemoveJobTarget(j)}
-                              title="Delete job"
-                              aria-label="Delete job"
-                            >
-                              <TrashIcon size={15} />
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              {(() => {
-                const active = jobs.find((j) => j.active);
-                if (!active) return null;
-                return (
-                  <div className="run-panel">
-                    <div className="run-panel-head">
-                      <span>
-                        Run <span className="mono">{active.name}</span> ·{" "}
-                        {active.boardCount} board
-                        {active.boardCount === 1 ? "" : "s"} ·{" "}
-                        {active.placementCount} placements
-                      </span>
-                      {!enabled && (
-                        <span className="muted">
-                          — machine offline; connect to run
-                        </span>
-                      )}
-                    </div>
-                    <div className="run-controls">
-                      {!jobRunning ? (
-                        <button
-                          className="btn btn-primary"
-                          onClick={runJob}
-                          disabled={
-                            !enabled || active.placementCount === 0
-                          }
-                        >
-                          ▶ Run job
-                        </button>
-                      ) : (
+            <section className="card jobs-page">
+              <div className="jobs-toolbar">
+                <div className="run-group">
+                  {jobRunning ? (
+                    <button className="btn btn-danger" onClick={abortJob}>
+                      ■ Stop
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        className="btn btn-primary"
+                        onClick={runJob}
+                        disabled={!enabled || !activeJobFile}
+                        title={!enabled ? "Connect the machine to run" : "Run the job"}
+                      >
+                        ▶ Run
+                      </button>
+                      <button
+                        className="btn"
+                        onClick={stepJob}
+                        disabled={!enabled || !activeJobFile}
+                        title="Advance one step"
+                      >
+                        ⏭ Step
+                      </button>
+                      {jobStepping && (
                         <button className="btn btn-danger" onClick={abortJob}>
-                          ■ Abort
+                          ■ Stop
                         </button>
                       )}
-                      <label
-                        className="run-toggle"
-                        title="On a feeder fault, retry then skip the placement and keep going, instead of pausing the job."
-                      >
-                        <input
-                          type="checkbox"
-                          checked={keepGoing}
-                          disabled={jobRunning}
-                          onChange={(e) => setKeepGoing(e.currentTarget.checked)}
-                        />
-                        Keep going on feeder faults
-                      </label>
-                      {jobRunning && (
-                        <span className="run-live">
-                          <span className="run-dot" /> {jobStatus}
-                        </span>
-                      )}
-                    </div>
-                    {!jobRunning && jobStatus && jobSkipped !== null && (
-                      <div
-                        className={`banner ${
-                          jobAborted || jobSkipped.length > 0
-                            ? "banner-warn"
-                            : "banner-ok"
-                        }`}
-                      >
-                        {jobAborted
-                          ? "Job aborted. "
-                          : jobSkipped.length === 0
-                            ? "Job complete — all placements placed."
-                            : `Job complete — ${jobSkipped.length} placement${
-                                jobSkipped.length === 1 ? "" : "s"
-                              } skipped:`}
-                        {jobSkipped.length > 0 && (
-                          <ul className="skip-list">
-                            {jobSkipped.map((s) => (
-                              <li key={`${s.board}-${s.id}`}>
-                                <span className="mono">{s.id}</span>
-                                {s.part ? ` · ${s.part}` : ""} ·{" "}
-                                <span className="muted">{s.board}</span>
-                              </li>
-                            ))}
-                          </ul>
-                        )}
-                      </div>
+                    </>
+                  )}
+                  <label
+                    className="run-toggle"
+                    title="On a feeder fault, retry then skip and keep going, instead of pausing."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={keepGoing}
+                      disabled={jobRunning}
+                      onChange={(e) => setKeepGoing(e.currentTarget.checked)}
+                    />
+                    Keep going
+                  </label>
+                  {(jobRunning || jobStepping) && (
+                    <span className="run-live">
+                      <span className="run-dot" /> {jobStatus}
+                    </span>
+                  )}
+                </div>
+                <div className="job-picker">
+                  <select
+                    className="type-select"
+                    value={activeJobFile ?? ""}
+                    onChange={(e) => selectJob(e.currentTarget.value || null)}
+                  >
+                    <option value="">— no active job —</option>
+                    {jobs.map((j) => (
+                      <option key={j.file ?? j.name} value={j.file ?? ""}>
+                        {j.name}
+                        {j.dirty ? " •" : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => {
+                      setNewJobName("");
+                      setJobErr("");
+                      setNewJobOpen(true);
+                    }}
+                  >
+                    + New
+                  </button>
+                  <button
+                    className="btn btn-sm"
+                    disabled={!activeJobFile}
+                    onClick={() => {
+                      const a = jobs.find((j) => j.active);
+                      if (a) {
+                        setRenameJobName(a.name);
+                        setJobErr("");
+                        setRenameJobTarget(a);
+                      }
+                    }}
+                  >
+                    Rename
+                  </button>
+                  <button
+                    className="btn btn-sm btn-trash"
+                    disabled={!activeJobFile}
+                    onClick={() => {
+                      const a = jobs.find((j) => j.active);
+                      if (a) setRemoveJobTarget(a);
+                    }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+
+              {jobErr && <div className="banner banner-warn">{jobErr}</div>}
+              {!jobRunning &&
+                !jobStepping &&
+                jobStatus &&
+                jobSkipped !== null && (
+                  <div
+                    className={`banner ${
+                      jobAborted || jobSkipped.length > 0
+                        ? "banner-warn"
+                        : "banner-ok"
+                    }`}
+                  >
+                    {jobAborted
+                      ? "Job aborted. "
+                      : jobSkipped.length === 0
+                        ? "Job complete — all placements placed."
+                        : `Job complete — ${jobSkipped.length} placement${
+                            jobSkipped.length === 1 ? "" : "s"
+                          } skipped:`}
+                    {jobSkipped.length > 0 && (
+                      <ul className="skip-list">
+                        {jobSkipped.map((s) => (
+                          <li key={`${s.board}-${s.id}`}>
+                            <span className="mono">{s.id}</span>
+                            {s.part ? ` · ${s.part}` : ""} ·{" "}
+                            <span className="muted">{s.board}</span>
+                          </li>
+                        ))}
+                      </ul>
                     )}
                   </div>
-                );
-              })()}
+                )}
+
+              {!activeJobFile ? (
+                <div className="muted jobs-empty">
+                  {jobs.length === 0
+                    ? "No jobs yet. Create one, then add boards to it."
+                    : "Pick an active job above (or create one)."}
+                </div>
+              ) : (
+                <>
+                  <div className="pane-head">
+                    <span className="pane-title">Boards</span>
+                    <select
+                      className="type-select"
+                      value={addBoardSel}
+                      onChange={(e) => setAddBoardSel(e.currentTarget.value)}
+                    >
+                      {jobBoardLib.length === 0 && (
+                        <option value="">no boards in library</option>
+                      )}
+                      {jobBoardLib.map((b) => (
+                        <option key={b.file} value={b.file}>
+                          {b.name}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      className="btn btn-sm btn-primary"
+                      onClick={addBoardToJob}
+                      disabled={!addBoardSel}
+                    >
+                      + Add board
+                    </button>
+                  </div>
+                  <div className="ptable-wrap">
+                    <table className="ptable jobs-boards">
+                      <thead>
+                        <tr>
+                          <th>Id</th>
+                          <th>Name</th>
+                          <th>Side</th>
+                          <th>X</th>
+                          <th>Y</th>
+                          <th>Z</th>
+                          <th>Rot</th>
+                          <th>En</th>
+                          <th>Fid</th>
+                          <th>Align</th>
+                          <th></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {jobBoards.length === 0 && (
+                          <tr>
+                            <td colSpan={11} className="muted">
+                              No boards in this job — add one above.
+                            </td>
+                          </tr>
+                        )}
+                        {jobBoards.map((b) => (
+                          <tr
+                            key={b.uid}
+                            className={
+                              selectedBoardUid === b.uid ? "sel-row" : ""
+                            }
+                            onClick={() => setSelectedBoardUid(b.uid)}
+                          >
+                            <td className="mono">{b.uid}</td>
+                            <td className="mono">{b.boardName}</td>
+                            <td onClick={(e) => e.stopPropagation()}>
+                              <select
+                                className="cell-select"
+                                value={b.side}
+                                onChange={(e) =>
+                                  updateJobBoard(b.uid, {
+                                    side: e.currentTarget.value,
+                                  })
+                                }
+                              >
+                                <option value="Top">Top</option>
+                                <option value="Bottom">Bottom</option>
+                              </select>
+                            </td>
+                            {(["x", "y", "z", "rotation"] as const).map((k) => (
+                              <td key={k} onClick={(e) => e.stopPropagation()}>
+                                <input
+                                  key={`${b.uid}-${k}-${b[k]}`}
+                                  type="number"
+                                  className="cell-num"
+                                  defaultValue={b[k]}
+                                  onBlur={(e) => {
+                                    const v = parseFloat(e.currentTarget.value);
+                                    if (!Number.isNaN(v) && v !== b[k])
+                                      updateJobBoard(b.uid, { [k]: v });
+                                  }}
+                                />
+                              </td>
+                            ))}
+                            <td onClick={(e) => e.stopPropagation()}>
+                              <input
+                                type="checkbox"
+                                checked={b.enabled}
+                                onChange={(e) =>
+                                  updateJobBoard(b.uid, {
+                                    enabled: e.currentTarget.checked,
+                                  })
+                                }
+                              />
+                            </td>
+                            <td onClick={(e) => e.stopPropagation()}>
+                              <input
+                                type="checkbox"
+                                checked={b.checkFids}
+                                onChange={(e) =>
+                                  updateJobBoard(b.uid, {
+                                    checkFids: e.currentTarget.checked,
+                                  })
+                                }
+                              />
+                            </td>
+                            <td onClick={(e) => e.stopPropagation()}>
+                              <button
+                                className="btn btn-sm"
+                                onClick={() =>
+                                  alignUid === b.uid
+                                    ? setAlignUid(null)
+                                    : openAlign(b.uid)
+                                }
+                                title="Fiducial-align this board"
+                              >
+                                {b.aligned ? `${b.alignAngle}°` : "align"}
+                              </button>
+                            </td>
+                            <td
+                              className="row-actions"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <button
+                                className="btn btn-sm btn-icon"
+                                onClick={() => teachJobBoard(b.uid, false)}
+                                title="Jog camera to board origin"
+                              >
+                                <CrosshairIcon size={14} />
+                              </button>
+                              <button
+                                className="btn btn-sm btn-icon"
+                                onClick={() => teachJobBoard(b.uid, true)}
+                                title="Set origin from camera"
+                              >
+                                <CameraIcon size={14} />
+                              </button>
+                              <button
+                                className="btn btn-sm btn-icon btn-trash"
+                                onClick={() => removeBoardFromJob(b.uid)}
+                                title="Remove board from job"
+                              >
+                                <TrashIcon size={14} />
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {alignUid && jobBoards.some((b) => b.uid === alignUid) && (
+                    <div className="detect-grp align-panel">
+                      <div className="detect-title">
+                        Fiducial alignment —{" "}
+                        {jobBoards.find((b) => b.uid === alignUid)?.boardName} —
+                        capture ≥2 fiducials, then compute
+                      </div>
+                      {alignFids.length === 0 ? (
+                        <div className="muted">
+                          No fiducials on this board. Mark placements as type
+                          Fiducial below (IDs starting FID auto-label).
+                        </div>
+                      ) : (
+                        <>
+                          {alignFids.map((f) => {
+                            const cap = alignMeasured[f.id];
+                            return (
+                              <div key={f.id} className="align-fid-row">
+                                <span className="mono align-fid-id">{f.id}</span>
+                                <span className="muted align-fid-xy">
+                                  design ({f.x}, {f.y})
+                                </span>
+                                <button
+                                  className="btn btn-sm"
+                                  onClick={() => alignGo(f.id)}
+                                >
+                                  <CrosshairIcon size={12} /> Go
+                                </button>
+                                <button
+                                  className="btn btn-sm"
+                                  onClick={() => alignCapture(f.id)}
+                                >
+                                  <CameraIcon size={12} /> Capture
+                                </button>
+                                <span
+                                  className={`align-fid-cap ${cap ? "ok" : ""}`}
+                                >
+                                  {cap
+                                    ? `✓ (${cap.x}, ${cap.y})`
+                                    : "not captured"}
+                                </span>
+                              </div>
+                            );
+                          })}
+                          <div className="teach-actions align-actions">
+                            <button
+                              className="btn btn-sm btn-primary"
+                              onClick={computeAlign}
+                              disabled={Object.keys(alignMeasured).length < 2}
+                            >
+                              Compute alignment (
+                              {Object.keys(alignMeasured).length})
+                            </button>
+                            <button
+                              className="btn btn-sm"
+                              onClick={() => autoAlign(alignUid)}
+                              disabled={!enabled}
+                              title="Auto-locate fiducials by camera vision"
+                            >
+                              Auto (vision)
+                            </button>
+                            <button
+                              className="btn btn-sm"
+                              onClick={() => clearAlign(alignUid)}
+                            >
+                              Clear
+                            </button>
+                          </div>
+                          {alignResult && (
+                            <div
+                              className={`banner ${
+                                alignResult.residual > 0.5
+                                  ? "banner-warn"
+                                  : "banner-ok"
+                              }`}
+                            >
+                              Aligned from {alignResult.points} fiducials —
+                              rotation {alignResult.angle}°, residual{" "}
+                              {alignResult.residual} mm
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="pane-head pane-head-plc">
+                    <span className="pane-title">
+                      Placements
+                      {selectedBoard ? ` — ${selectedBoard.boardName}` : ""}
+                    </span>
+                    <button
+                      className="btn btn-sm"
+                      onClick={addJobPlacement}
+                      disabled={!selectedBoard}
+                    >
+                      + Add
+                    </button>
+                    <div className="plc-search">
+                      <SearchIcon size={13} />
+                      <input
+                        className="plc-search-input"
+                        placeholder="search id / part"
+                        value={plcSearch}
+                        onChange={(e) => setPlcSearch(e.currentTarget.value)}
+                      />
+                    </div>
+                  </div>
+                  <div className="ptable-wrap plc-scroll">
+                    <table className="ptable jobs-plc">
+                      <thead>
+                        <tr>
+                          <th>En</th>
+                          <th>ID</th>
+                          <th>Part</th>
+                          <th>Side</th>
+                          <th>X</th>
+                          <th>Y</th>
+                          <th>Rot</th>
+                          <th>Type</th>
+                          <th>Placed</th>
+                          <th>Status</th>
+                          <th>Err</th>
+                          <th>Comments</th>
+                          <th></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {!selectedBoard && (
+                          <tr>
+                            <td colSpan={13} className="muted">
+                              Select a board above to see its placements.
+                            </td>
+                          </tr>
+                        )}
+                        {jobBoardPlc
+                          .filter((p) => {
+                            const q = plcSearch.trim().toLowerCase();
+                            if (!q) return true;
+                            return (
+                              p.id.toLowerCase().includes(q) ||
+                              (p.part ?? "").toLowerCase().includes(q)
+                            );
+                          })
+                          .map((p) => (
+                            <tr key={p.id}>
+                              <td>
+                                <input
+                                  type="checkbox"
+                                  checked={p.enabled}
+                                  onChange={(e) =>
+                                    editJobPlacement(p.id, {
+                                      enabled: e.currentTarget.checked,
+                                    })
+                                  }
+                                />
+                              </td>
+                              <td className="mono">{p.id}</td>
+                              <td>
+                                <select
+                                  className="cell-select"
+                                  value={p.part ?? ""}
+                                  onChange={(e) =>
+                                    editJobPlacement(p.id, {
+                                      partId: e.currentTarget.value,
+                                    })
+                                  }
+                                >
+                                  <option value="">— none —</option>
+                                  {partsDetail.map((pt) => (
+                                    <option key={pt.id} value={pt.id}>
+                                      {pt.id}
+                                    </option>
+                                  ))}
+                                </select>
+                              </td>
+                              <td>
+                                <select
+                                  className="cell-select"
+                                  value={p.side ?? "Top"}
+                                  onChange={(e) =>
+                                    editJobPlacement(p.id, {
+                                      side: e.currentTarget.value,
+                                    })
+                                  }
+                                >
+                                  <option value="Top">Top</option>
+                                  <option value="Bottom">Bottom</option>
+                                </select>
+                              </td>
+                              {(["x", "y", "rot"] as const).map((k) => (
+                                <td key={k}>
+                                  <input
+                                    key={`${p.id}-${k}-${p[k]}`}
+                                    type="number"
+                                    className="cell-num"
+                                    defaultValue={p[k]}
+                                    onBlur={(e) => {
+                                      const v = parseFloat(
+                                        e.currentTarget.value,
+                                      );
+                                      if (!Number.isNaN(v) && v !== p[k])
+                                        editJobPlacement(p.id, { [k]: v });
+                                    }}
+                                  />
+                                </td>
+                              ))}
+                              <td>
+                                <select
+                                  className="cell-select"
+                                  value={p.type}
+                                  onChange={(e) =>
+                                    editJobPlacement(p.id, {
+                                      type: e.currentTarget.value,
+                                    })
+                                  }
+                                >
+                                  <option value="Placement">Placement</option>
+                                  <option value="Fiducial">Fiducial</option>
+                                </select>
+                              </td>
+                              <td className="cell-center">
+                                {p.placed ? "✓" : ""}
+                              </td>
+                              <td>
+                                <span
+                                  className={`plc-status status-${(
+                                    p.status ?? "ready"
+                                  )
+                                    .toLowerCase()
+                                    .replace(/ /g, "-")}`}
+                                >
+                                  {p.status}
+                                </span>
+                              </td>
+                              <td>
+                                <select
+                                  className="cell-select"
+                                  value={p.errorHandling ?? "Default"}
+                                  onChange={(e) =>
+                                    editJobPlacement(p.id, {
+                                      errorHandling: e.currentTarget.value,
+                                    })
+                                  }
+                                >
+                                  {ERROR_HANDLING.map((eh) => (
+                                    <option key={eh} value={eh}>
+                                      {eh}
+                                    </option>
+                                  ))}
+                                </select>
+                              </td>
+                              <td>
+                                <input
+                                  key={`${p.id}-cmt-${p.comments ?? ""}`}
+                                  className="cell-text"
+                                  defaultValue={p.comments ?? ""}
+                                  onBlur={(e) => {
+                                    if (
+                                      e.currentTarget.value !==
+                                      (p.comments ?? "")
+                                    )
+                                      editJobPlacement(p.id, {
+                                        comments: e.currentTarget.value,
+                                      });
+                                  }}
+                                />
+                              </td>
+                              <td className="row-actions">
+                                <button
+                                  className="btn btn-sm btn-icon btn-trash"
+                                  onClick={() => deleteJobPlacement(p.id)}
+                                  title="Delete placement"
+                                >
+                                  <TrashIcon size={13} />
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
             </section>
           )}
 
@@ -5309,297 +5830,6 @@ function App() {
         </div>
       )}
 
-      {jobEditFile && (
-        <div className="modal-backdrop" onClick={() => setJobEditFile(null)}>
-          <div
-            className="modal modal-wide"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="modal-head">
-              <h3>
-                Job — <span className="mono">{jobEditName}</span>
-              </h3>
-              <button
-                className="icon-btn"
-                onClick={() => setJobEditFile(null)}
-                title="Close"
-              >
-                ✕
-              </button>
-            </div>
-            <div className="modal-body plc-body">
-              <div className="import-row">
-                <select
-                  className="type-select"
-                  value={addBoardSel}
-                  onChange={(e) => setAddBoardSel(e.currentTarget.value)}
-                >
-                  {jobBoardLib.length === 0 && (
-                    <option value="">no boards in library</option>
-                  )}
-                  {jobBoardLib.map((b) => (
-                    <option key={b.file} value={b.file}>
-                      {b.name}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  className="btn btn-primary"
-                  onClick={addBoardToJob}
-                  disabled={!addBoardSel}
-                >
-                  + Add board
-                </button>
-              </div>
-              {jobErr && <div className="banner banner-warn">{jobErr}</div>}
-              {jobBoards.length === 0 ? (
-                <div className="muted">
-                  No boards in this job yet. Add one above, then position it on
-                  the machine bed.
-                </div>
-              ) : (
-                jobBoards.map((b) => (
-                  <div key={b.uid} className="teach-block">
-                    <div className="teach-head">
-                      <span className="mono">{b.boardName}</span> ·{" "}
-                      {b.placements} placements · {b.fiducialCount} fiducial
-                      {b.fiducialCount === 1 ? "" : "s"}
-                      {b.aligned && (
-                        <span className="job-active-tag" title="Fiducial-aligned">
-                          aligned {b.alignAngle}°
-                        </span>
-                      )}
-                      <button
-                        className="btn btn-sm btn-icon btn-trash jb-remove"
-                        onClick={() => removeBoardFromJob(b.uid)}
-                        title="Remove from job"
-                        aria-label="Remove board from job"
-                      >
-                        <TrashIcon size={14} />
-                      </button>
-                    </div>
-                    <div className="field-grid">
-                      <label className="loc-field">
-                        <span>X (mm)</span>
-                        <NumberInput
-                          step={1}
-                          value={b.x}
-                          onChange={(v) => updateJobBoard(b.uid, { x: v })}
-                        />
-                      </label>
-                      <label className="loc-field">
-                        <span>Y (mm)</span>
-                        <NumberInput
-                          step={1}
-                          value={b.y}
-                          onChange={(v) => updateJobBoard(b.uid, { y: v })}
-                        />
-                      </label>
-                      <label className="loc-field">
-                        <span>Z (mm)</span>
-                        <NumberInput
-                          step={0.1}
-                          value={b.z}
-                          onChange={(v) => updateJobBoard(b.uid, { z: v })}
-                        />
-                      </label>
-                      <label className="loc-field">
-                        <span>Rotation°</span>
-                        <NumberInput
-                          step={1}
-                          value={b.rotation}
-                          onChange={(v) =>
-                            updateJobBoard(b.uid, { rotation: v })
-                          }
-                        />
-                      </label>
-                      <label className="loc-field">
-                        <span>Side</span>
-                        <select
-                          className="type-select"
-                          value={b.side}
-                          onChange={(e) =>
-                            updateJobBoard(b.uid, { side: e.currentTarget.value })
-                          }
-                        >
-                          <option value="Top">Top</option>
-                          <option value="Bottom">Bottom</option>
-                        </select>
-                      </label>
-                    </div>
-                    <div className="teach-actions">
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => teachJobBoard(b.uid, false)}
-                        title="Jog the camera to this board origin"
-                      >
-                        <CrosshairIcon size={13} /> Go
-                      </button>
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => teachJobBoard(b.uid, true)}
-                        title="Set origin from the current camera position"
-                      >
-                        <CameraIcon size={13} /> Grab
-                      </button>
-                      <label className="run-toggle">
-                        <input
-                          type="checkbox"
-                          checked={b.enabled}
-                          onChange={(e) =>
-                            updateJobBoard(b.uid, {
-                              enabled: e.currentTarget.checked,
-                            })
-                          }
-                        />
-                        Enabled
-                      </label>
-                      <label
-                        className="run-toggle"
-                        title="Locate this board by its fiducials before placing."
-                      >
-                        <input
-                          type="checkbox"
-                          checked={b.checkFids}
-                          onChange={(e) =>
-                            updateJobBoard(b.uid, {
-                              checkFids: e.currentTarget.checked,
-                            })
-                          }
-                        />
-                        Check fiducials
-                      </label>
-                      <button
-                        className="btn btn-sm"
-                        onClick={() =>
-                          alignUid === b.uid
-                            ? setAlignUid(null)
-                            : openAlign(b.uid)
-                        }
-                        title="Locate this board by its fiducials (rotation + offset)"
-                      >
-                        <CrosshairIcon size={13} />{" "}
-                        {alignUid === b.uid ? "Close align" : "Align…"}
-                      </button>
-                    </div>
-
-                    {alignUid === b.uid && (
-                      <div className="detect-grp align-panel">
-                        <div className="detect-title">
-                          Fiducial alignment — capture ≥2 fiducials, then compute
-                        </div>
-                        {alignFids.length === 0 ? (
-                          <div className="muted">
-                            No fiducials on this board. Mark placements as type
-                            Fiducial in the board's placements editor (IDs
-                            starting FID are auto-labeled).
-                          </div>
-                        ) : (
-                          <>
-                            {alignFids.map((f) => {
-                              const cap = alignMeasured[f.id];
-                              return (
-                                <div key={f.id} className="align-fid-row">
-                                  <span className="mono align-fid-id">
-                                    {f.id}
-                                  </span>
-                                  <span className="muted align-fid-xy">
-                                    design ({f.x}, {f.y})
-                                  </span>
-                                  <button
-                                    className="btn btn-sm"
-                                    onClick={() => alignGo(f.id)}
-                                    title="Jog camera to where this fiducial is expected"
-                                  >
-                                    <CrosshairIcon size={12} /> Go
-                                  </button>
-                                  <button
-                                    className="btn btn-sm"
-                                    onClick={() => alignCapture(f.id)}
-                                    title="Capture the current camera position for this fiducial"
-                                  >
-                                    <CameraIcon size={12} /> Capture
-                                  </button>
-                                  <span
-                                    className={`align-fid-cap ${
-                                      cap ? "ok" : ""
-                                    }`}
-                                  >
-                                    {cap
-                                      ? `✓ (${cap.x}, ${cap.y})`
-                                      : "not captured"}
-                                  </span>
-                                </div>
-                              );
-                            })}
-                            <div className="teach-actions align-actions">
-                              <button
-                                className="btn btn-sm btn-primary"
-                                onClick={computeAlign}
-                                disabled={
-                                  Object.keys(alignMeasured).length < 2
-                                }
-                              >
-                                Compute alignment (
-                                {Object.keys(alignMeasured).length})
-                              </button>
-                              <button
-                                className="btn btn-sm"
-                                onClick={() => autoAlign(b.uid)}
-                                disabled={!enabled}
-                                title="Auto-locate fiducials by camera vision (needs the machine + configured fiducial vision)"
-                              >
-                                Auto (vision)
-                              </button>
-                              {b.aligned && (
-                                <button
-                                  className="btn btn-sm"
-                                  onClick={() => clearAlign(b.uid)}
-                                  title="Remove the alignment transform"
-                                >
-                                  Clear
-                                </button>
-                              )}
-                            </div>
-                            {alignResult && (
-                              <div
-                                className={`banner ${
-                                  alignResult.residual > 0.5
-                                    ? "banner-warn"
-                                    : "banner-ok"
-                                }`}
-                              >
-                                Aligned from {alignResult.points} fiducials —
-                                rotation {alignResult.angle}°, residual{" "}
-                                {alignResult.residual} mm
-                                {alignResult.residual > 0.5
-                                  ? " (high — re-capture more carefully)"
-                                  : "."}
-                              </div>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                ))
-              )}
-            </div>
-            <div className="modal-foot">
-              <span className="muted job-save-note">
-                Edits mark the job unsaved — use Save in the header to write the
-                .job.xml.
-              </span>
-              <button
-                className="btn btn-primary"
-                onClick={() => setJobEditFile(null)}
-              >
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {editPlacement && (
         <div className="modal-backdrop" onClick={() => setEditPlacement(null)}>

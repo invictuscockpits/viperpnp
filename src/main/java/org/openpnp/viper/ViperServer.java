@@ -107,7 +107,9 @@ public class ViperServer {
     private static File activeJobFile = null;
     private static volatile boolean jobRunning = false;
     private static volatile boolean jobAbortRequested = false;
+    private static volatile boolean jobStepping = false;
     private static PnpJobProcessor jobProcessor;
+    private static JobProcessor.TextStatusListener jobStepListener;
     private static volatile boolean configDirty = false;
     /** file-part-id → canonical-part-id remap rules (persisted alongside config). */
     private static final Map<String, String> partAliases = new LinkedHashMap<>();
@@ -273,7 +275,9 @@ public class ViperServer {
         app.post("/api/boards/new", ViperServer::newBoard);
         app.post("/api/boards/remove", ViperServer::removeBoard);
         app.post("/api/job/run", ViperServer::runJob);
+        app.post("/api/job/step", ViperServer::stepJob);
         app.post("/api/job/abort", ViperServer::abortJob);
+        app.post("/api/job/board/placements", ViperServer::jobBoardPlacements);
         app.get("/api/jobs", ViperServer::listJobs);
         app.post("/api/job/select", ViperServer::selectJob);
         app.post("/api/jobs/new", ViperServer::newJob);
@@ -295,6 +299,7 @@ public class ViperServer {
         app.get("/api/job/state", ctx -> {
             Map<String, Object> s = new LinkedHashMap<>();
             s.put("running", jobRunning);
+            s.put("stepping", jobStepping);
             s.put("loaded", currentJob != null);
             ctx.contentType("application/json");
             ctx.result(GSON.toJson(s));
@@ -2285,6 +2290,9 @@ public class ViperServer {
                 found.setPart(req.partId.isEmpty() ? null
                         : Configuration.get().getPart(req.partId));
             }
+            if (req.comments != null) {
+                found.setComments(req.comments);
+            }
             if (req.x != null || req.y != null || req.rot != null) {
                 Location l = found.getLocation().convertToUnits(LengthUnit.Millimeters);
                 found.setLocation(new Location(LengthUnit.Millimeters,
@@ -2548,6 +2556,7 @@ public class ViperServer {
         Double x;
         Double y;
         Double rot;
+        String comments;
     }
 
     /** JSON body for board-scoped endpoints. */
@@ -2640,14 +2649,79 @@ public class ViperServer {
         }
     }
 
-    /** POST /api/job/abort — requests a graceful abort of the running job. */
+    /**
+     * POST /api/job/step — advances the job by a single processor step (one placement/action).
+     * Initializes the processor on the first step; subsequent steps continue. Emits jobStatus per
+     * step and jobComplete when there are no more steps. Uses Alert handling so a step surfaces
+     * issues rather than silently skipping. Not allowed while a continuous run is in progress.
+     */
+    private static void stepJob(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            if (currentJob == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"no job loaded\"}");
+                return;
+            }
+            if (jobRunning) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"a continuous run is in progress\"}");
+                return;
+            }
+            final PnpJobProcessor jp = machine.getPnpJobProcessor();
+            final Job job = currentJob;
+            if (!jobStepping) {
+                job.setErrorHandling(Job.ErrorHandling.Alert);
+                jobStepListener = text -> broadcast(GSON.toJson(jobEvent("jobStatus", text, null, false)));
+                jp.addTextStatusListener(jobStepListener);
+                jp.initialize(job);
+                jobProcessor = jp;
+                jobAbortRequested = false;
+                jobStepping = true;
+                broadcast(GSON.toJson(jobEvent("jobStarted", "Stepping", null, false)));
+            }
+            machine.submit(() -> {
+                boolean more;
+                try {
+                    more = jp.next();
+                }
+                catch (Exception e) {
+                    more = false;
+                    broadcast(GSON.toJson(errorMap(e)));
+                }
+                if (!more) {
+                    endStepping(job);
+                }
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"stepped\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** Tears down a step session and reports completion. */
+    private static void endStepping(Job job) {
+        jobStepping = false;
+        if (jobStepListener != null && jobProcessor != null) {
+            jobProcessor.removeTextStatusListener(jobStepListener);
+        }
+        jobStepListener = null;
+        broadcast(GSON.toJson(jobEvent("jobComplete", "Job complete",
+                collectSkipped(job), jobAbortRequested)));
+    }
+
+    /** POST /api/job/abort — requests a graceful abort of the running (or stepping) job. */
     private static void abortJob(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
-        if (!jobRunning) {
+        if (!jobRunning && !jobStepping) {
             ctx.result("{\"running\":false}");
             return;
         }
         jobAbortRequested = true;
+        boolean wasStepping = jobStepping;
         jobRunning = false;
         try {
             if (jobProcessor != null) {
@@ -2656,6 +2730,9 @@ public class ViperServer {
         }
         catch (Exception e) {
             // abort() cleans up best-effort; the run loop will exit regardless.
+        }
+        if (wasStepping) {
+            endStepping(currentJob);
         }
         ctx.result("{\"aborting\":true}");
     }
@@ -2880,6 +2957,8 @@ public class ViperServer {
         m.put("uid", bl.getUniqueId());
         m.put("boardFile", b.getFile() != null ? b.getFile().getAbsolutePath() : null);
         m.put("boardName", b.getName());
+        m.put("width", boardDim(b, true));
+        m.put("length", boardDim(b, false));
         m.put("side", bl.getGlobalSide().toString());
         m.put("enabled", bl.isEnabled());
         m.put("checkFids", bl.isCheckFiducials());
@@ -3108,6 +3187,65 @@ public class ViperServer {
             ctx.status(500);
             ctx.result(GSON.toJson(errorMap(e)));
         }
+    }
+
+    /**
+     * POST /api/job/board/placements — the selected board-location's placements, each with its
+     * job-context Placed flag and a derived Status. Body: {file, uid}. Placements live on the
+     * shared Board (edit via the board-scoped /api/job/placement endpoints); Placed status is
+     * per board-location in the job.
+     */
+    private static void jobBoardPlacements(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+        Job j = req != null ? findJob(req.file) : null;
+        BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+        if (bl == null) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"board location not found\"}");
+            return;
+        }
+        Board board = bl.getBoard();
+        Set<String> fiducialIds = fiducialPartIds();
+        List<Map<String, Object>> placements = new ArrayList<>();
+        for (Placement p : board.getPlacements()) {
+            Map<String, Object> pm = placementMap(p);
+            boolean placed = j.retrievePlacedStatus(bl, p.getId());
+            pm.put("placed", placed);
+            pm.put("status", placementStatus(p, placed, fiducialIds));
+            placements.add(pm);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("boardFile", board.getFile() != null ? board.getFile().getAbsolutePath() : null);
+        root.put("boardName", board.getName());
+        root.put("uid", bl.getUniqueId());
+        root.put("placements", placements);
+        ctx.result(GSON.toJson(root));
+    }
+
+    /**
+     * Derives the OpenPnP-style placement Status: Disabled if off; Placed if done this run;
+     * else Ready, unless it's un-runnable (no part / no part height on a non-fiducial).
+     */
+    private static String placementStatus(Placement p, boolean placed, Set<String> fiducialIds) {
+        if (!p.isEnabled()) {
+            return "Disabled";
+        }
+        if (placed) {
+            return "Placed";
+        }
+        boolean fiducial = p.getType() == Placement.Type.Fiducial
+                || (p.getPart() != null && fiducialIds.contains(p.getPart().getId()));
+        if (!fiducial) {
+            if (p.getPart() == null) {
+                return "No part";
+            }
+            if (p.getPart().getHeight() == null
+                    || p.getPart().getHeight().getValue() == 0) {
+                return "No height";
+            }
+        }
+        return "Ready";
     }
 
     /** JSON body for job board-location endpoints. */
@@ -4381,6 +4519,7 @@ public class ViperServer {
         pm.put("x", round(l.getX()));
         pm.put("y", round(l.getY()));
         pm.put("rot", round(l.getRotation()));
+        pm.put("comments", p.getComments() != null ? p.getComments() : "");
         return pm;
     }
 
