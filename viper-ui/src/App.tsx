@@ -311,6 +311,7 @@ function App() {
   const [importFormat, setImportFormat] = useState("kicad");
   const [formatMenuOpen, setFormatMenuOpen] = useState(false);
   const [savePath, setSavePath] = useState("");
+  const [createParts, setCreateParts] = useState(true);
   const [boards, setBoards] = useState<BoardInfo[]>([]);
   const [activeBoard, setActiveBoard] = useState<string | null>(null);
   const [boardPlacements, setBoardPlacements] = useState<Placement[]>([]);
@@ -536,6 +537,7 @@ function App() {
           format: importFormat,
           topFile: importPath,
           savePath: savePath || undefined,
+          createMissingParts: createParts,
         }),
       });
       const data = await res.json();
@@ -1381,6 +1383,17 @@ function App() {
                     <FolderIcon size={15} />
                   </button>
                 </div>
+                <label
+                  className="run-toggle"
+                  title="On import, create Part entries for any part not already in the library."
+                >
+                  <input
+                    type="checkbox"
+                    checked={createParts}
+                    onChange={(e) => setCreateParts(e.currentTarget.checked)}
+                  />
+                  Create missing parts
+                </label>
               </div>
               {boards.length > 0 && (
                 <div className="run-bar">
