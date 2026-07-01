@@ -20,6 +20,26 @@ export function CameraIcon({ size = 18 }: { size?: number }) {
   );
 }
 
+export function WarnIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 3.5 21 19H3z" />
+      <line x1="12" y1="9.5" x2="12" y2="13.5" />
+      <circle cx="12" cy="16.5" r="0.6" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 export function GearIcon({ size = 18 }: { size?: number }) {
   return (
     <svg

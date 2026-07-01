@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { BoardMap, type Placement } from "./BoardMap";
-import { CameraIcon, GearIcon, NozzleIcon } from "./Icons";
+import { CameraIcon, GearIcon, NozzleIcon, WarnIcon } from "./Icons";
 import "./App.css";
 
 interface DriverInfo {
@@ -241,6 +241,7 @@ function App() {
   const [feederType, setFeederType] = useState("photon");
   const [feederName, setFeederName] = useState("");
   const [editFeeder, setEditFeeder] = useState<FeederConfig | null>(null);
+  const [openTip, setOpenTip] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [jobRunning, setJobRunning] = useState(false);
   const [configDirty, setConfigDirty] = useState(false);
@@ -1243,15 +1244,7 @@ function App() {
                             ⠿
                           </td>
                           <td>
-                            {f.canEnable === false ? (
-                              <button
-                                className="needs-setup"
-                                onClick={() => openEditFeeder(f.id)}
-                                title={`Set up before enabling: ${(f.needs ?? []).join(", ")}`}
-                              >
-                                needs setup
-                              </button>
-                            ) : (
+                            <span className="active-cell">
                               <input
                                 type="checkbox"
                                 checked={f.enabled}
@@ -1261,7 +1254,28 @@ function App() {
                                   })
                                 }
                               />
-                            )}
+                              {f.canEnable === false && (
+                                <span className="warn-wrap">
+                                  <button
+                                    type="button"
+                                    className="warn-tri"
+                                    title={`Set up before enabling: ${(f.needs ?? []).join(", ")}`}
+                                    aria-label="Setup required"
+                                    onClick={() =>
+                                      setOpenTip(openTip === f.id ? null : f.id)
+                                    }
+                                  >
+                                    <WarnIcon size={14} />
+                                  </button>
+                                  {openTip === f.id && (
+                                    <span className="warn-tip">
+                                      Set up before enabling:{" "}
+                                      {(f.needs ?? []).join(", ")}
+                                    </span>
+                                  )}
+                                </span>
+                              )}
+                            </span>
                           </td>
                           <td className="mono">{f.name}</td>
                           <td className="muted">{f.type}</td>
