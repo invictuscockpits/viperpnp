@@ -563,6 +563,12 @@ public class ViperServer {
                     board.addPlacement(p);
                 }
             }
+            // Any placement whose reference starts with FID is a fiducial.
+            for (Placement p : board.getPlacements()) {
+                if (p.getId() != null && p.getId().toUpperCase().startsWith("FID")) {
+                    p.setType(Placement.Type.Fiducial);
+                }
+            }
             // Persist as a .board.xml file and add it to the library.
             File file = resolveBoardFile(req.savePath, name);
             file.getParentFile().mkdirs();
