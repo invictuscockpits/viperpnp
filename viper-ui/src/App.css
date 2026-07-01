@@ -698,15 +698,12 @@ body {
   color: #e6b800;
   display: inline-flex;
   align-items: center;
-  position: relative;
 }
 
-.warn-tip {
-  position: absolute;
-  left: 50%;
-  bottom: calc(100% + 6px);
-  transform: translateX(-50%);
-  z-index: 20;
+.warn-tip-fixed {
+  position: fixed;
+  transform: translateY(-100%) translateY(-6px);
+  z-index: 100;
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 5px;
@@ -715,14 +712,7 @@ body {
   color: var(--text);
   white-space: nowrap;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
-  opacity: 0;
-  visibility: hidden;
   pointer-events: none;
-}
-
-.warn-tri:hover .warn-tip {
-  opacity: 1;
-  visibility: visible;
 }
 
 .row-actions {

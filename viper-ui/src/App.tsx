@@ -242,6 +242,9 @@ function App() {
   const [feederName, setFeederName] = useState("");
   const [editFeeder, setEditFeeder] = useState<FeederConfig | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<FeederInfo | null>(null);
+  const [tip, setTip] = useState<{ text: string; x: number; y: number } | null>(
+    null,
+  );
   const [scanning, setScanning] = useState(false);
   const [jobRunning, setJobRunning] = useState(false);
   const [configDirty, setConfigDirty] = useState(false);
@@ -1273,12 +1276,21 @@ function App() {
                                 }
                               />
                               {f.canEnable === false && (
-                                <span className="warn-tri" aria-label="Setup required">
+                                <span
+                                  className="warn-tri"
+                                  aria-label="Setup required"
+                                  onMouseEnter={(e) => {
+                                    const r =
+                                      e.currentTarget.getBoundingClientRect();
+                                    setTip({
+                                      text: `Set up before enabling: ${(f.needs ?? []).join(", ")}`,
+                                      x: r.left,
+                                      y: r.top,
+                                    });
+                                  }}
+                                  onMouseLeave={() => setTip(null)}
+                                >
                                   <WarnIcon size={14} />
-                                  <span className="warn-tip">
-                                    Set up before enabling:{" "}
-                                    {(f.needs ?? []).join(", ")}
-                                  </span>
                                 </span>
                               )}
                             </span>
@@ -1776,6 +1788,12 @@ function App() {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {tip && (
+        <div className="warn-tip-fixed" style={{ left: tip.x, top: tip.y }}>
+          {tip.text}
         </div>
       )}
 
