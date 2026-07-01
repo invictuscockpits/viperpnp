@@ -707,6 +707,38 @@ public class ViperServer {
         return e;
     }
 
+    /**
+     * Display name for a feeder. {@link PhotonFeeder#getName()} hardcodes
+     * "Unconfigured PhotonFeeder" whenever the feeder has no hardwareId yet
+     * (i.e. it hasn't been discovered on the bus), which throws away any name
+     * the user set. Here we prefer the stored name in that case so a rename is
+     * actually visible; once the feeder is discovered, its normal
+     * "name (Slot: N)" form takes over again.
+     */
+    private static String feederName(Feeder f) {
+        if (f instanceof PhotonFeeder && ((PhotonFeeder) f).getHardwareId() == null) {
+            String raw = rawFeederName(f);
+            if (raw != null && !raw.isEmpty()
+                    && !raw.equals(PhotonFeeder.class.getSimpleName())) {
+                return raw;
+            }
+        }
+        return f.getName();
+    }
+
+    /** Reads the stored name field on AbstractFeeder, bypassing getName() overrides. */
+    private static String rawFeederName(Feeder f) {
+        try {
+            java.lang.reflect.Field field = AbstractFeeder.class.getDeclaredField("name");
+            field.setAccessible(true);
+            Object v = field.get(f);
+            return v != null ? v.toString() : null;
+        }
+        catch (Exception e) {
+            return null;
+        }
+    }
+
     /** Feeder list snapshot: name, type, assigned part, enabled. */
     private static Map<String, Object> describeFeeders() {
         Map<String, Object> root = new LinkedHashMap<>();
@@ -714,7 +746,7 @@ public class ViperServer {
         for (Feeder f : machine.getFeeders()) {
             Map<String, Object> fm = new LinkedHashMap<>();
             fm.put("id", f.getId());
-            fm.put("name", f.getName());
+            fm.put("name", feederName(f));
             fm.put("type", f.getClass().getSimpleName());
             fm.put("part", f.getPart() != null ? f.getPart().getId() : null);
             fm.put("enabled", f.isEnabled());
@@ -861,7 +893,7 @@ public class ViperServer {
     private static Map<String, Object> feederConfig(Feeder f) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", f.getId());
-        m.put("name", f.getName());
+        m.put("name", feederName(f));
         m.put("type", f.getClass().getSimpleName());
         m.put("part", f.getPart() != null ? f.getPart().getId() : null);
         m.put("enabled", f.isEnabled());
