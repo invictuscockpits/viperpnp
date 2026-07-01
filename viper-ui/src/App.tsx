@@ -185,6 +185,29 @@ function App() {
     }
   };
 
+  const updatePlacement = async (
+    id: string,
+    patch: { type?: string; enabled?: boolean },
+  ) => {
+    try {
+      const res = await fetch("/api/job/placement", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, ...patch }),
+      });
+      const data = await res.json();
+      if (data && (data.event === "error" || data.error)) {
+        setImportErr(String(data.message ?? data.error));
+      } else {
+        setJob(data as JobInfo);
+      }
+    } catch (e) {
+      setImportErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const placements = (job?.boards ?? []).flatMap((b) => b.placements);
+
   const pos = status?.position;
   const shortImpl = inventory?.impl.split(".").pop() ?? "—";
 
@@ -325,16 +348,69 @@ function App() {
               <div className="board-summary">
                 <span className="tag">{job.boards?.[0]?.name}</span>
                 <span className="muted">
-                  {job.placementCount} placements · {job.partCount} parts
+                  {job.placementCount} placements · {job.partCount} parts ·{" "}
+                  {placements.filter((p) => p.enabled).length} enabled ·{" "}
+                  {placements.filter((p) => p.type === "Fiducial").length} fiducials
                 </span>
                 <span className="legend">
-                  <span className="dot-top" /> Top
-                  <span className="dot-bot" /> Bottom
+                  <span className="lg lg-top" /> Top
+                  <span className="lg lg-fid" /> Fiducial
                 </span>
               </div>
-              <BoardMap
-                placements={(job.boards ?? []).flatMap((b) => b.placements)}
-              />
+              <div className="board-body">
+                <div className="ptable-wrap">
+                  <table className="ptable">
+                    <thead>
+                      <tr>
+                        <th>On</th>
+                        <th>Ref</th>
+                        <th>Part</th>
+                        <th>Type</th>
+                        <th>X</th>
+                        <th>Y</th>
+                        <th>Rot</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {placements.map((p) => (
+                        <tr key={p.id} className={p.enabled ? "" : "row-off"}>
+                          <td>
+                            <input
+                              type="checkbox"
+                              checked={p.enabled}
+                              onChange={(e) =>
+                                updatePlacement(p.id, {
+                                  enabled: e.currentTarget.checked,
+                                })
+                              }
+                            />
+                          </td>
+                          <td className="mono">{p.id}</td>
+                          <td className="muted ptable-part">{p.part ?? "—"}</td>
+                          <td>
+                            <select
+                              className="type-select"
+                              value={p.type}
+                              onChange={(e) =>
+                                updatePlacement(p.id, {
+                                  type: e.currentTarget.value,
+                                })
+                              }
+                            >
+                              <option value="Placement">Placement</option>
+                              <option value="Fiducial">Fiducial</option>
+                            </select>
+                          </td>
+                          <td className="mono">{p.x.toFixed(2)}</td>
+                          <td className="mono">{p.y.toFixed(2)}</td>
+                          <td className="mono">{p.rot.toFixed(0)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <BoardMap placements={placements} />
+              </div>
             </>
           ) : (
             <div className="muted">

@@ -2,6 +2,8 @@ export interface Placement {
   id: string;
   part: string | null;
   side: string | null;
+  type: string;
+  enabled: boolean;
   x: number;
   y: number;
   rot: number;
@@ -42,19 +44,40 @@ export function BoardMap({ placements }: { placements: Placement[] }) {
         stroke="#2a323d"
         strokeWidth={0.3}
       />
-      {pts.map((p) => (
-        <circle
-          key={p.id}
-          cx={p.x}
-          cy={p.sy}
-          r={r}
-          fill={p.side === "Bottom" ? "#6db3ff" : "#05aa3d"}
-          stroke="#0b0e12"
-          strokeWidth={r * 0.18}
-        >
-          <title>{`${p.id} · ${p.part ?? "?"} · ${p.rot}°`}</title>
-        </circle>
-      ))}
+      {pts.map((p) => {
+        const op = p.enabled ? 1 : 0.22;
+        const title = `${p.id} · ${p.part ?? "?"} · ${p.type} · ${p.rot}°`;
+        if (p.type === "Fiducial") {
+          return (
+            <circle
+              key={p.id}
+              cx={p.x}
+              cy={p.sy}
+              r={r * 1.7}
+              fill="none"
+              stroke="#e0b64e"
+              strokeWidth={r * 0.5}
+              opacity={op}
+            >
+              <title>{title}</title>
+            </circle>
+          );
+        }
+        return (
+          <circle
+            key={p.id}
+            cx={p.x}
+            cy={p.sy}
+            r={r}
+            fill={p.side === "Bottom" ? "#6db3ff" : "#05aa3d"}
+            stroke="#0b0e12"
+            strokeWidth={r * 0.18}
+            opacity={op}
+          >
+            <title>{title}</title>
+          </circle>
+        );
+      })}
     </svg>
   );
 }

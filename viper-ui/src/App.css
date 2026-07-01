@@ -462,6 +462,88 @@ body {
   display: block;
 }
 
+.lg {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.lg-top {
+  background: var(--green);
+}
+
+.lg-fid {
+  background: none;
+  border: 2px solid #e0b64e;
+  margin-left: 10px;
+}
+
+.board-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.ptable-wrap {
+  max-height: 440px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.ptable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.ptable thead th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  color: var(--muted);
+  text-align: left;
+  font-weight: 500;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ptable td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ptable tr:hover td {
+  background: var(--panel-2);
+}
+
+.ptable .row-off td {
+  opacity: 0.45;
+}
+
+.ptable .mono {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+
+.ptable-part {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.type-select {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 2px 6px;
+  font-size: 0.8rem;
+  font-family: inherit;
+}
+
 @media (max-width: 760px) {
   .grid {
     grid-template-columns: repeat(2, 1fr);
@@ -472,6 +554,10 @@ body {
   }
 
   .controls {
+    grid-template-columns: 1fr;
+  }
+
+  .board-body {
     grid-template-columns: 1fr;
   }
 }
