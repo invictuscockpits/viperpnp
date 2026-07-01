@@ -15,6 +15,7 @@ import org.openpnp.gui.importer.ReferenceCsvImporter;
 import org.openpnp.machine.photon.PhotonFeeder;
 import org.openpnp.machine.photon.PhotonProperties;
 import org.openpnp.machine.reference.ReferenceFeeder;
+import org.openpnp.machine.reference.ReferenceMachine;
 import org.openpnp.machine.reference.ReferenceNozzle;
 import org.openpnp.machine.reference.ReferencePnpJobProcessor;
 import org.openpnp.machine.reference.axis.ReferenceControllerAxis;
@@ -38,6 +39,7 @@ import org.openpnp.model.Part;
 import org.openpnp.model.Placement;
 import org.openpnp.spi.Actuator;
 import org.openpnp.spi.Axis;
+import org.openpnp.spi.base.AbstractHead;
 import org.openpnp.spi.Camera;
 import org.openpnp.spi.Driver;
 import org.openpnp.spi.Feeder;
@@ -238,6 +240,8 @@ public class ViperServer {
         app.post("/api/nozzletip", ViperServer::updateNozzleTip);
         app.get("/api/axes/detail", ViperServer::listAxes);
         app.post("/api/axis", ViperServer::updateAxis);
+        app.get("/api/general", ViperServer::getGeneral);
+        app.post("/api/general", ViperServer::updateGeneral);
         app.get("/api/parts/detail", ViperServer::listPartsDetail);
         app.post("/api/part", ViperServer::updatePart);
         app.post("/api/part/add", ViperServer::addPart);
@@ -1293,6 +1297,106 @@ public class ViperServer {
         Double limitHigh;
         Boolean limitLowOn;
         Boolean limitHighOn;
+    }
+
+    // ------------------------------------------------------------- General
+
+    private static Map<String, Object> describeGeneral() {
+        Map<String, Object> root = new LinkedHashMap<>();
+        if (machine instanceof ReferenceMachine) {
+            ReferenceMachine rm = (ReferenceMachine) machine;
+            root.put("homeAfterEnabled", rm.getHomeAfterEnabled());
+            root.put("autoToolSelect", rm.isAutoToolSelect());
+            root.put("safeZPark", rm.isSafeZPark());
+            root.put("parkAfterHomed", rm.isParkAfterHomed());
+        }
+        root.put("discard", locMap(machine.getDiscardLocation()));
+        Head head = null;
+        try {
+            if (!machine.getHeads().isEmpty()) {
+                head = machine.getHeads().get(0);
+            }
+        }
+        catch (Exception e) {
+            // ignore
+        }
+        if (head != null) {
+            root.put("park", locMap(head.getParkLocation()));
+            root.put("headName", head.getName());
+        }
+        return root;
+    }
+
+    private static void getGeneral(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        ctx.result(GSON.toJson(describeGeneral()));
+    }
+
+    /** POST /api/general — any subset of the toggles / discard / park coords. */
+    private static void updateGeneral(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            GeneralUpdate req = GSON.fromJson(ctx.body(), GeneralUpdate.class);
+            if (req == null) {
+                req = new GeneralUpdate();
+            }
+            if (machine instanceof ReferenceMachine) {
+                ReferenceMachine rm = (ReferenceMachine) machine;
+                if (req.homeAfterEnabled != null) {
+                    rm.setHomeAfterEnabled(req.homeAfterEnabled);
+                }
+                if (req.autoToolSelect != null) {
+                    rm.setAutoToolSelect(req.autoToolSelect);
+                }
+                if (req.safeZPark != null) {
+                    rm.setSafeZPark(req.safeZPark);
+                }
+                if (req.parkAfterHomed != null) {
+                    rm.setParkAfterHomed(req.parkAfterHomed);
+                }
+            }
+            if ((req.discardX != null || req.discardY != null || req.discardZ != null)
+                    && machine instanceof ReferenceMachine) {
+                Location d = machine.getDiscardLocation().convertToUnits(LengthUnit.Millimeters);
+                ((ReferenceMachine) machine).setDiscardLocation(new Location(LengthUnit.Millimeters,
+                        req.discardX != null ? req.discardX : d.getX(),
+                        req.discardY != null ? req.discardY : d.getY(),
+                        req.discardZ != null ? req.discardZ : d.getZ(),
+                        d.getRotation()));
+            }
+            if ((req.parkX != null || req.parkY != null || req.parkZ != null)
+                    && !machine.getHeads().isEmpty()) {
+                Head head = machine.getHeads().get(0);
+                if (head instanceof AbstractHead) {
+                    Location p = head.getParkLocation().convertToUnits(LengthUnit.Millimeters);
+                    ((AbstractHead) head).setParkLocation(new Location(LengthUnit.Millimeters,
+                            req.parkX != null ? req.parkX : p.getX(),
+                            req.parkY != null ? req.parkY : p.getY(),
+                            req.parkZ != null ? req.parkZ : p.getZ(),
+                            p.getRotation()));
+                }
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describeGeneral()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/general. */
+    private static class GeneralUpdate {
+        Boolean homeAfterEnabled;
+        Boolean autoToolSelect;
+        Boolean safeZPark;
+        Boolean parkAfterHomed;
+        Double discardX;
+        Double discardY;
+        Double discardZ;
+        Double parkX;
+        Double parkY;
+        Double parkZ;
     }
 
     // ------------------------------------------------------------- Cameras

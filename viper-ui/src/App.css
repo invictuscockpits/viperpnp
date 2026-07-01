@@ -1312,6 +1312,19 @@ input[type="number"] {
   margin-bottom: 0.35rem;
 }
 
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.3rem 0;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.check-row > input {
+  flex: none;
+}
+
 .nt-row {
   align-items: flex-end;
 }

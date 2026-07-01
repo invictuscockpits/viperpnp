@@ -223,6 +223,15 @@ interface AxisInfo {
   limitHigh: number;
   limitHighOn: boolean;
 }
+interface GeneralInfo {
+  homeAfterEnabled: boolean;
+  autoToolSelect: boolean;
+  safeZPark: boolean;
+  parkAfterHomed: boolean;
+  discard: { x: number; y: number; z: number };
+  park?: { x: number; y: number; z: number };
+  headName?: string;
+}
 
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
 const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
@@ -312,7 +321,7 @@ const MACHINE_CARDS: {
     id: "general",
     title: "General",
     desc: "Homing, parking, tool select",
-    ready: false,
+    ready: true,
   },
 ];
 
@@ -504,6 +513,7 @@ function App() {
   const [nzTips, setNzTips] = useState<NozzleTipInfo[]>([]);
   const [nozzleActs, setNozzleActs] = useState<ActuatorOpt[]>([]);
   const [axes, setAxes] = useState<AxisInfo[]>([]);
+  const [general, setGeneral] = useState<GeneralInfo | null>(null);
   const [reference, setReference] = useState("camera");
   const [tab, setTab] = useState<Tab>("board");
   const [feeders, setFeeders] = useState<FeederInfo[]>([]);
@@ -684,12 +694,33 @@ function App() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
 
+  const loadGeneral = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/general")).json();
+      setGeneral(d);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const updateGeneral = (patch: object) => {
+    fetch("/api/general", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    })
+      .then((r) => r.json())
+      .then((d) => setGeneral(d))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
   const openCard = (id: string) => {
     if (id === "connection") loadDrivers();
     if (id === "actuators") loadActuators();
     if (id === "cameras") loadCameras();
     if (id === "nozzles") loadNozzles();
     if (id === "motion") loadAxes();
+    if (id === "general") loadGeneral();
     setMachineCard(id);
   };
 
@@ -3986,16 +4017,11 @@ function App() {
         </div>
       )}
 
-      {machineCard &&
-        machineCard !== "connection" &&
-        machineCard !== "actuators" &&
-        machineCard !== "cameras" &&
-        machineCard !== "nozzles" &&
-        machineCard !== "motion" && (
+      {machineCard === "general" && (
         <div className="modal-backdrop" onClick={() => setMachineCard(null)}>
-          <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+          <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
-              <h3>{MACHINE_CARDS.find((c) => c.id === machineCard)?.title}</h3>
+              <h3>General</h3>
               <button
                 className="icon-btn"
                 onClick={() => setMachineCard(null)}
@@ -4004,15 +4030,127 @@ function App() {
                 ✕
               </button>
             </div>
-            <div className="modal-body">
-              <p className="confirm-text muted">
-                This machine-setup card is coming soon. For now, configure it in
-                OpenPnP (or machine.xml) against the same config.
-              </p>
+            <div className="modal-body plc-body">
+              {!general && <div className="muted">loading…</div>}
+              {general && (
+                <>
+                  <div className="sub-head">Startup &amp; homing</div>
+                  <label className="check-row">
+                    <input
+                      type="checkbox"
+                      checked={general.homeAfterEnabled}
+                      onChange={(e) =>
+                        updateGeneral({
+                          homeAfterEnabled: e.currentTarget.checked,
+                        })
+                      }
+                    />
+                    <span>Home automatically when the machine is enabled</span>
+                  </label>
+                  <label className="check-row">
+                    <input
+                      type="checkbox"
+                      checked={general.parkAfterHomed}
+                      onChange={(e) =>
+                        updateGeneral({ parkAfterHomed: e.currentTarget.checked })
+                      }
+                    />
+                    <span>Park the head after homing</span>
+                  </label>
+                  <label className="check-row">
+                    <input
+                      type="checkbox"
+                      checked={general.safeZPark}
+                      onChange={(e) =>
+                        updateGeneral({ safeZPark: e.currentTarget.checked })
+                      }
+                    />
+                    <span>Park at safe Z (raise nozzles before parking)</span>
+                  </label>
+                  <label className="check-row">
+                    <input
+                      type="checkbox"
+                      checked={general.autoToolSelect}
+                      onChange={(e) =>
+                        updateGeneral({ autoToolSelect: e.currentTarget.checked })
+                      }
+                    />
+                    <span>Auto-select the tool when clicking in the UI</span>
+                  </label>
+
+                  <div className="sub-head" style={{ marginTop: 14 }}>
+                    Discard location (rejected parts, mm)
+                  </div>
+                  <div className="field-grid">
+                    <label className="loc-field">
+                      <span>X</span>
+                      <NumberInput
+                        step={1}
+                        value={general.discard.x}
+                        onChange={(v) => updateGeneral({ discardX: v })}
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Y</span>
+                      <NumberInput
+                        step={1}
+                        value={general.discard.y}
+                        onChange={(v) => updateGeneral({ discardY: v })}
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Z</span>
+                      <NumberInput
+                        step={1}
+                        value={general.discard.z}
+                        onChange={(v) => updateGeneral({ discardZ: v })}
+                      />
+                    </label>
+                  </div>
+
+                  {general.park && (
+                    <>
+                      <div className="sub-head" style={{ marginTop: 14 }}>
+                        Park location{" "}
+                        {general.headName ? `(${general.headName}, mm)` : "(mm)"}
+                      </div>
+                      <div className="field-grid">
+                        <label className="loc-field">
+                          <span>X</span>
+                          <NumberInput
+                            step={1}
+                            value={general.park.x}
+                            onChange={(v) => updateGeneral({ parkX: v })}
+                          />
+                        </label>
+                        <label className="loc-field">
+                          <span>Y</span>
+                          <NumberInput
+                            step={1}
+                            value={general.park.y}
+                            onChange={(v) => updateGeneral({ parkY: v })}
+                          />
+                        </label>
+                        <label className="loc-field">
+                          <span>Z</span>
+                          <NumberInput
+                            step={1}
+                            value={general.park.z}
+                            onChange={(v) => updateGeneral({ parkZ: v })}
+                          />
+                        </label>
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
             </div>
             <div className="modal-foot">
-              <button className="btn" onClick={() => setMachineCard(null)}>
-                Close
+              <button
+                className="btn btn-primary"
+                onClick={() => setMachineCard(null)}
+              >
+                Done
               </button>
             </div>
           </div>
