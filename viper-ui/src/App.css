@@ -671,39 +671,18 @@ body {
   gap: 0.35rem;
 }
 
-.warn-wrap {
-  position: relative;
-  display: inline-flex;
+.active-cell input[type="checkbox"] {
+  accent-color: var(--green);
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
 }
 
 .warn-tri {
-  background: none;
-  border: none;
-  padding: 0;
-  cursor: pointer;
   color: #e6b800;
   display: inline-flex;
   align-items: center;
-}
-
-.warn-tri:hover {
-  color: #ffd23f;
-}
-
-.warn-tip {
-  position: absolute;
-  left: 50%;
-  bottom: calc(100% + 6px);
-  transform: translateX(-50%);
-  z-index: 20;
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  padding: 0.35rem 0.55rem;
-  font-size: 0.72rem;
-  color: var(--text);
-  white-space: nowrap;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  cursor: help;
 }
 
 .row-actions {

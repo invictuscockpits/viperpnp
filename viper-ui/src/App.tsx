@@ -241,7 +241,6 @@ function App() {
   const [feederType, setFeederType] = useState("photon");
   const [feederName, setFeederName] = useState("");
   const [editFeeder, setEditFeeder] = useState<FeederConfig | null>(null);
-  const [openTip, setOpenTip] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [jobRunning, setJobRunning] = useState(false);
   const [configDirty, setConfigDirty] = useState(false);
@@ -1255,24 +1254,12 @@ function App() {
                                 }
                               />
                               {f.canEnable === false && (
-                                <span className="warn-wrap">
-                                  <button
-                                    type="button"
-                                    className="warn-tri"
-                                    title={`Set up before enabling: ${(f.needs ?? []).join(", ")}`}
-                                    aria-label="Setup required"
-                                    onClick={() =>
-                                      setOpenTip(openTip === f.id ? null : f.id)
-                                    }
-                                  >
-                                    <WarnIcon size={14} />
-                                  </button>
-                                  {openTip === f.id && (
-                                    <span className="warn-tip">
-                                      Set up before enabling:{" "}
-                                      {(f.needs ?? []).join(", ")}
-                                    </span>
-                                  )}
+                                <span
+                                  className="warn-tri"
+                                  title={`Set up before enabling: ${(f.needs ?? []).join(", ")}`}
+                                  aria-label="Setup required"
+                                >
+                                  <WarnIcon size={14} />
                                 </span>
                               )}
                             </span>
