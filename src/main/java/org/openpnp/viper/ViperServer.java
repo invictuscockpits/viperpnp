@@ -257,6 +257,7 @@ public class ViperServer {
         });
         app.post("/api/feeder", ViperServer::updateFeeder);
         app.post("/api/feeders/add", ViperServer::addFeeder);
+        app.post("/api/feeders/delete", ViperServer::deleteFeeder);
         app.post("/api/feeders/reorder", ViperServer::reorderFeeders);
         app.get("/api/feeder/{id}", ViperServer::getFeederConfig);
         app.post("/api/feeder/location", ViperServer::setFeederLocation);
@@ -914,6 +915,26 @@ public class ViperServer {
             f.setPart(req != null && req.partId != null && !req.partId.isEmpty()
                     ? Configuration.get().getPart(req.partId) : null);
             machine.addFeeder(f);
+            ctx.result(GSON.toJson(describeFeeders()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** Removes a feeder from the machine. Body: {id}. */
+    private static void deleteFeeder(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            FeederUpdate req = GSON.fromJson(ctx.body(), FeederUpdate.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (f == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"feeder not found\"}");
+                return;
+            }
+            machine.removeFeeder(f);
             ctx.result(GSON.toJson(describeFeeders()));
         }
         catch (Exception e) {

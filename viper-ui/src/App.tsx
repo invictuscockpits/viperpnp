@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { BoardMap, type Placement } from "./BoardMap";
-import { CameraIcon, GearIcon, NozzleIcon, WarnIcon } from "./Icons";
+import { CameraIcon, GearIcon, NozzleIcon, TrashIcon, WarnIcon } from "./Icons";
 import "./App.css";
 
 interface DriverInfo {
@@ -241,6 +241,7 @@ function App() {
   const [feederType, setFeederType] = useState("photon");
   const [feederName, setFeederName] = useState("");
   const [editFeeder, setEditFeeder] = useState<FeederConfig | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<FeederInfo | null>(null);
   const [scanning, setScanning] = useState(false);
   const [jobRunning, setJobRunning] = useState(false);
   const [configDirty, setConfigDirty] = useState(false);
@@ -477,6 +478,24 @@ function App() {
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const confirmDeleteFeeder = async () => {
+    if (!deleteTarget) return;
+    try {
+      const res = await fetch("/api/feeders/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: deleteTarget.id }),
+      });
+      const d = await res.json();
+      if (d.feeders) setFeeders(d.feeders);
+      else if (d.error) setError(String(d.message ?? d.error));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleteTarget(null);
     }
   };
 
@@ -1254,12 +1273,12 @@ function App() {
                                 }
                               />
                               {f.canEnable === false && (
-                                <span
-                                  className="warn-tri"
-                                  title={`Set up before enabling: ${(f.needs ?? []).join(", ")}`}
-                                  aria-label="Setup required"
-                                >
+                                <span className="warn-tri" aria-label="Setup required">
                                   <WarnIcon size={14} />
+                                  <span className="warn-tip">
+                                    Set up before enabling:{" "}
+                                    {(f.needs ?? []).join(", ")}
+                                  </span>
                                 </span>
                               )}
                             </span>
@@ -1310,6 +1329,14 @@ function App() {
                               aria-label="Edit feeder"
                             >
                               <GearIcon size={15} />
+                            </button>
+                            <button
+                              className="btn btn-sm btn-icon btn-trash"
+                              onClick={() => setDeleteTarget(f)}
+                              title="Delete feeder"
+                              aria-label="Delete feeder"
+                            >
+                              <TrashIcon size={15} />
                             </button>
                           </td>
                         </tr>
@@ -1746,6 +1773,40 @@ function App() {
                 onClick={() => setSkipReport(null)}
               >
                 OK
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deleteTarget && (
+        <div className="modal-backdrop" onClick={() => setDeleteTarget(null)}>
+          <div
+            className="modal modal-sm"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3>Delete feeder?</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setDeleteTarget(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p className="confirm-text">
+                Delete <span className="mono">{deleteTarget.name}</span>? This
+                removes the feeder and its setup. This can't be undone.
+              </p>
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setDeleteTarget(null)}>
+                Cancel
+              </button>
+              <button className="btn btn-danger" onClick={confirmDeleteFeeder}>
+                Delete
               </button>
             </div>
           </div>

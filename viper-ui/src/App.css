@@ -665,6 +665,22 @@ body {
   padding: 0.3rem 0.45rem;
 }
 
+.btn-trash:hover:not(:disabled) {
+  border-color: #d2413a;
+  color: #e06a6a;
+}
+
+.modal-sm {
+  width: 360px;
+}
+
+.confirm-text {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--text);
+}
+
 .active-cell {
   display: inline-flex;
   align-items: center;
@@ -682,7 +698,31 @@ body {
   color: #e6b800;
   display: inline-flex;
   align-items: center;
-  cursor: help;
+  position: relative;
+}
+
+.warn-tip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  z-index: 20;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.72rem;
+  color: var(--text);
+  white-space: nowrap;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.warn-tri:hover .warn-tip {
+  opacity: 1;
+  visibility: visible;
 }
 
 .row-actions {
