@@ -13,6 +13,7 @@ import org.openpnp.gui.importer.KicadPosImporter;
 import org.openpnp.machine.photon.PhotonFeeder;
 import org.openpnp.machine.photon.PhotonProperties;
 import org.openpnp.machine.reference.ReferenceFeeder;
+import org.openpnp.machine.reference.ReferencePnpJobProcessor;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
 import org.openpnp.machine.reference.feeder.ReferenceStripFeeder;
 import org.openpnp.machine.reference.feeder.ReferenceTrayFeeder;
@@ -32,9 +33,11 @@ import org.openpnp.spi.Driver;
 import org.openpnp.spi.Feeder;
 import org.openpnp.spi.Head;
 import org.openpnp.spi.HeadMountable;
+import org.openpnp.spi.JobProcessor;
 import org.openpnp.spi.Machine;
 import org.openpnp.spi.MachineListener;
 import org.openpnp.spi.Nozzle;
+import org.openpnp.spi.PnpJobProcessor;
 import org.openpnp.spi.base.AbstractFeeder;
 import org.openpnp.util.MovableUtils;
 
@@ -76,6 +79,9 @@ public class ViperServer {
 
     private static Machine machine;
     private static Job currentJob;
+    private static volatile boolean jobRunning = false;
+    private static volatile boolean jobAbortRequested = false;
+    private static PnpJobProcessor jobProcessor;
 
     public static void main(String[] args) throws Exception {
         File configDir;
@@ -197,6 +203,15 @@ public class ViperServer {
             ctx.result(GSON.toJson(describeJob(currentJob)));
         });
         app.post("/api/job/placement", ViperServer::updatePlacement);
+        app.post("/api/job/run", ViperServer::runJob);
+        app.post("/api/job/abort", ViperServer::abortJob);
+        app.get("/api/job/state", ctx -> {
+            Map<String, Object> s = new LinkedHashMap<>();
+            s.put("running", jobRunning);
+            s.put("loaded", currentJob != null);
+            ctx.contentType("application/json");
+            ctx.result(GSON.toJson(s));
+        });
         app.get("/api/feeders", ctx -> {
             ctx.contentType("application/json");
             ctx.result(GSON.toJson(describeFeeders()));
@@ -463,6 +478,142 @@ public class ViperServer {
         String id;
         String type;
         Boolean enabled;
+    }
+
+    /**
+     * POST /api/job/run — runs the current job. Body (all optional): {errorHandling:
+     * "Defer"|"Alert", feederFaultLimit, maxPlacementRetries}. Defaults to Defer,
+     * so a feeder fault retries and the placement is skipped rather than hard-
+     * stopping the job. Progress and a final jobComplete (with the list of skipped
+     * placements) are pushed over the WebSocket. The processor runs on the machine
+     * task thread; next() drives motion directly there.
+     */
+    private static void runJob(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            if (currentJob == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"no job loaded\"}");
+                return;
+            }
+            if (jobRunning) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"a job is already running\"}");
+                return;
+            }
+            JobRunRequest req = GSON.fromJson(ctx.body(), JobRunRequest.class);
+            currentJob.setErrorHandling("Alert".equalsIgnoreCase(req != null ? req.errorHandling : null)
+                    ? Job.ErrorHandling.Alert : Job.ErrorHandling.Defer);
+            PnpJobProcessor jp = machine.getPnpJobProcessor();
+            if (req != null && jp instanceof ReferencePnpJobProcessor) {
+                ReferencePnpJobProcessor r = (ReferencePnpJobProcessor) jp;
+                if (req.feederFaultLimit != null) {
+                    r.setFeederFaultLimit(Math.max(1, req.feederFaultLimit));
+                }
+                if (req.maxPlacementRetries != null) {
+                    r.setMaxPlacementRetries(Math.max(1, req.maxPlacementRetries));
+                }
+            }
+            final JobProcessor.TextStatusListener tsl = text -> broadcast(GSON.toJson(jobEvent("jobStatus", text, null, false)));
+            final Job job = currentJob;
+            jp.addTextStatusListener(tsl);
+            jp.initialize(job);
+            jobProcessor = jp;
+            jobAbortRequested = false;
+            jobRunning = true;
+            broadcast(GSON.toJson(jobEvent("jobStarted", "Job started", null, false)));
+            machine.submit(() -> {
+                String error = null;
+                try {
+                    while (jobRunning && jp.next()) {
+                        // next() advances one step and drives its own motion.
+                    }
+                }
+                catch (Exception e) {
+                    error = e.getMessage() != null ? e.getMessage() : e.toString();
+                }
+                finally {
+                    jobRunning = false;
+                    jp.removeTextStatusListener(tsl);
+                    broadcast(GSON.toJson(jobEvent("jobComplete", "Job complete",
+                            collectSkipped(job), jobAbortRequested)));
+                }
+                if (error != null) {
+                    broadcast(GSON.toJson(errorMap(new Exception(error))));
+                }
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"started\":true}");
+        }
+        catch (Exception e) {
+            jobRunning = false;
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/job/abort — requests a graceful abort of the running job. */
+    private static void abortJob(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        if (!jobRunning) {
+            ctx.result("{\"running\":false}");
+            return;
+        }
+        jobAbortRequested = true;
+        jobRunning = false;
+        try {
+            if (jobProcessor != null) {
+                jobProcessor.abort();
+            }
+        }
+        catch (Exception e) {
+            // abort() cleans up best-effort; the run loop will exit regardless.
+        }
+        ctx.result("{\"aborting\":true}");
+    }
+
+    /** Builds a job WebSocket event payload. */
+    private static Map<String, Object> jobEvent(String event, String text,
+            List<Map<String, Object>> skipped, boolean aborted) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("event", event);
+        m.put("text", text);
+        m.put("running", jobRunning);
+        if (skipped != null) {
+            m.put("skipped", skipped);
+            m.put("aborted", aborted);
+        }
+        return m;
+    }
+
+    /**
+     * Enabled placements (type Placement) that did not end up placed — i.e. the
+     * ones skipped during the run (feeder faults, alignment failures, etc.).
+     */
+    private static List<Map<String, Object>> collectSkipped(Job job) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (BoardLocation bl : job.getBoardLocations()) {
+            for (Placement p : bl.getBoard().getPlacements()) {
+                if (!p.isEnabled() || p.getType() != Placement.Type.Placement) {
+                    continue;
+                }
+                if (!job.retrievePlacedStatus(bl, p.getId())) {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("id", p.getId());
+                    m.put("part", p.getPart() != null ? p.getPart().getId() : null);
+                    m.put("board", bl.getBoard().getName());
+                    out.add(m);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** JSON body for POST /api/job/run. */
+    private static class JobRunRequest {
+        String errorHandling;
+        Integer feederFaultLimit;
+        Integer maxPlacementRetries;
     }
 
     /** Feeder list wrapped as a WebSocket event so clients can refresh live. */

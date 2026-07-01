@@ -664,6 +664,29 @@ body {
   justify-content: flex-end;
 }
 
+.run-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.6rem;
+}
+
+.run-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.run-status {
+  font-size: 0.85rem;
+  font-style: italic;
+}
+
 .btn-danger {
   border-color: #d2413a;
   color: #e06a6a;
