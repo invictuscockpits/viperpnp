@@ -17,6 +17,7 @@ import org.openpnp.machine.photon.PhotonProperties;
 import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.machine.reference.ReferenceNozzle;
 import org.openpnp.machine.reference.ReferencePnpJobProcessor;
+import org.openpnp.machine.reference.driver.AbstractReferenceDriver;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
 import org.openpnp.machine.reference.feeder.ReferenceRotatedTrayFeeder;
 import org.openpnp.machine.reference.feeder.ReferenceStripFeeder;
@@ -223,6 +224,8 @@ public class ViperServer {
         app.post("/api/job/placement/delete", ViperServer::deletePlacement);
         app.post("/api/job/placement/batch", ViperServer::batchPlacements);
         app.post("/api/job/board-origin", ViperServer::setBoardOriginFromPlacement);
+        app.get("/api/drivers/detail", ViperServer::listDrivers);
+        app.post("/api/driver", ViperServer::updateDriver);
         app.get("/api/parts/detail", ViperServer::listPartsDetail);
         app.post("/api/part", ViperServer::updatePart);
         app.post("/api/part/add", ViperServer::addPart);
@@ -947,6 +950,96 @@ public class ViperServer {
             ctx.status(500);
             ctx.result(GSON.toJson(errorMap(e)));
         }
+    }
+
+    // ---------------------------------------------------- Connection/Driver
+
+    /** Drivers + their comms (serial/tcp) + available ports + connection state. */
+    private static Map<String, Object> describeDrivers() {
+        List<Map<String, Object>> drivers = new ArrayList<>();
+        for (Driver d : machine.getDrivers()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", d.getId());
+            m.put("name", d.getName());
+            m.put("type", d.getClass().getSimpleName());
+            if (d instanceof AbstractReferenceDriver) {
+                AbstractReferenceDriver rd = (AbstractReferenceDriver) d;
+                m.put("commType", rd.getCommunicationsType().name());
+                m.put("port", rd.getSerial().getPortName());
+                m.put("baud", rd.getSerial().getBaud());
+                m.put("ip", rd.getTcp().getIpAddress());
+                m.put("tcpPort", rd.getTcp().getPort());
+            }
+            drivers.add(m);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("drivers", drivers);
+        try {
+            root.put("ports", SerialPortCommunications.getPortNames());
+        }
+        catch (Exception e) {
+            root.put("ports", new ArrayList<>());
+        }
+        root.put("connected", machine.isEnabled());
+        return root;
+    }
+
+    private static void listDrivers(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        ctx.result(GSON.toJson(describeDrivers()));
+    }
+
+    /** POST /api/driver — Body: {id, commType?, port?, baud?, ip?, tcpPort?}. */
+    private static void updateDriver(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            DriverUpdate req = GSON.fromJson(ctx.body(), DriverUpdate.class);
+            Driver found = null;
+            for (Driver d : machine.getDrivers()) {
+                if (req != null && d.getId().equals(req.id)) {
+                    found = d;
+                    break;
+                }
+            }
+            if (!(found instanceof AbstractReferenceDriver)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"driver not found\"}");
+                return;
+            }
+            AbstractReferenceDriver rd = (AbstractReferenceDriver) found;
+            if (req.commType != null) {
+                rd.setCommunicationsType(
+                        AbstractReferenceDriver.CommunicationsType.valueOf(req.commType));
+            }
+            if (req.port != null) {
+                rd.getSerial().setPortName(req.port);
+            }
+            if (req.baud != null) {
+                rd.getSerial().setBaud(req.baud);
+            }
+            if (req.ip != null) {
+                rd.getTcp().setIpAddress(req.ip);
+            }
+            if (req.tcpPort != null) {
+                rd.getTcp().setPort(req.tcpPort);
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describeDrivers()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/driver. */
+    private static class DriverUpdate {
+        String id;
+        String commType;
+        String port;
+        Integer baud;
+        String ip;
+        Integer tcpPort;
     }
 
     // --------------------------------------------------------- Part aliases

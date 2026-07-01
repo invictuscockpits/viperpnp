@@ -158,6 +158,17 @@ interface NtInfo {
   name: string;
 }
 
+interface DriverInfo {
+  id: string;
+  name: string;
+  type: string;
+  commType?: string;
+  port?: string;
+  baud?: number;
+  ip?: string;
+  tcpPort?: number;
+}
+
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
 const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
 const IMPORT_FORMATS = [
@@ -166,6 +177,7 @@ const IMPORT_FORMATS = [
   { id: "eagle", label: "Eagle .mnt" },
 ];
 const ERROR_HANDLING = ["Default", "Alert", "Defer"];
+const BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 250000, 460800, 921600];
 const NEW_PART: PartInfo = {
   id: "",
   name: "",
@@ -204,6 +216,50 @@ const TABS: { id: Tab; label: string }[] = [
 ];
 
 const SOON = ["Vision", "Log"];
+
+const MACHINE_CARDS: {
+  id: string;
+  title: string;
+  desc: string;
+  ready: boolean;
+}[] = [
+  {
+    id: "connection",
+    title: "Connection",
+    desc: "Driver & serial port",
+    ready: true,
+  },
+  {
+    id: "motion",
+    title: "Motion & Axes",
+    desc: "Limits, feedrates, homing",
+    ready: false,
+  },
+  {
+    id: "nozzles",
+    title: "Nozzles & Tips",
+    desc: "Nozzles, vacuum, tips",
+    ready: false,
+  },
+  {
+    id: "cameras",
+    title: "Cameras",
+    desc: "Top & bottom cameras",
+    ready: false,
+  },
+  {
+    id: "actuators",
+    title: "Actuators & I/O",
+    desc: "Vacuum, lights, valves",
+    ready: false,
+  },
+  {
+    id: "general",
+    title: "General",
+    desc: "Homing, parking, tool select",
+    ready: false,
+  },
+];
 
 /** Number input with custom gray up/down triangle steppers (native spinners hidden). */
 function NumberInput({
@@ -380,6 +436,9 @@ function App() {
   const [editPackage, setEditPackage] = useState<PackageInfo | null>(null);
   const [pkgIsNew, setPkgIsNew] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [machineCard, setMachineCard] = useState<string | null>(null);
+  const [drivers, setDrivers] = useState<DriverInfo[]>([]);
+  const [driverPorts, setDriverPorts] = useState<string[]>([]);
   const [reference, setReference] = useState("camera");
   const [tab, setTab] = useState<Tab>("board");
   const [feeders, setFeeders] = useState<FeederInfo[]>([]);
@@ -443,6 +502,45 @@ function App() {
       /* ignore */
     }
   }, []);
+
+  const loadDrivers = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/drivers/detail")).json();
+      setDrivers(d.drivers ?? []);
+      setDriverPorts(d.ports ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const openCard = (id: string) => {
+    if (id === "connection") loadDrivers();
+    setMachineCard(id);
+  };
+
+  const updateDriver = (id: string, patch: object) => {
+    fetch("/api/driver", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, ...patch }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.drivers) {
+          setDrivers(d.drivers);
+          setDriverPorts(d.ports ?? []);
+        }
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
+  const setMachineEnabled = (on: boolean) => {
+    fetch(on ? "/api/machine/connect" : "/api/machine/disconnect", {
+      method: "POST",
+    })
+      .then(() => setTimeout(loadDrivers, 600))
+      .catch(() => {});
+  };
 
   const loadPackages = useCallback(async () => {
     try {
@@ -1539,67 +1637,60 @@ function App() {
 
           {tab === "machine" &&
             (inventory ? (
-              <div className="grid">
-                <section className="card span-2">
-                  <h2>Machine</h2>
-                  <div className="big">{shortImpl}</div>
-                  <div className="muted">{inventory.impl}</div>
-                </section>
-
-                <section className="card">
-                  <h2>Feeders</h2>
-                  <div className="big">{inventory.feederCount}</div>
-                </section>
-
-                <section className="card">
-                  <h2>Actuators</h2>
-                  <div className="big">{inventory.actuatorCount}</div>
-                </section>
-
-                <section className="card span-2">
-                  <h2>Drivers</h2>
-                  <ul className="list">
-                    {inventory.drivers.map((d) => (
-                      <li key={d.name}>
-                        <span className="tag">{d.name}</span>
-                        <span className="muted">{d.type}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-
-                <section className="card span-2">
-                  <h2>Machine cameras</h2>
-                  <div className="chips">
-                    {inventory.machineCameras.map((c) => (
-                      <span key={c} className="chip chip-cam">
-                        <CameraIcon size={12} /> {c}
-                      </span>
-                    ))}
+              <>
+                <section className="card machine-summary">
+                  <div>
+                    <div className="big">{shortImpl}</div>
+                    <div className="muted">{inventory.impl}</div>
                   </div>
+                  <span className={`badge ${enabled ? "on" : ""}`}>
+                    {enabled ? "Connected" : "Disconnected"}
+                  </span>
                 </section>
-
-                <section className="card span-4">
-                  <h2>Heads</h2>
-                  {inventory.heads.map((h) => (
-                    <div key={h.name} className="head">
-                      <div className="head-name">{h.name}</div>
-                      <div className="chips">
-                        {h.nozzles.map((n) => (
-                          <span key={n} className="chip chip-nozzle">
-                            <NozzleIcon size={12} /> {n}
-                          </span>
-                        ))}
-                        {h.cameras.map((c) => (
-                          <span key={c} className="chip chip-cam">
-                            <CameraIcon size={12} /> {c}
-                          </span>
-                        ))}
-                      </div>
+                <div className="machine-cards">
+                  {MACHINE_CARDS.map((c) => {
+                    const summary =
+                      c.id === "connection"
+                        ? `${inventory.drivers[0]?.type ?? "no driver"} · ${
+                            enabled ? "connected" : "offline"
+                          }`
+                        : c.id === "nozzles"
+                          ? `${inventory.heads.flatMap((h) => h.nozzles).length} nozzles`
+                          : c.id === "cameras"
+                            ? `${
+                                inventory.machineCameras.length +
+                                inventory.heads.flatMap((h) => h.cameras).length
+                              } cameras`
+                            : c.id === "actuators"
+                              ? `${inventory.actuatorCount} actuators`
+                              : c.desc;
+                    return (
+                      <button
+                        key={c.id}
+                        className="mcard"
+                        onClick={() => openCard(c.id)}
+                      >
+                        <div className="mcard-title">
+                          {c.title}
+                          {!c.ready && (
+                            <span className="mcard-soon">soon</span>
+                          )}
+                        </div>
+                        <div className="muted mcard-sum">{summary}</div>
+                      </button>
+                    );
+                  })}
+                  <button
+                    className="mcard"
+                    onClick={() => setTab("feeders")}
+                  >
+                    <div className="mcard-title">Feeders</div>
+                    <div className="muted mcard-sum">
+                      {inventory.feederCount} feeders →
                     </div>
-                  ))}
-                </section>
-              </div>
+                  </button>
+                </div>
+              </>
             ) : (
               <div className="muted">
                 {online
@@ -3215,6 +3306,169 @@ function App() {
                 onClick={() => setWizardOpen(false)}
               >
                 Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {machineCard === "connection" && (
+        <div className="modal-backdrop" onClick={() => setMachineCard(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>Connection</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setMachineCard(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="field-row">
+                <label>Status</label>
+                <span className={`badge ${enabled ? "on" : ""}`}>
+                  {enabled ? "Connected" : "Disconnected"}
+                </span>
+                <button
+                  className={`btn btn-sm ${enabled ? "btn-danger" : "btn-primary"}`}
+                  onClick={() => setMachineEnabled(!enabled)}
+                >
+                  {enabled ? "Disconnect" : "Connect"}
+                </button>
+                <button
+                  className="btn btn-sm"
+                  onClick={loadDrivers}
+                  title="Rescan serial ports"
+                >
+                  Rescan
+                </button>
+              </div>
+              {drivers.map((d) => (
+                <div key={d.id} className="teach-block">
+                  <div className="teach-head">
+                    {d.name} — {d.type}
+                  </div>
+                  <div className="field-grid">
+                    <label className="loc-field">
+                      <span>Connection</span>
+                      <select
+                        className="type-select"
+                        value={d.commType ?? "serial"}
+                        onChange={(e) =>
+                          updateDriver(d.id, { commType: e.currentTarget.value })
+                        }
+                      >
+                        <option value="serial">Serial</option>
+                        <option value="tcp">TCP</option>
+                      </select>
+                    </label>
+                    {d.commType === "tcp" ? (
+                      <>
+                        <label className="loc-field">
+                          <span>Host</span>
+                          <input
+                            className="import-input"
+                            value={d.ip ?? ""}
+                            onChange={(e) =>
+                              updateDriver(d.id, { ip: e.currentTarget.value })
+                            }
+                          />
+                        </label>
+                        <label className="loc-field">
+                          <span>TCP port</span>
+                          <NumberInput
+                            min={1}
+                            value={d.tcpPort ?? 23}
+                            onChange={(v) => updateDriver(d.id, { tcpPort: v })}
+                          />
+                        </label>
+                      </>
+                    ) : (
+                      <>
+                        <label className="loc-field">
+                          <span>Serial port</span>
+                          <select
+                            className="type-select"
+                            value={d.port ?? ""}
+                            onChange={(e) =>
+                              updateDriver(d.id, { port: e.currentTarget.value })
+                            }
+                          >
+                            <option value="">— none —</option>
+                            {driverPorts.length === 0 && d.port && (
+                              <option value={d.port}>{d.port}</option>
+                            )}
+                            {driverPorts.map((p) => (
+                              <option key={p} value={p}>
+                                {p}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="loc-field">
+                          <span>Baud</span>
+                          <select
+                            className="type-select"
+                            value={d.baud ?? 115200}
+                            onChange={(e) =>
+                              updateDriver(d.id, {
+                                baud: parseInt(e.currentTarget.value, 10),
+                              })
+                            }
+                          >
+                            {BAUDS.map((b) => (
+                              <option key={b} value={b}>
+                                {b}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </>
+                    )}
+                  </div>
+                </div>
+              ))}
+              <p className="confirm-text muted">
+                Connecting needs the controller on this computer's USB. Changes
+                save with the machine config.
+              </p>
+            </div>
+            <div className="modal-foot">
+              <button
+                className="btn btn-primary"
+                onClick={() => setMachineCard(null)}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {machineCard && machineCard !== "connection" && (
+        <div className="modal-backdrop" onClick={() => setMachineCard(null)}>
+          <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>{MACHINE_CARDS.find((c) => c.id === machineCard)?.title}</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setMachineCard(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p className="confirm-text muted">
+                This machine-setup card is coming soon. For now, configure it in
+                OpenPnP (or machine.xml) against the same config.
+              </p>
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setMachineCard(null)}>
+                Close
               </button>
             </div>
           </div>
