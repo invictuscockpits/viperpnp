@@ -70,10 +70,36 @@ interface FeederLoc {
   rotation: number;
 }
 
+interface PhotonCfg {
+  slotAddress: number | null;
+  hardwareId: string | null;
+  offset: FeederLoc | null;
+  slotLocation: FeederLoc | null;
+  pickLocation: FeederLoc | null;
+}
+
+interface StripCfg {
+  referenceHole: FeederLoc | null;
+  lastHole: FeederLoc | null;
+  partPitch: number;
+  tapeWidth: number;
+  tapeType: string;
+  feedCount: number;
+  pickLocation: FeederLoc | null;
+}
+
 interface FeederConfig extends FeederInfo {
   editableLocation: boolean;
   location?: FeederLoc;
+  photon?: PhotonCfg;
+  strip?: StripCfg;
 }
+
+const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
+const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
+
+type TeachTool = "camera" | "nozzle";
+type TeachTarget = "location" | "slot" | "refHole" | "lastHole" | "pick";
 
 type Tab = "machine" | "board" | "feeders";
 
@@ -86,6 +112,87 @@ const TABS: { id: Tab; label: string }[] = [
 ];
 
 const SOON = ["Vision", "Log"];
+
+/** A 4-axis location editor with optional Go-to / Capture teach buttons. */
+function TeachLoc({
+  label,
+  value,
+  onChange,
+  onGo,
+  onCapture,
+}: {
+  label: string;
+  value: FeederLoc | null;
+  onChange?: (loc: FeederLoc) => void;
+  onGo?: (tool: TeachTool) => void;
+  onCapture?: (tool: TeachTool) => void;
+}) {
+  const v = value ?? ZERO_LOC;
+  return (
+    <div className="teach-block">
+      <div className="teach-head">{label}</div>
+      <div className="loc-grid">
+        {(["x", "y", "z", "rotation"] as const).map((k) => (
+          <label key={k} className="loc-field">
+            <span>{k === "rotation" ? "Rot°" : k.toUpperCase()}</span>
+            <input
+              type="number"
+              step="0.01"
+              disabled={!onChange}
+              value={v[k]}
+              onChange={(e) =>
+                onChange?.({
+                  ...v,
+                  [k]: parseFloat(e.currentTarget.value) || 0,
+                })
+              }
+            />
+          </label>
+        ))}
+      </div>
+      {(onGo || onCapture) && (
+        <div className="teach-actions">
+          {onGo && (
+            <button
+              className="btn btn-sm"
+              onClick={() => onGo("camera")}
+              title="Move camera here"
+            >
+              <CameraIcon size={14} /> Go
+            </button>
+          )}
+          {onCapture && (
+            <button
+              className="btn btn-sm"
+              onClick={() => onCapture("camera")}
+              title="Capture X/Y from camera"
+            >
+              <CameraIcon size={14} /> Grab
+            </button>
+          )}
+          {onGo && (
+            <button
+              className="btn btn-sm"
+              onClick={() => onGo("nozzle")}
+              title="Move nozzle here"
+            >
+              <NozzleIcon size={14} /> Go
+            </button>
+          )}
+          {onCapture && (
+            <button
+              className="btn btn-sm"
+              onClick={() => onCapture("nozzle")}
+              title="Capture X/Y/Z from nozzle"
+            >
+              <NozzleIcon size={14} /> Grab
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function App() {
   const [online, setOnline] = useState(false);
@@ -107,12 +214,6 @@ function App() {
   const [feederType, setFeederType] = useState("photon");
   const [feederName, setFeederName] = useState("");
   const [editFeeder, setEditFeeder] = useState<FeederConfig | null>(null);
-  const [locForm, setLocForm] = useState<FeederLoc>({
-    x: 0,
-    y: 0,
-    z: 0,
-    rotation: 0,
-  });
   const wsRef = useRef<WebSocket | null>(null);
   const dragIndex = useRef<number | null>(null);
 
@@ -334,11 +435,14 @@ function App() {
     });
   };
 
-  const applyFeederConfig = (d: FeederConfig) => {
-    setEditFeeder(d);
-    if (d.location) {
-      setLocForm(d.location);
+  const applyFeederConfig = (
+    d: FeederConfig & { error?: string; event?: string; message?: string },
+  ) => {
+    if (d.error || d.event === "error") {
+      setError(String(d.message ?? d.error));
+      return;
     }
+    setEditFeeder(d);
     setFeeders((fs) =>
       fs.map((f) =>
         f.id === d.id
@@ -351,64 +455,78 @@ function App() {
   const openEditFeeder = async (id: string) => {
     try {
       const res = await fetch(`/api/feeder/${id}`);
-      const d: FeederConfig = await res.json();
-      setEditFeeder(d);
-      setLocForm(d.location ?? { x: 0, y: 0, z: 0, rotation: 0 });
+      setEditFeeder(await res.json());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
 
-  const saveFeederLocation = async () => {
-    if (!editFeeder) {
-      return;
-    }
+  const setEF = (patch: Partial<FeederConfig>) =>
+    setEditFeeder((ef) => (ef ? { ...ef, ...patch } : ef));
+  const setPhotonField = (patch: Partial<PhotonCfg>) =>
+    setEditFeeder((ef) =>
+      ef?.photon ? { ...ef, photon: { ...ef.photon, ...patch } } : ef,
+    );
+  const setStripField = (patch: Partial<StripCfg>) =>
+    setEditFeeder((ef) =>
+      ef?.strip ? { ...ef, strip: { ...ef.strip, ...patch } } : ef,
+    );
+
+  const postFeeder = async (url: string, body: unknown) => {
     try {
-      const res = await fetch("/api/feeder/location", {
+      const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: editFeeder.id, ...locForm }),
+        body: JSON.stringify(body),
       });
-      const d = await res.json();
-      if (d.error || d.event === "error") {
-        setError(String(d.message ?? d.error));
-        return;
-      }
-      applyFeederConfig(d);
+      applyFeederConfig(await res.json());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
 
-  const captureFeederLoc = async (tool: "camera" | "nozzle") => {
-    if (!editFeeder) {
-      return;
-    }
-    try {
-      const res = await fetch("/api/feeder/capture", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: editFeeder.id, tool }),
-      });
-      const d = await res.json();
-      if (d.error || d.event === "error") {
-        setError(String(d.message ?? d.error));
-        return;
-      }
-      applyFeederConfig(d);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
+  const saveFeederLocation = () => {
+    if (!editFeeder) return;
+    const l = editFeeder.location ?? ZERO_LOC;
+    postFeeder("/api/feeder/location", { id: editFeeder.id, ...l });
   };
 
-  const moveToFeederLoc = (tool: "camera" | "nozzle") => {
-    if (!editFeeder) {
-      return;
-    }
+  const savePhoton = () => {
+    if (!editFeeder?.photon) return;
+    const p = editFeeder.photon;
+    postFeeder("/api/feeder/photon", {
+      id: editFeeder.id,
+      slotAddress: p.slotAddress,
+      offset: p.offset ?? undefined,
+      slotLocation: p.slotLocation ?? undefined,
+    });
+  };
+
+  const saveStrip = () => {
+    if (!editFeeder?.strip) return;
+    const s = editFeeder.strip;
+    postFeeder("/api/feeder/strip", {
+      id: editFeeder.id,
+      referenceHole: s.referenceHole ?? undefined,
+      lastHole: s.lastHole ?? undefined,
+      partPitch: s.partPitch,
+      tapeWidth: s.tapeWidth,
+      tapeType: s.tapeType,
+      feedCount: s.feedCount,
+    });
+  };
+
+  const captureFeederLoc = (tool: TeachTool, target: TeachTarget) => {
+    if (!editFeeder) return;
+    postFeeder("/api/feeder/capture", { id: editFeeder.id, tool, target });
+  };
+
+  const moveToFeederLoc = (tool: TeachTool, target: TeachTarget) => {
+    if (!editFeeder) return;
     fetch("/api/feeder/move", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: editFeeder.id, tool }),
+      body: JSON.stringify({ id: editFeeder.id, tool, target }),
     }).catch(() => {
       /* ignore */
     });
@@ -997,67 +1115,136 @@ function App() {
                 </select>
               </div>
 
-              {editFeeder.editableLocation ? (
+              {editFeeder.photon ? (
                 <>
-                  <div className="loc-grid">
-                    {(["x", "y", "z", "rotation"] as const).map((k) => (
-                      <label key={k} className="loc-field">
-                        <span>{k === "rotation" ? "Rot°" : k.toUpperCase()}</span>
-                        <input
-                          type="number"
-                          step="0.01"
-                          value={locForm[k]}
-                          onChange={(e) =>
-                            setLocForm({
-                              ...locForm,
-                              [k]: parseFloat(e.currentTarget.value) || 0,
-                            })
-                          }
-                        />
-                      </label>
-                    ))}
-                  </div>
-                  <div className="teach-block">
-                    <div className="teach-row">
-                      <span className="teach-tool">
-                        <CameraIcon size={15} /> Camera
+                  <div className="field-row">
+                    <label>Slot</label>
+                    <input
+                      className="num-sm"
+                      type="number"
+                      step="1"
+                      placeholder="addr"
+                      value={editFeeder.photon.slotAddress ?? ""}
+                      onChange={(e) =>
+                        setPhotonField({
+                          slotAddress:
+                            e.currentTarget.value === ""
+                              ? null
+                              : parseInt(e.currentTarget.value, 10),
+                        })
+                      }
+                    />
+                    {editFeeder.photon.hardwareId && (
+                      <span className="muted">
+                        HW {editFeeder.photon.hardwareId}
                       </span>
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => moveToFeederLoc("camera")}
-                        title="Move camera over this location"
-                      >
-                        Go to
-                      </button>
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => captureFeederLoc("camera")}
-                        title="Set X/Y from current camera position"
-                      >
-                        Capture X/Y
-                      </button>
-                    </div>
-                    <div className="teach-row">
-                      <span className="teach-tool">
-                        <NozzleIcon size={15} /> Nozzle
-                      </span>
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => moveToFeederLoc("nozzle")}
-                        title="Move nozzle over this location"
-                      >
-                        Go to
-                      </button>
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => captureFeederLoc("nozzle")}
-                        title="Set X/Y/Z from current nozzle position"
-                      >
-                        Capture X/Y/Z
-                      </button>
-                    </div>
+                    )}
                   </div>
+                  <TeachLoc
+                    label="Slot location (shared by all feeders in this slot)"
+                    value={editFeeder.photon.slotLocation}
+                    onChange={(loc) => setPhotonField({ slotLocation: loc })}
+                    onGo={(t) => moveToFeederLoc(t, "slot")}
+                    onCapture={(t) => captureFeederLoc(t, "slot")}
+                  />
+                  <TeachLoc
+                    label="Part offset (within the slot)"
+                    value={editFeeder.photon.offset}
+                    onChange={(loc) => setPhotonField({ offset: loc })}
+                  />
+                  <TeachLoc
+                    label="Pick location (computed: offset ⊕ slot)"
+                    value={editFeeder.photon.pickLocation}
+                    onGo={(t) => moveToFeederLoc(t, "pick")}
+                  />
                 </>
+              ) : editFeeder.strip ? (
+                <>
+                  <TeachLoc
+                    label="Reference hole (first sprocket hole)"
+                    value={editFeeder.strip.referenceHole}
+                    onChange={(loc) => setStripField({ referenceHole: loc })}
+                    onGo={(t) => moveToFeederLoc(t, "refHole")}
+                    onCapture={(t) => captureFeederLoc(t, "refHole")}
+                  />
+                  <TeachLoc
+                    label="Last hole (far end of the tape)"
+                    value={editFeeder.strip.lastHole}
+                    onChange={(loc) => setStripField({ lastHole: loc })}
+                    onGo={(t) => moveToFeederLoc(t, "lastHole")}
+                    onCapture={(t) => captureFeederLoc(t, "lastHole")}
+                  />
+                  <div className="field-grid">
+                    <label className="loc-field">
+                      <span>Part pitch (mm)</span>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={editFeeder.strip.partPitch}
+                        onChange={(e) =>
+                          setStripField({
+                            partPitch: parseFloat(e.currentTarget.value) || 0,
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Tape width (mm)</span>
+                      <input
+                        type="number"
+                        step="1"
+                        value={editFeeder.strip.tapeWidth}
+                        onChange={(e) =>
+                          setStripField({
+                            tapeWidth: parseFloat(e.currentTarget.value) || 0,
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Tape type</span>
+                      <select
+                        className="type-select"
+                        value={editFeeder.strip.tapeType}
+                        onChange={(e) =>
+                          setStripField({ tapeType: e.currentTarget.value })
+                        }
+                      >
+                        {TAPE_TYPES.map((t) => (
+                          <option key={t} value={t}>
+                            {t}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="loc-field">
+                      <span>Feed count</span>
+                      <input
+                        type="number"
+                        step="1"
+                        value={editFeeder.strip.feedCount}
+                        onChange={(e) =>
+                          setStripField({
+                            feedCount: parseInt(e.currentTarget.value, 10) || 0,
+                          })
+                        }
+                      />
+                    </label>
+                  </div>
+                  <TeachLoc
+                    label="Pick location (computed from holes + pitch)"
+                    value={editFeeder.strip.pickLocation}
+                    onGo={(t) => moveToFeederLoc(t, "pick")}
+                  />
+                </>
+              ) : editFeeder.editableLocation ? (
+                <TeachLoc
+                  label="Pick location"
+                  value={editFeeder.location ?? null}
+                  onChange={(loc) => setEF({ location: loc })}
+                  onGo={(t) => moveToFeederLoc(t, "location")}
+                  onCapture={(t) => captureFeederLoc(t, "location")}
+                />
               ) : (
                 <div className="muted">
                   This feeder type has no directly editable pick location.
@@ -1068,11 +1255,26 @@ function App() {
               <button className="btn" onClick={() => setEditFeeder(null)}>
                 Close
               </button>
-              {editFeeder.editableLocation && (
-                <button className="btn btn-primary" onClick={saveFeederLocation}>
-                  Save location
+              {editFeeder.photon && (
+                <button className="btn btn-primary" onClick={savePhoton}>
+                  Save
                 </button>
               )}
+              {editFeeder.strip && (
+                <button className="btn btn-primary" onClick={saveStrip}>
+                  Save
+                </button>
+              )}
+              {!editFeeder.photon &&
+                !editFeeder.strip &&
+                editFeeder.editableLocation && (
+                  <button
+                    className="btn btn-primary"
+                    onClick={saveFeederLocation}
+                  >
+                    Save location
+                  </button>
+                )}
             </div>
           </div>
         </div>

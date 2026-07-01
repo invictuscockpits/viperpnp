@@ -19,6 +19,7 @@ import org.openpnp.model.Board;
 import org.openpnp.model.BoardLocation;
 import org.openpnp.model.Configuration;
 import org.openpnp.model.Job;
+import org.openpnp.model.Length;
 import org.openpnp.model.LengthUnit;
 import org.openpnp.model.Location;
 import org.openpnp.model.Motion.MotionOption;
@@ -212,6 +213,8 @@ public class ViperServer {
         app.post("/api/feeders/reorder", ViperServer::reorderFeeders);
         app.get("/api/feeder/{id}", ViperServer::getFeederConfig);
         app.post("/api/feeder/location", ViperServer::setFeederLocation);
+        app.post("/api/feeder/photon", ViperServer::setPhoton);
+        app.post("/api/feeder/strip", ViperServer::setStrip);
         app.post("/api/feeder/move", ViperServer::moveToFeeder);
         app.post("/api/feeder/capture", ViperServer::captureFeeder);
 
@@ -581,20 +584,124 @@ public class ViperServer {
         m.put("type", f.getClass().getSimpleName());
         m.put("part", f.getPart() != null ? f.getPart().getId() : null);
         m.put("enabled", f.isEnabled());
-        if (f instanceof ReferenceFeeder) {
-            Location l = ((ReferenceFeeder) f).getLocation().convertToUnits(LengthUnit.Millimeters);
-            Map<String, Object> loc = new LinkedHashMap<>();
-            loc.put("x", round(l.getX()));
-            loc.put("y", round(l.getY()));
-            loc.put("z", round(l.getZ()));
-            loc.put("rotation", round(l.getRotation()));
-            m.put("location", loc);
+        if (f instanceof PhotonFeeder) {
+            PhotonFeeder pf = (PhotonFeeder) f;
+            Map<String, Object> ph = new LinkedHashMap<>();
+            ph.put("slotAddress", pf.getSlotAddress());
+            ph.put("hardwareId", pf.getHardwareId());
+            ph.put("offset", locMap(pf.getOffset()));
+            ph.put("slotLocation", pf.getSlot() != null ? locMap(pf.getSlot().getLocation()) : null);
+            ph.put("pickLocation", locMap(tryPickLocation(pf)));
+            m.put("photon", ph);
+            m.put("editableLocation", false);
+        }
+        else if (f instanceof ReferenceStripFeeder) {
+            ReferenceStripFeeder sf = (ReferenceStripFeeder) f;
+            Map<String, Object> st = new LinkedHashMap<>();
+            st.put("referenceHole", locMap(sf.getReferenceHoleLocation()));
+            st.put("lastHole", locMap(sf.getLastHoleLocation()));
+            st.put("partPitch", round(sf.getPartPitch().convertToUnits(LengthUnit.Millimeters).getValue()));
+            st.put("tapeWidth", round(sf.getTapeWidth().convertToUnits(LengthUnit.Millimeters).getValue()));
+            st.put("tapeType", sf.getTapeType().name());
+            st.put("feedCount", sf.getFeedCount());
+            st.put("pickLocation", locMap(tryPickLocation(sf)));
+            m.put("strip", st);
+            m.put("editableLocation", false);
+        }
+        else if (f instanceof ReferenceFeeder) {
+            m.put("location", locMap(((ReferenceFeeder) f).getLocation()));
             m.put("editableLocation", true);
         }
         else {
             m.put("editableLocation", false);
         }
         return m;
+    }
+
+    /** Serializes a Location to an {x,y,z,rotation} map in mm, or null. */
+    private static Map<String, Object> locMap(Location l) {
+        if (l == null) {
+            return null;
+        }
+        Location m = l.convertToUnits(LengthUnit.Millimeters);
+        Map<String, Object> o = new LinkedHashMap<>();
+        o.put("x", round(m.getX()));
+        o.put("y", round(m.getY()));
+        o.put("z", round(m.getZ()));
+        o.put("rotation", round(m.getRotation()));
+        return o;
+    }
+
+    /** A Location in mm from an {x,y,z,rotation} DTO. */
+    private static Location loc(LocDto d) {
+        return new Location(LengthUnit.Millimeters, d.x, d.y, d.z, d.rotation);
+    }
+
+    /** Pick location if the feeder is fully configured, else null (never throws). */
+    private static Location tryPickLocation(Feeder f) {
+        try {
+            return f.getPickLocation();
+        }
+        catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Resolves a named teachable location on a feeder: "location" (generic
+     * ReferenceFeeder), "slot" (Photon slot), "refHole"/"lastHole" (strip), or
+     * "pick" (computed pick location, read-only). Returns null if unresolvable.
+     */
+    private static Location namedLocation(Feeder f, String target) {
+        String t = target == null ? "location" : target;
+        switch (t) {
+            case "slot":
+                return f instanceof PhotonFeeder && ((PhotonFeeder) f).getSlot() != null
+                        ? ((PhotonFeeder) f).getSlot().getLocation() : null;
+            case "pick":
+                return tryPickLocation(f);
+            case "refHole":
+                return f instanceof ReferenceStripFeeder
+                        ? ((ReferenceStripFeeder) f).getReferenceHoleLocation() : null;
+            case "lastHole":
+                return f instanceof ReferenceStripFeeder
+                        ? ((ReferenceStripFeeder) f).getLastHoleLocation() : null;
+            case "location":
+            default:
+                return f instanceof ReferenceFeeder ? ((ReferenceFeeder) f).getLocation() : null;
+        }
+    }
+
+    /** Writes a named teachable location; returns false if the target is invalid. */
+    private static boolean writeNamedLocation(Feeder f, String target, Location loc) {
+        String t = target == null ? "location" : target;
+        switch (t) {
+            case "slot":
+                if (f instanceof PhotonFeeder && ((PhotonFeeder) f).getSlot() != null) {
+                    ((PhotonFeeder) f).getSlot().setLocation(loc);
+                    return true;
+                }
+                return false;
+            case "refHole":
+                if (f instanceof ReferenceStripFeeder) {
+                    ((ReferenceStripFeeder) f).setReferenceHoleLocation(loc);
+                    return true;
+                }
+                return false;
+            case "lastHole":
+                if (f instanceof ReferenceStripFeeder) {
+                    ((ReferenceStripFeeder) f).setLastHoleLocation(loc);
+                    return true;
+                }
+                return false;
+            case "location":
+            default:
+                if (f instanceof ReferenceFeeder) {
+                    ((ReferenceFeeder) f).setLocation(loc);
+                    return true;
+                }
+                return false;
+        }
     }
 
     /** GET /api/feeder/{id} — full config for the edit dialog. */
@@ -636,20 +743,108 @@ public class ViperServer {
     }
 
     /**
-     * POST /api/feeder/move — jogs a tool to the feeder pick location at safe Z.
-     * Body: {id, tool: "camera"|"nozzle"}. Runs on the machine task thread.
+     * POST /api/feeder/photon — Photon config. Body: {id, slotAddress?,
+     * offset?{x,y,z,rotation}, slotLocation?{x,y,z,rotation}}. The slot location
+     * is shared by all feeders at that address; the offset is per-feeder.
+     */
+    private static void setPhoton(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PhotonUpdate req = GSON.fromJson(ctx.body(), PhotonUpdate.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (!(f instanceof PhotonFeeder)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"photon feeder not found\"}");
+                return;
+            }
+            PhotonFeeder pf = (PhotonFeeder) f;
+            if (req.slotAddress != null) {
+                pf.setSlotAddress(req.slotAddress);
+            }
+            if (req.offset != null) {
+                pf.setOffset(loc(req.offset));
+            }
+            if (req.slotLocation != null) {
+                if (pf.getSlot() == null) {
+                    ctx.status(400);
+                    ctx.result("{\"error\":\"assign a slot address before setting the slot location\"}");
+                    return;
+                }
+                pf.getSlot().setLocation(loc(req.slotLocation));
+            }
+            ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/feeder/strip — strip-feeder tape geometry. Body: {id,
+     * referenceHole?, lastHole?, partPitch?, tapeWidth?, tapeType?, feedCount?}.
+     * Locations in mm; pitches/widths in mm.
+     */
+    private static void setStrip(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            StripUpdate req = GSON.fromJson(ctx.body(), StripUpdate.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (!(f instanceof ReferenceStripFeeder)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"strip feeder not found\"}");
+                return;
+            }
+            ReferenceStripFeeder sf = (ReferenceStripFeeder) f;
+            if (req.referenceHole != null) {
+                sf.setReferenceHoleLocation(loc(req.referenceHole));
+            }
+            if (req.lastHole != null) {
+                sf.setLastHoleLocation(loc(req.lastHole));
+            }
+            if (req.partPitch != null) {
+                sf.setPartPitch(new Length(req.partPitch, LengthUnit.Millimeters));
+            }
+            if (req.tapeWidth != null) {
+                sf.setTapeWidth(new Length(req.tapeWidth, LengthUnit.Millimeters));
+            }
+            if (req.tapeType != null) {
+                sf.setTapeType(ReferenceStripFeeder.TapeType.valueOf(req.tapeType));
+            }
+            if (req.feedCount != null) {
+                sf.setFeedCount(req.feedCount);
+            }
+            ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/feeder/move — jogs a tool to a named feeder location at safe Z.
+     * Body: {id, tool: "camera"|"nozzle", target?}. target defaults to "pick"
+     * (the computed pick location); "slot", "refHole", "lastHole", "location"
+     * address the specific teachable point. Runs on the machine task thread.
      */
     private static void moveToFeeder(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         FeederAction req = GSON.fromJson(ctx.body(), FeederAction.class);
         Feeder f = req != null ? machine.getFeeder(req.id) : null;
-        if (!(f instanceof ReferenceFeeder)) {
+        if (f == null) {
             ctx.status(404);
-            ctx.result("{\"error\":\"feeder not found or has no location\"}");
+            ctx.result("{\"error\":\"feeder not found\"}");
             return;
         }
-        final Location target = ((ReferenceFeeder) f).getLocation();
-        final boolean nozzle = req != null && "nozzle".equalsIgnoreCase(req.tool);
+        String tgt = req.target != null ? req.target : "pick";
+        final Location target = namedLocation(f, tgt);
+        if (target == null) {
+            ctx.status(400);
+            ctx.result("{\"error\":\"location not set for target '" + tgt + "'\"}");
+            return;
+        }
+        final boolean nozzle = "nozzle".equalsIgnoreCase(req.tool);
         machine.submit(() -> {
             Head head = machine.getDefaultHead();
             HeadMountable hm = nozzle ? head.getDefaultNozzle() : head.getDefaultCamera();
@@ -660,30 +855,36 @@ public class ViperServer {
     }
 
     /**
-     * POST /api/feeder/capture — writes the current tool position into the
-     * feeder location. Camera capture sets X/Y (keeps Z, since the camera can't
-     * reach pick depth); nozzle capture sets X/Y/Z. Rotation is left as-is.
-     * Body: {id, tool: "camera"|"nozzle"}. Reads position only — no motion.
+     * POST /api/feeder/capture — writes the current tool position into a named
+     * feeder location. Camera capture sets X/Y (keeps the target's existing Z,
+     * since the camera can't reach pick depth); nozzle capture sets X/Y/Z.
+     * Rotation is preserved. Body: {id, tool, target?}. Reads position — no motion.
      */
     private static void captureFeeder(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
             FeederAction req = GSON.fromJson(ctx.body(), FeederAction.class);
             Feeder f = req != null ? machine.getFeeder(req.id) : null;
-            if (!(f instanceof ReferenceFeeder)) {
+            if (f == null) {
                 ctx.status(404);
-                ctx.result("{\"error\":\"feeder not found or has no location\"}");
+                ctx.result("{\"error\":\"feeder not found\"}");
                 return;
             }
             Head head = machine.getDefaultHead();
             boolean nozzle = "nozzle".equalsIgnoreCase(req.tool);
             HeadMountable hm = nozzle ? head.getDefaultNozzle() : head.getDefaultCamera();
             Location cur = hm.getLocation().convertToUnits(LengthUnit.Millimeters);
-            ReferenceFeeder rf = (ReferenceFeeder) f;
-            Location existing = rf.getLocation().convertToUnits(LengthUnit.Millimeters);
-            double z = nozzle ? cur.getZ() : existing.getZ();
-            rf.setLocation(new Location(LengthUnit.Millimeters, cur.getX(), cur.getY(), z,
-                    existing.getRotation()));
+            Location existing = namedLocation(f, req.target);
+            Location prior = existing != null ? existing.convertToUnits(LengthUnit.Millimeters) : cur;
+            double z = nozzle ? cur.getZ() : prior.getZ();
+            Location updated = new Location(LengthUnit.Millimeters, cur.getX(), cur.getY(), z,
+                    prior.getRotation());
+            if (!writeNamedLocation(f, req.target, updated)) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"cannot capture into target '" + req.target
+                        + "' (for a Photon slot, assign a slot address first)\"}");
+                return;
+            }
             ctx.result(GSON.toJson(feederConfig(f)));
         }
         catch (Exception e) {
@@ -701,10 +902,38 @@ public class ViperServer {
         double rotation;
     }
 
+    /** An {x,y,z,rotation} location DTO (mm). */
+    private static class LocDto {
+        double x;
+        double y;
+        double z;
+        double rotation;
+    }
+
     /** JSON body for the feeder move/capture teach actions. */
     private static class FeederAction {
         String id;
         String tool;
+        String target;
+    }
+
+    /** JSON body for POST /api/feeder/photon. */
+    private static class PhotonUpdate {
+        String id;
+        Integer slotAddress;
+        LocDto offset;
+        LocDto slotLocation;
+    }
+
+    /** JSON body for POST /api/feeder/strip. */
+    private static class StripUpdate {
+        String id;
+        LocDto referenceHole;
+        LocDto lastHole;
+        Double partPitch;
+        Double tapeWidth;
+        String tapeType;
+        Integer feedCount;
     }
 
     /** JSON summary of the current job: boards, placements and distinct parts. */
