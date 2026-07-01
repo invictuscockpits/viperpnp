@@ -15,7 +15,15 @@ export interface Placement {
  * Y grows downward in file terms), so we plot at (x, -y) to get a board-like
  * view with Y up, and let the SVG viewBox work in millimetre space.
  */
-export function BoardMap({ placements }: { placements: Placement[] }) {
+export function BoardMap({
+  placements,
+  width = 0,
+  height = 0,
+}: {
+  placements: Placement[];
+  width?: number;
+  height?: number;
+}) {
   if (placements.length === 0) {
     return <div className="muted">no placements</div>;
   }
@@ -23,6 +31,12 @@ export function BoardMap({ placements }: { placements: Placement[] }) {
   const pts = placements.map((p) => ({ ...p, sy: -p.y }));
   const xs = pts.map((p) => p.x);
   const ys = pts.map((p) => p.sy);
+  // Board outline: origin (0,0) to (width, height) in plotted space.
+  const hasBoard = width > 0 && height > 0;
+  if (hasBoard) {
+    xs.push(0, width);
+    ys.push(0, height);
+  }
   const minX = Math.min(...xs);
   const maxX = Math.max(...xs);
   const minY = Math.min(...ys);
@@ -45,6 +59,19 @@ export function BoardMap({ placements }: { placements: Placement[] }) {
         stroke="#2a323d"
         strokeWidth={0.3}
       />
+      {hasBoard && (
+        <rect
+          x={0}
+          y={0}
+          width={width}
+          height={height}
+          fill="none"
+          stroke="#05aa3d"
+          strokeWidth={r * 0.4}
+          strokeDasharray={`${r} ${r}`}
+          opacity={0.55}
+        />
+      )}
       {pts.map((p) => {
         const op = p.enabled ? 1 : 0.22;
         const title = `${p.id} · ${p.part ?? "?"} · ${p.type} · ${p.rot}°`;

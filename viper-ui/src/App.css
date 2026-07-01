@@ -14,6 +14,11 @@
   box-sizing: border-box;
 }
 
+/* All checkboxes use the Invictus green when checked (not browser blue). */
+input[type="checkbox"] {
+  accent-color: var(--green);
+}
+
 /* Custom scrollbars — solid gray thumb on a transparent track, shown only
    when content overflows. */
 * {
@@ -708,12 +713,12 @@ body {
   font-weight: 600;
 }
 
-.modal-sm {
+.modal.modal-sm {
   width: 360px;
 }
 
-.modal-wide {
-  width: 620px;
+.modal.modal-wide {
+  width: 700px;
   max-width: 94vw;
 }
 
@@ -788,6 +793,55 @@ body {
   font-size: 0.8rem;
 }
 
+.plc-filter {
+  flex: 0 1 200px;
+}
+
+.plc-size {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: var(--green-dim);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.batch-count {
+  font-size: 0.82rem;
+  color: var(--green);
+  font-weight: 600;
+}
+
+.chk-col {
+  width: 1.8rem;
+  text-align: center;
+}
+
+.sort-th {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.sort-th:hover {
+  color: var(--green);
+}
+
+.boards-toolbar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+}
+
 .plc-body {
   max-height: 68vh;
 }
@@ -798,6 +852,7 @@ body {
 
 .save-row {
   margin-top: 0.5rem;
+  margin-bottom: 0.9rem;
 }
 
 .dirty-dot {

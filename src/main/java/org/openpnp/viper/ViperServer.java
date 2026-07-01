@@ -216,9 +216,12 @@ public class ViperServer {
         app.post("/api/job/placement", ViperServer::updatePlacement);
         app.post("/api/job/placement/add", ViperServer::addPlacement);
         app.post("/api/job/placement/delete", ViperServer::deletePlacement);
+        app.post("/api/job/placement/batch", ViperServer::batchPlacements);
         app.post("/api/job/board-origin", ViperServer::setBoardOriginFromPlacement);
         app.get("/api/boards", ViperServer::listBoards);
         app.post("/api/board", ViperServer::getBoardPlacements);
+        app.post("/api/board/dimensions", ViperServer::setBoardDimensions);
+        app.post("/api/boards/new", ViperServer::newBoard);
         app.post("/api/boards/remove", ViperServer::removeBoard);
         app.post("/api/job/run", ViperServer::runJob);
         app.post("/api/job/abort", ViperServer::abortJob);
@@ -663,6 +666,16 @@ public class ViperServer {
         syncJob();
     }
 
+    /** Board width (mm) or height (mm) from its dimensions, 0 if unset. */
+    private static double boardDim(Board b, boolean width) {
+        Location d = b.getDimensions();
+        if (d == null) {
+            return 0;
+        }
+        d = d.convertToUnits(LengthUnit.Millimeters);
+        return round(width ? d.getX() : d.getY());
+    }
+
     /** The board library: every loaded board with its placement/fiducial counts. */
     private static Map<String, Object> describeBoards() {
         List<Map<String, Object>> boards = new ArrayList<>();
@@ -683,6 +696,8 @@ public class ViperServer {
             bm.put("placements", pl);
             bm.put("fiducials", fid);
             bm.put("dirty", b.isDirty());
+            bm.put("width", boardDim(b, true));
+            bm.put("height", boardDim(b, false));
             boards.add(bm);
         }
         Map<String, Object> root = new LinkedHashMap<>();
@@ -884,22 +899,150 @@ public class ViperServer {
         return "P" + n;
     }
 
-    /** POST /api/job/placement/delete — removes a placement. Body: {board, id}. */
+    /** POST /api/job/placement/delete — removes placement(s). Body: {board, id|ids}. */
     private static void deletePlacement(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
             PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
             Board board = req != null ? resolveBoard(req.board) : null;
-            Placement found = board != null ? board.getPlacements().get(req.id) : null;
-            if (found == null) {
+            if (board == null) {
                 ctx.status(404);
-                ctx.result("{\"error\":\"placement not found\"}");
+                ctx.result("{\"error\":\"board not found\"}");
                 return;
             }
-            board.removePlacement(found);
+            List<String> ids = idsOf(req);
+            boolean any = false;
+            for (String id : ids) {
+                Placement p = board.getPlacements().get(id);
+                if (p != null) {
+                    board.removePlacement(p);
+                    any = true;
+                }
+            }
+            if (any) {
+                board.setDirty(true);
+                markDirty();
+            }
+            ctx.result(GSON.toJson(describeBoardPlacements(board)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** ids from a request: the {ids} list if present, else the single {id}. */
+    private static List<String> idsOf(PlacementUpdate req) {
+        if (req.ids != null && !req.ids.isEmpty()) {
+            return req.ids;
+        }
+        List<String> out = new ArrayList<>();
+        if (req.id != null) {
+            out.add(req.id);
+        }
+        return out;
+    }
+
+    /**
+     * POST /api/job/placement/batch — applies the same change to many placements.
+     * Body: {board, ids:[], type?, side?, enabled?, errorHandling?}.
+     */
+    private static void batchPlacements(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
+            Board board = req != null ? resolveBoard(req.board) : null;
+            if (board == null || req.ids == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"board and ids are required\"}");
+                return;
+            }
+            for (String id : req.ids) {
+                Placement p = board.getPlacements().get(id);
+                if (p == null) {
+                    continue;
+                }
+                if (req.type != null) {
+                    p.setType(Placement.Type.valueOf(req.type));
+                }
+                if (req.side != null) {
+                    p.setSide(Side.valueOf(req.side));
+                }
+                if (req.enabled != null) {
+                    p.setEnabled(req.enabled);
+                }
+                if (req.errorHandling != null) {
+                    p.setErrorHandling(Placement.ErrorHandling.valueOf(req.errorHandling));
+                }
+            }
             board.setDirty(true);
             markDirty();
             ctx.result(GSON.toJson(describeBoardPlacements(board)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/board/dimensions — sets board size. Body: {board, width, height} (mm). */
+    private static void setBoardDimensions(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            DimRequest req = GSON.fromJson(ctx.body(), DimRequest.class);
+            Board board = req != null ? resolveBoard(req.board) : null;
+            if (board == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"board not found\"}");
+                return;
+            }
+            board.setDimensions(new Location(LengthUnit.Millimeters,
+                    Math.max(0, req.width), Math.max(0, req.height), 0, 0));
+            board.setDirty(true);
+            markDirty();
+            ctx.result(GSON.toJson(describeBoardPlacements(board)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/boards/new — creates an empty board. Body: {name, savePath?}. */
+    private static void newBoard(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            NewBoardRequest req = GSON.fromJson(ctx.body(), NewBoardRequest.class);
+            if (req == null || req.name == null || req.name.trim().isEmpty()) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"name is required\"}");
+                return;
+            }
+            String name = req.name.trim();
+            File file = resolveBoardFile(req.savePath, name);
+            try {
+                file = file.getCanonicalFile();
+            }
+            catch (Exception ignore) {
+                // fall back to absolute
+            }
+            if (findBoard(file.getAbsolutePath()) != null) {
+                Map<String, Object> conflict = new LinkedHashMap<>();
+                conflict.put("conflict", true);
+                conflict.put("name", name);
+                conflict.put("file", file.getAbsolutePath());
+                ctx.status(409);
+                ctx.result(GSON.toJson(conflict));
+                return;
+            }
+            file.getParentFile().mkdirs();
+            Board board = new Board();
+            board.setName(name);
+            board.setFile(file);
+            Configuration.get().saveBoard(board);
+            Configuration.get().addBoard(board);
+            syncJob();
+            ctx.result(GSON.toJson(describeBoards()));
         }
         catch (Exception e) {
             ctx.status(500);
@@ -950,6 +1093,7 @@ public class ViperServer {
     private static class PlacementUpdate {
         String board;
         String id;
+        List<String> ids;
         String type;
         Boolean enabled;
         String side;
@@ -963,6 +1107,19 @@ public class ViperServer {
     /** JSON body for board-scoped endpoints. */
     private static class BoardUpdate {
         String board;
+    }
+
+    /** JSON body for POST /api/board/dimensions. */
+    private static class DimRequest {
+        String board;
+        double width;
+        double height;
+    }
+
+    /** JSON body for POST /api/boards/new. */
+    private static class NewBoardRequest {
+        String name;
+        String savePath;
     }
 
     /**
@@ -2143,6 +2300,8 @@ public class ViperServer {
         Map<String, Object> root = new LinkedHashMap<>();
         root.put("file", board.getFile() != null ? board.getFile().getAbsolutePath() : null);
         root.put("name", board.getName());
+        root.put("width", boardDim(board, true));
+        root.put("height", boardDim(board, false));
         List<Map<String, Object>> placements = new ArrayList<>();
         for (Placement p : board.getPlacements()) {
             placements.add(placementMap(p));

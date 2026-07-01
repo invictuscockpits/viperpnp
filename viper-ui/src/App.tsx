@@ -314,11 +314,18 @@ function App() {
   const [boards, setBoards] = useState<BoardInfo[]>([]);
   const [activeBoard, setActiveBoard] = useState<string | null>(null);
   const [boardPlacements, setBoardPlacements] = useState<Placement[]>([]);
+  const [boardDims, setBoardDims] = useState({ width: 0, height: 0 });
   const [placementsOpen, setPlacementsOpen] = useState(false);
   const [removeBoardTarget, setRemoveBoardTarget] = useState<BoardInfo | null>(
     null,
   );
-  const [selPlacement, setSelPlacement] = useState<string | null>(null);
+  const [selPlacements, setSelPlacements] = useState<Set<string>>(new Set());
+  const [plcFilter, setPlcFilter] = useState("");
+  const [plcTypeFilter, setPlcTypeFilter] = useState("all");
+  const [sortCol, setSortCol] = useState("id");
+  const [sortDir, setSortDir] = useState<1 | -1>(1);
+  const [newBoardOpen, setNewBoardOpen] = useState(false);
+  const [newBoardName, setNewBoardName] = useState("");
   const [editPlacement, setEditPlacement] = useState<Placement | null>(null);
   const [reference, setReference] = useState("camera");
   const [tab, setTab] = useState<Tab>("board");
@@ -547,7 +554,8 @@ function App() {
   const openBoard = async (file: string | null) => {
     if (!file) return;
     setActiveBoard(file);
-    setSelPlacement(null);
+    setSelPlacements(new Set());
+    setPlcFilter("");
     setPlacementsOpen(true);
     try {
       const res = await fetch("/api/board", {
@@ -557,6 +565,7 @@ function App() {
       });
       const d = await res.json();
       setBoardPlacements(d.placements ?? []);
+      setBoardDims({ width: d.width ?? 0, height: d.height ?? 0 });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -592,6 +601,8 @@ function App() {
         setError(String(data.message ?? data.error));
       } else {
         setBoardPlacements(data.placements ?? []);
+        if (data.width !== undefined)
+          setBoardDims({ width: data.width, height: data.height });
         loadBoards();
       }
     } catch (e) {
@@ -600,13 +611,57 @@ function App() {
   };
 
   const addPlacement = () => postPlacement("/api/job/placement/add", {});
-  const deleteSelPlacement = () => {
-    if (!selPlacement) return;
-    postPlacement("/api/job/placement/delete", { id: selPlacement });
-    setSelPlacement(null);
-  };
   const setBoardOrigin = (id: string) =>
     postPlacement("/api/job/board-origin", { id });
+
+  const selIds = () => Array.from(selPlacements);
+  const deleteSelPlacements = () => {
+    if (selPlacements.size === 0) return;
+    postPlacement("/api/job/placement/delete", { ids: selIds() });
+    setSelPlacements(new Set());
+  };
+  const batchSet = (patch: {
+    type?: string;
+    side?: string;
+    enabled?: boolean;
+    errorHandling?: string;
+  }) => {
+    if (selPlacements.size === 0) return;
+    postPlacement("/api/job/placement/batch", { ids: selIds(), ...patch });
+  };
+  const toggleSel = (id: string) =>
+    setSelPlacements((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const setBoardSize = (width: number, height: number) =>
+    postPlacement("/api/board/dimensions", { width, height });
+
+  const createNewBoard = async () => {
+    if (!newBoardName.trim()) return;
+    try {
+      const res = await fetch("/api/boards/new", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: newBoardName.trim(),
+          savePath: savePath || undefined,
+        }),
+      });
+      const d = await res.json();
+      if (res.status === 409 && d.conflict) {
+        setError(`A board named "${d.name}" already exists.`);
+        return;
+      }
+      if (d.boards) setBoards(d.boards);
+      setNewBoardOpen(false);
+      setNewBoardName("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const updatePlacement = async (
     id: string,
@@ -909,6 +964,49 @@ function App() {
   };
 
   const placements = boardPlacements;
+  const visiblePlacements = (() => {
+    const f = plcFilter.trim().toLowerCase();
+    let ps = placements.filter((p) => {
+      if (plcTypeFilter !== "all" && p.type !== plcTypeFilter) return false;
+      if (!f) return true;
+      return (
+        p.id.toLowerCase().includes(f) ||
+        (p.part ?? "").toLowerCase().includes(f)
+      );
+    });
+    ps = [...ps].sort((a, b) => {
+      const pick = (p: Placement): string | number => {
+        switch (sortCol) {
+          case "part":
+            return p.part ?? "";
+          case "side":
+            return p.side ?? "";
+          case "type":
+            return p.type;
+          case "enabled":
+            return p.enabled ? 1 : 0;
+          default:
+            return p.id;
+        }
+      };
+      const av = pick(a);
+      const bv = pick(b);
+      if (typeof av === "string" && typeof bv === "string")
+        return av.localeCompare(bv) * sortDir;
+      return ((av as number) - (bv as number)) * sortDir;
+    });
+    return ps;
+  })();
+  const allVisibleSelected =
+    visiblePlacements.length > 0 &&
+    visiblePlacements.every((p) => selPlacements.has(p.id));
+  const toggleSortCol = (col: string) => {
+    if (sortCol === col) setSortDir((d) => (d === 1 ? -1 : 1));
+    else {
+      setSortCol(col);
+      setSortDir(1);
+    }
+  };
   const pos = status?.position;
   const shortImpl = inventory?.impl.split(".").pop() ?? "—";
   const cameraName = inventory?.heads?.[0]?.cameras?.[0] ?? "Top";
@@ -1367,10 +1465,21 @@ function App() {
                 </label>
               </div>
               {importErr && <div className="banner banner-warn">{importErr}</div>}
+              <div className="boards-toolbar">
+                <button
+                  className="btn btn-sm"
+                  onClick={() => {
+                    setNewBoardName("");
+                    setNewBoardOpen(true);
+                  }}
+                >
+                  + New board
+                </button>
+              </div>
               {boards.length === 0 ? (
                 <div className="muted">
-                  No boards yet. Import a board file (KiCad, CSV, Eagle) to add
-                  one to the library.
+                  No boards yet. Import a board file (KiCad, CSV, Eagle) or make a
+                  new one.
                 </div>
               ) : (
                 <div className="ptable-wrap">
@@ -2050,41 +2159,158 @@ function App() {
               <button className="btn btn-sm" onClick={addPlacement}>
                 + Add
               </button>
-              <button
-                className="btn btn-sm btn-trash"
-                onClick={deleteSelPlacement}
-                disabled={!selPlacement}
+              <input
+                className="import-input plc-filter"
+                value={plcFilter}
+                onChange={(e) => setPlcFilter(e.currentTarget.value)}
+                placeholder="filter by ref or part…"
+              />
+              <select
+                className="type-select"
+                value={plcTypeFilter}
+                onChange={(e) => setPlcTypeFilter(e.currentTarget.value)}
               >
-                <TrashIcon size={14} /> Delete
-              </button>
+                <option value="all">All types</option>
+                <option value="Placement">Placements</option>
+                <option value="Fiducial">Fiducials</option>
+              </select>
+              <label className="run-toggle plc-size">
+                Board mm
+                <NumberInput
+                  className="num-sm"
+                  min={0}
+                  value={boardDims.width}
+                  onChange={(v) => setBoardSize(v, boardDims.height)}
+                />
+                ×
+                <NumberInput
+                  className="num-sm"
+                  min={0}
+                  value={boardDims.height}
+                  onChange={(v) => setBoardSize(boardDims.width, v)}
+                />
+              </label>
               <span className="muted plc-count">
-                {placements.length} placements ·{" "}
-                {placements.filter((p) => p.type === "Fiducial").length}{" "}
-                fiducials
+                {visiblePlacements.length}/{placements.length}
               </span>
             </div>
+            {selPlacements.size > 0 && (
+              <div className="batch-bar">
+                <span className="batch-count">{selPlacements.size} selected</span>
+                <select
+                  className="type-select"
+                  value=""
+                  onChange={(e) => {
+                    if (e.currentTarget.value)
+                      batchSet({ type: e.currentTarget.value });
+                    e.currentTarget.value = "";
+                  }}
+                >
+                  <option value="">Type…</option>
+                  <option value="Placement">Placement</option>
+                  <option value="Fiducial">Fiducial</option>
+                </select>
+                <select
+                  className="type-select"
+                  value=""
+                  onChange={(e) => {
+                    if (e.currentTarget.value)
+                      batchSet({ side: e.currentTarget.value });
+                    e.currentTarget.value = "";
+                  }}
+                >
+                  <option value="">Side…</option>
+                  <option value="Top">Top</option>
+                  <option value="Bottom">Bottom</option>
+                </select>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => batchSet({ enabled: true })}
+                >
+                  Enable
+                </button>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => batchSet({ enabled: false })}
+                >
+                  Disable
+                </button>
+                <select
+                  className="type-select"
+                  value=""
+                  onChange={(e) => {
+                    if (e.currentTarget.value)
+                      batchSet({ errorHandling: e.currentTarget.value });
+                    e.currentTarget.value = "";
+                  }}
+                >
+                  <option value="">Error…</option>
+                  {ERROR_HANDLING.map((eh) => (
+                    <option key={eh} value={eh}>
+                      {eh}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn btn-sm btn-trash"
+                  onClick={deleteSelPlacements}
+                >
+                  <TrashIcon size={14} /> Delete
+                </button>
+              </div>
+            )}
             <div className="modal-body plc-body">
               <table className="ptable">
                 <thead>
                   <tr>
-                    <th>Active</th>
-                    <th>ID</th>
-                    <th>Part</th>
-                    <th>Side</th>
-                    <th>Type</th>
+                    <th className="chk-col">
+                      <input
+                        type="checkbox"
+                        checked={allVisibleSelected}
+                        onChange={(e) =>
+                          setSelPlacements(
+                            e.currentTarget.checked
+                              ? new Set(visiblePlacements.map((p) => p.id))
+                              : new Set(),
+                          )
+                        }
+                      />
+                    </th>
+                    <th>On</th>
+                    {[
+                      ["id", "ID"],
+                      ["part", "Part"],
+                      ["side", "Side"],
+                      ["type", "Type"],
+                    ].map(([col, label]) => (
+                      <th
+                        key={col}
+                        className="sort-th"
+                        onClick={() => toggleSortCol(col)}
+                      >
+                        {label}
+                        {sortCol === col ? (sortDir === 1 ? " ▲" : " ▼") : ""}
+                      </th>
+                    ))}
                     <th></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {placements.map((p) => (
+                  {visiblePlacements.map((p) => (
                     <tr
                       key={p.id}
                       className={`${p.enabled ? "" : "row-off"} ${
-                        selPlacement === p.id ? "row-sel" : ""
+                        selPlacements.has(p.id) ? "row-sel" : ""
                       }`}
-                      onClick={() => setSelPlacement(p.id)}
                     >
-                      <td onClick={(e) => e.stopPropagation()}>
+                      <td className="chk-col">
+                        <input
+                          type="checkbox"
+                          checked={selPlacements.has(p.id)}
+                          onChange={() => toggleSel(p.id)}
+                        />
+                      </td>
+                      <td>
                         <input
                           type="checkbox"
                           checked={p.enabled}
@@ -2096,7 +2322,7 @@ function App() {
                         />
                       </td>
                       <td className="mono">{p.id}</td>
-                      <td onClick={(e) => e.stopPropagation()}>
+                      <td>
                         <select
                           className="type-select"
                           value={p.part ?? ""}
@@ -2114,7 +2340,7 @@ function App() {
                           ))}
                         </select>
                       </td>
-                      <td onClick={(e) => e.stopPropagation()}>
+                      <td>
                         <select
                           className="type-select"
                           value={p.side ?? "Top"}
@@ -2128,7 +2354,7 @@ function App() {
                           <option value="Bottom">Bottom</option>
                         </select>
                       </td>
-                      <td onClick={(e) => e.stopPropagation()}>
+                      <td>
                         <select
                           className="type-select"
                           value={p.type}
@@ -2142,7 +2368,7 @@ function App() {
                           <option value="Fiducial">Fiducial</option>
                         </select>
                       </td>
-                      <td onClick={(e) => e.stopPropagation()}>
+                      <td>
                         <button
                           className="btn btn-sm btn-icon"
                           onClick={() => setEditPlacement(p)}
@@ -2158,9 +2384,60 @@ function App() {
               </table>
               {placements.length > 0 && (
                 <div className="plc-map">
-                  <BoardMap placements={placements} />
+                  <BoardMap
+                    placements={placements}
+                    width={boardDims.width}
+                    height={boardDims.height}
+                  />
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {newBoardOpen && (
+        <div className="modal-backdrop" onClick={() => setNewBoardOpen(false)}>
+          <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>New board</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setNewBoardOpen(false)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="field-row">
+                <label>Name</label>
+                <input
+                  className="import-input"
+                  autoFocus
+                  value={newBoardName}
+                  onChange={(e) => setNewBoardName(e.currentTarget.value)}
+                  onKeyDown={(e) => e.key === "Enter" && createNewBoard()}
+                  placeholder="board name"
+                />
+              </div>
+              <p className="confirm-text muted">
+                Creates an empty <span className="mono">.board.xml</span> in{" "}
+                {savePath || "config/boards"}. Add placements from the
+                placements window.
+              </p>
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setNewBoardOpen(false)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={!newBoardName.trim()}
+                onClick={createNewBoard}
+              >
+                Create
+              </button>
             </div>
           </div>
         </div>
