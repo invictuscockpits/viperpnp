@@ -747,6 +747,9 @@ public class ViperServer {
             if (req.enabled != null) {
                 f.setEnabled(req.enabled);
             }
+            if (req.name != null && !req.name.trim().isEmpty()) {
+                f.setName(req.name.trim());
+            }
             ctx.result(GSON.toJson(describeFeeders()));
         }
         catch (Exception e) {
@@ -793,6 +796,7 @@ public class ViperServer {
         String id;
         String partId;
         Boolean enabled;
+        String name;
     }
 
     /** JSON body for POST /api/feeders/add. */

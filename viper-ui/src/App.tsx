@@ -451,7 +451,7 @@ function App() {
 
   const updateFeeder = async (
     id: string,
-    patch: { partId?: string; enabled?: boolean },
+    patch: { partId?: string; enabled?: boolean; name?: string },
   ) => {
     try {
       const res = await fetch("/api/feeder", {
@@ -1290,6 +1290,20 @@ function App() {
               </button>
             </div>
             <div className="modal-body">
+              <div className="field-row">
+                <label>Name</label>
+                <input
+                  className="import-input"
+                  value={editFeeder.name}
+                  onChange={(e) => setEF({ name: e.currentTarget.value })}
+                  onBlur={() => {
+                    if (editFeeder.name.trim()) {
+                      updateFeeder(editFeeder.id, { name: editFeeder.name.trim() });
+                    }
+                  }}
+                  placeholder="feeder name"
+                />
+              </div>
               <div className="field-row">
                 <label>Type</label>
                 <span className="muted">{editFeeder.type}</span>
