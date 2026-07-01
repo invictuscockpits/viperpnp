@@ -27,6 +27,7 @@ import org.openpnp.spi.HeadMountable;
 import org.openpnp.spi.Machine;
 import org.openpnp.spi.MachineListener;
 import org.openpnp.spi.Nozzle;
+import org.openpnp.util.MovableUtils;
 
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.gson.Gson;
@@ -122,16 +123,59 @@ public class ViperServer {
             ctx.result("{\"submitted\":true}");
         });
 
+        app.post("/api/machine/park", ctx -> {
+            machine.submit(() -> {
+                MovableUtils.park(machine.getDefaultHead());
+                return null;
+            }, broadcastCallback());
+            ctx.contentType("application/json");
+            ctx.result("{\"submitted\":true}");
+        });
+
+        app.post("/api/machine/camera-to-nozzle", ctx -> {
+            machine.submit(() -> {
+                Head head = machine.getDefaultHead();
+                MovableUtils.moveToLocationAtSafeZ(head.getDefaultCamera(),
+                        head.getDefaultNozzle().getLocation());
+                return null;
+            }, broadcastCallback());
+            ctx.contentType("application/json");
+            ctx.result("{\"submitted\":true}");
+        });
+
+        app.post("/api/machine/nozzle-to-camera", ctx -> {
+            machine.submit(() -> {
+                Head head = machine.getDefaultHead();
+                MovableUtils.moveToLocationAtSafeZ(head.getDefaultNozzle(),
+                        head.getDefaultCamera().getLocation());
+                return null;
+            }, broadcastCallback());
+            ctx.contentType("application/json");
+            ctx.result("{\"submitted\":true}");
+        });
+
         app.post("/api/jog", ctx -> {
             JogRequest req = GSON.fromJson(ctx.body(), JogRequest.class);
             final JogRequest jog = req != null ? req : new JogRequest();
             machine.submit(() -> {
-                HeadMountable tool = machine.getDefaultHead().getDefaultNozzle();
+                Head head = machine.getDefaultHead();
+                HeadMountable tool;
+                if (jog.tool == null || jog.tool.isEmpty()
+                        || "nozzle".equalsIgnoreCase(jog.tool)) {
+                    tool = head.getDefaultNozzle();
+                }
+                else if ("camera".equalsIgnoreCase(jog.tool)) {
+                    tool = head.getDefaultCamera();
+                }
+                else {
+                    HeadMountable n = head.getNozzle(jog.tool);
+                    tool = n != null ? n : head.getDefaultNozzle();
+                }
                 Location current = tool.getLocation().convertToUnits(LengthUnit.Millimeters);
                 Location delta = new Location(LengthUnit.Millimeters, jog.dx, jog.dy, jog.dz, jog.dc);
                 Location target = current.addWithRotation(delta);
-                double speed = jog.speed > 0 ? jog.speed : 1.0;
-                tool.moveTo(target, speed, MotionOption.JogMotion);
+                double sp = jog.speed > 0 ? jog.speed : 1.0;
+                tool.moveTo(target, sp, MotionOption.JogMotion);
                 return null;
             }, broadcastCallback());
             ctx.contentType("application/json");
@@ -265,13 +309,14 @@ public class ViperServer {
         }
     }
 
-    /** JSON body for POST /api/jog; millimetre deltas plus optional 0..1 speed. */
+    /** JSON body for POST /api/jog; mm deltas, 0..1 speed, and the tool to move. */
     private static class JogRequest {
         double dx;
         double dy;
         double dz;
         double dc;
         double speed;
+        String tool;
     }
 
     /**
