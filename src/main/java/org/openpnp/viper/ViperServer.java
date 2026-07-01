@@ -10,7 +10,9 @@ import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.openpnp.gui.importer.KicadPosImporter;
+import org.openpnp.machine.photon.PhotonFeeder;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
+import org.openpnp.machine.reference.feeder.ReferenceStripFeeder;
 import org.openpnp.model.Abstract2DLocatable.Side;
 import org.openpnp.model.Board;
 import org.openpnp.model.BoardLocation;
@@ -19,9 +21,11 @@ import org.openpnp.model.Job;
 import org.openpnp.model.LengthUnit;
 import org.openpnp.model.Location;
 import org.openpnp.model.Motion.MotionOption;
+import org.openpnp.model.Part;
 import org.openpnp.model.Placement;
 import org.openpnp.spi.Camera;
 import org.openpnp.spi.Driver;
+import org.openpnp.spi.Feeder;
 import org.openpnp.spi.Head;
 import org.openpnp.spi.HeadMountable;
 import org.openpnp.spi.Machine;
@@ -188,6 +192,22 @@ public class ViperServer {
             ctx.result(GSON.toJson(describeJob(currentJob)));
         });
         app.post("/api/job/placement", ViperServer::updatePlacement);
+        app.get("/api/feeders", ctx -> {
+            ctx.contentType("application/json");
+            ctx.result(GSON.toJson(describeFeeders()));
+        });
+        app.get("/api/parts", ctx -> {
+            List<String> parts = new ArrayList<>();
+            for (Part p : Configuration.get().getParts()) {
+                parts.add(p.getId());
+            }
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("parts", parts);
+            ctx.contentType("application/json");
+            ctx.result(GSON.toJson(out));
+        });
+        app.post("/api/feeder", ViperServer::updateFeeder);
+        app.post("/api/feeders/add", ViperServer::addFeeder);
 
         app.ws("/ws/events", ws -> {
             ws.onConnect(sctx -> {
@@ -409,6 +429,91 @@ public class ViperServer {
         String id;
         String type;
         Boolean enabled;
+    }
+
+    /** Feeder list snapshot: name, type, assigned part, enabled. */
+    private static Map<String, Object> describeFeeders() {
+        Map<String, Object> root = new LinkedHashMap<>();
+        List<Map<String, Object>> feeders = new ArrayList<>();
+        for (Feeder f : machine.getFeeders()) {
+            Map<String, Object> fm = new LinkedHashMap<>();
+            fm.put("id", f.getId());
+            fm.put("name", f.getName());
+            fm.put("type", f.getClass().getSimpleName());
+            fm.put("part", f.getPart() != null ? f.getPart().getId() : null);
+            fm.put("enabled", f.isEnabled());
+            feeders.add(fm);
+        }
+        root.put("feeders", feeders);
+        return root;
+    }
+
+    /** Assigns a part to a feeder and/or toggles it. Body: {id, partId?, enabled?}. */
+    private static void updateFeeder(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            FeederUpdate req = GSON.fromJson(ctx.body(), FeederUpdate.class);
+            if (req == null || req.id == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"missing feeder id\"}");
+                return;
+            }
+            Feeder f = machine.getFeeder(req.id);
+            if (f == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"feeder not found\"}");
+                return;
+            }
+            if (req.partId != null) {
+                f.setPart(req.partId.isEmpty() ? null
+                        : Configuration.get().getPart(req.partId));
+            }
+            if (req.enabled != null) {
+                f.setEnabled(req.enabled);
+            }
+            ctx.result(GSON.toJson(describeFeeders()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** Adds a feeder. Body: {type: "photon"|"strip", name?, partId?}. */
+    private static void addFeeder(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            FeederAdd req = GSON.fromJson(ctx.body(), FeederAdd.class);
+            Feeder f = req != null && "strip".equalsIgnoreCase(req.type)
+                    ? new ReferenceStripFeeder()
+                    : new PhotonFeeder();
+            if (req != null && req.name != null && !req.name.isEmpty()) {
+                f.setName(req.name);
+            }
+            if (req != null && req.partId != null && !req.partId.isEmpty()) {
+                f.setPart(Configuration.get().getPart(req.partId));
+            }
+            machine.addFeeder(f);
+            ctx.result(GSON.toJson(describeFeeders()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/feeder. */
+    private static class FeederUpdate {
+        String id;
+        String partId;
+        Boolean enabled;
+    }
+
+    /** JSON body for POST /api/feeders/add. */
+    private static class FeederAdd {
+        String type;
+        String name;
+        String partId;
     }
 
     /** JSON summary of the current job: boards, placements and distinct parts. */
