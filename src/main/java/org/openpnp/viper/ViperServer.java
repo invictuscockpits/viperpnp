@@ -16,6 +16,7 @@ import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.machine.reference.ReferenceNozzle;
 import org.openpnp.machine.reference.ReferencePnpJobProcessor;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
+import org.openpnp.machine.reference.feeder.ReferenceRotatedTrayFeeder;
 import org.openpnp.machine.reference.feeder.ReferenceStripFeeder;
 import org.openpnp.machine.reference.feeder.ReferenceTrayFeeder;
 import org.openpnp.model.Abstract2DLocatable.Side;
@@ -42,6 +43,7 @@ import org.openpnp.spi.Nozzle;
 import org.openpnp.spi.PnpJobProcessor;
 import org.openpnp.spi.base.AbstractFeeder;
 import org.openpnp.util.MovableUtils;
+import org.openpnp.util.Utils2D;
 
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.gson.Gson;
@@ -266,6 +268,8 @@ public class ViperServer {
         app.post("/api/feeder/photon/feed", ctx -> photonAction(ctx, true));
         app.post("/api/feeder/strip", ViperServer::setStrip);
         app.post("/api/feeder/tray", ViperServer::setTray);
+        app.post("/api/feeder/rotatedtray", ViperServer::setRotatedTray);
+        app.post("/api/feeder/count", ViperServer::feederCount);
         app.post("/api/feeder/retry", ViperServer::setFeederRetry);
         app.post("/api/feeders/scan", ctx -> {
             machine.submit(() -> {
@@ -835,7 +839,50 @@ public class ViperServer {
         return needs;
     }
 
-    /** Feeder list snapshot: name, type, assigned part, enabled, setup needs. */
+    /** Current feed count for feeders that track one (tray/rotated tray/strip), else null. */
+    private static Integer feederFeedCount(Feeder f) {
+        if (f instanceof ReferenceTrayFeeder) {
+            return ((ReferenceTrayFeeder) f).getFeedCount();
+        }
+        if (f instanceof ReferenceRotatedTrayFeeder) {
+            return ((ReferenceRotatedTrayFeeder) f).getFeedCount();
+        }
+        if (f instanceof ReferenceStripFeeder) {
+            return ((ReferenceStripFeeder) f).getFeedCount();
+        }
+        return null;
+    }
+
+    /** Total part capacity, else null when unknown (e.g. a strip with no max set). */
+    private static Integer feederCapacity(Feeder f) {
+        if (f instanceof ReferenceTrayFeeder) {
+            ReferenceTrayFeeder t = (ReferenceTrayFeeder) f;
+            return t.getEffectiveTrayCountX() * t.getEffectiveTrayCountY();
+        }
+        if (f instanceof ReferenceRotatedTrayFeeder) {
+            ReferenceRotatedTrayFeeder t = (ReferenceRotatedTrayFeeder) f;
+            return t.getEffectiveTrayCountCols() * t.getEffectiveTrayCountRows();
+        }
+        if (f instanceof ReferenceStripFeeder) {
+            int m = ((ReferenceStripFeeder) f).getMaxFeedCount();
+            return m > 0 ? m : null;
+        }
+        return null;
+    }
+
+    private static void setFeederFeedCount(Feeder f, int n) {
+        if (f instanceof ReferenceTrayFeeder) {
+            ((ReferenceTrayFeeder) f).setFeedCount(n);
+        }
+        else if (f instanceof ReferenceRotatedTrayFeeder) {
+            ((ReferenceRotatedTrayFeeder) f).setFeedCount(n);
+        }
+        else if (f instanceof ReferenceStripFeeder) {
+            ((ReferenceStripFeeder) f).setFeedCount(n);
+        }
+    }
+
+    /** Feeder list snapshot: name, type, assigned part, enabled, setup needs, parts left. */
     private static Map<String, Object> describeFeeders() {
         Map<String, Object> root = new LinkedHashMap<>();
         List<Map<String, Object>> feeders = new ArrayList<>();
@@ -849,6 +896,12 @@ public class ViperServer {
             List<String> needs = feederNeeds(f);
             fm.put("canEnable", needs.isEmpty());
             fm.put("needs", needs);
+            Integer cap = feederCapacity(f);
+            Integer fc = feederFeedCount(f);
+            if (cap != null && fc != null) {
+                fm.put("capacity", cap);
+                fm.put("remaining", Math.max(0, cap - fc));
+            }
             feeders.add(fm);
         }
         root.put("feeders", feeders);
@@ -899,6 +952,9 @@ public class ViperServer {
             switch (type) {
                 case "tray":
                     f = new ReferenceTrayFeeder();
+                    break;
+                case "rotatedtray":
+                    f = new ReferenceRotatedTrayFeeder();
                     break;
                 case "strip":
                     f = new ReferenceStripFeeder();
@@ -1046,6 +1102,23 @@ public class ViperServer {
             m.put("tray", tr);
             m.put("editableLocation", false);
         }
+        else if (f instanceof ReferenceRotatedTrayFeeder) {
+            ReferenceRotatedTrayFeeder tf = (ReferenceRotatedTrayFeeder) f;
+            Map<String, Object> tr = new LinkedHashMap<>();
+            tr.put("firstLocation", locMap(tf.getLocation()));
+            tr.put("firstRowLastLocation", locMap(tf.getFirstRowLastComponentLocation()));
+            tr.put("lastLocation", locMap(tf.getLastComponentLocation()));
+            tr.put("trayCountCols", tf.getTrayCountCols());
+            tr.put("trayCountRows", tf.getTrayCountRows());
+            tr.put("componentRotation", round(tf.getComponentRotationInTray()));
+            tr.put("feedCount", tf.getFeedCount());
+            Location off = tf.getOffsets().convertToUnits(LengthUnit.Millimeters);
+            tr.put("colPitch", round(off.getX()));
+            tr.put("rowPitch", round(off.getY()));
+            tr.put("trayRotation", round(tf.getLocation().getRotation()));
+            m.put("rotatedTray", tr);
+            m.put("editableLocation", false);
+        }
         else if (f instanceof ReferenceStripFeeder) {
             ReferenceStripFeeder sf = (ReferenceStripFeeder) f;
             Map<String, Object> st = new LinkedHashMap<>();
@@ -1117,6 +1190,12 @@ public class ViperServer {
             case "lastHole":
                 return f instanceof ReferenceStripFeeder
                         ? ((ReferenceStripFeeder) f).getLastHoleLocation() : null;
+            case "firstRowLast":
+                return f instanceof ReferenceRotatedTrayFeeder
+                        ? ((ReferenceRotatedTrayFeeder) f).getFirstRowLastComponentLocation() : null;
+            case "lastComponent":
+                return f instanceof ReferenceRotatedTrayFeeder
+                        ? ((ReferenceRotatedTrayFeeder) f).getLastComponentLocation() : null;
             case "location":
             default:
                 return f instanceof ReferenceFeeder ? ((ReferenceFeeder) f).getLocation() : null;
@@ -1154,6 +1233,18 @@ public class ViperServer {
             case "lastHole":
                 if (f instanceof ReferenceStripFeeder) {
                     ((ReferenceStripFeeder) f).setLastHoleLocation(loc);
+                    return true;
+                }
+                return false;
+            case "firstRowLast":
+                if (f instanceof ReferenceRotatedTrayFeeder) {
+                    ((ReferenceRotatedTrayFeeder) f).setFirstRowLastComponentLocation(loc);
+                    return true;
+                }
+                return false;
+            case "lastComponent":
+                if (f instanceof ReferenceRotatedTrayFeeder) {
+                    ((ReferenceRotatedTrayFeeder) f).setLastComponentLocation(loc);
                     return true;
                 }
                 return false;
@@ -1321,6 +1412,133 @@ public class ViperServer {
                 tf.setFeedCount(req.feedCount);
             }
             ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/feeder/rotatedtray — rotated/skewed matrix tray. Body (optional):
+     * {id, firstLocation, firstRowLastLocation, lastLocation, trayCountCols,
+     * trayCountRows, componentRotation, feedCount, recalculate}. The first three
+     * are the 3 taught corners; with recalculate=true the row/column pitch and
+     * tray rotation are derived from them (same math as OpenPnP's wizard).
+     */
+    private static void setRotatedTray(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            RotatedTrayUpdate req = GSON.fromJson(ctx.body(), RotatedTrayUpdate.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (!(f instanceof ReferenceRotatedTrayFeeder)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"rotated tray feeder not found\"}");
+                return;
+            }
+            ReferenceRotatedTrayFeeder tf = (ReferenceRotatedTrayFeeder) f;
+            if (req.firstLocation != null) {
+                tf.setLocation(loc(req.firstLocation));
+            }
+            if (req.firstRowLastLocation != null) {
+                tf.setFirstRowLastComponentLocation(loc(req.firstRowLastLocation));
+            }
+            if (req.lastLocation != null) {
+                tf.setLastComponentLocation(loc(req.lastLocation));
+            }
+            if (req.trayCountCols != null) {
+                tf.setTrayCountCols(req.trayCountCols);
+            }
+            if (req.trayCountRows != null) {
+                tf.setTrayCountRows(req.trayCountRows);
+            }
+            if (req.componentRotation != null) {
+                tf.setComponentRotationInTray(req.componentRotation);
+            }
+            if (req.feedCount != null) {
+                tf.setFeedCount(req.feedCount);
+            }
+            if (Boolean.TRUE.equals(req.recalculate)) {
+                recomputeRotatedTray(tf);
+            }
+            ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * Derives the row/column pitch (offsets) and tray rotation from the three
+     * taught corners and the row/column counts. Mirrors
+     * ReferenceRotatedTrayFeederConfigurationWizard.calculateOffsetsAndRotation.
+     */
+    private static void recomputeRotatedTray(ReferenceRotatedTrayFeeder tf) {
+        int nCols = tf.getTrayCountCols();
+        int nRows = tf.getTrayCountRows();
+        if (nCols < 1 || nRows < 1) {
+            return;
+        }
+        Location a = tf.getLocation();
+        Location b = tf.getFirstRowLastComponentLocation();
+        Location c = tf.getLastComponentLocation();
+        Length abLen = a.getLinearLengthTo(b);
+        Length bcLen = b.getLinearLengthTo(c);
+        Length colStep = nCols > 1 ? abLen.divide(nCols - 1) : new Length(0, LengthUnit.Millimeters);
+        Length rowStep = nRows > 1 ? bcLen.divide(nRows - 1) : new Length(0, LengthUnit.Millimeters);
+        double rowAngle = Utils2D.getAngleFromPoint(a, b);
+        double colAngle = Utils2D.getAngleFromPoint(b, c);
+        if (nRows > 1 && nCols > 1) {
+            double check = Utils2D.normalizeAngle180(rowAngle - colAngle);
+            if (check < 0) {
+                rowStep = rowStep.multiply(-1);
+            }
+        }
+        double rotDeg = a.getRotation();
+        if (nCols > 1) {
+            rotDeg = rowAngle;
+        }
+        else if (nRows > 1) {
+            rotDeg = colAngle + 90;
+        }
+        tf.setOffsets(new Location(LengthUnit.Millimeters,
+                colStep.convertToUnits(LengthUnit.Millimeters).getValue(),
+                rowStep.convertToUnits(LengthUnit.Millimeters).getValue(), 0, 0));
+        tf.setLocation(tf.getLocation().derive(null, null, null, rotDeg));
+    }
+
+    /**
+     * POST /api/feeder/count — moves a tray/strip feeder's part counter. Body:
+     * {id, op: "reset"|"advance"}. Reset goes back to the first part; advance
+     * steps to the next, bounded by capacity.
+     */
+    private static void feederCount(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            CountRequest req = GSON.fromJson(ctx.body(), CountRequest.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            Integer fc = f != null ? feederFeedCount(f) : null;
+            if (fc == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"feeder has no part counter\"}");
+                return;
+            }
+            Integer cap = feederCapacity(f);
+            int next;
+            if ("reset".equalsIgnoreCase(req.op)) {
+                next = 0;
+            }
+            else if ("advance".equalsIgnoreCase(req.op)) {
+                next = cap != null ? Math.min(cap, fc + 1) : fc + 1;
+            }
+            else {
+                ctx.status(400);
+                ctx.result("{\"error\":\"op must be reset or advance\"}");
+                return;
+            }
+            setFeederFeedCount(f, next);
+            ctx.result(GSON.toJson(describeFeeders()));
         }
         catch (Exception e) {
             ctx.status(500);
@@ -1512,6 +1730,25 @@ public class ViperServer {
         Integer feedRetryCount;
         Integer pickRetryCount;
         Integer commMaxRetry;
+    }
+
+    /** JSON body for POST /api/feeder/rotatedtray. */
+    private static class RotatedTrayUpdate {
+        String id;
+        LocDto firstLocation;
+        LocDto firstRowLastLocation;
+        LocDto lastLocation;
+        Integer trayCountCols;
+        Integer trayCountRows;
+        Double componentRotation;
+        Integer feedCount;
+        Boolean recalculate;
+    }
+
+    /** JSON body for POST /api/feeder/count. */
+    private static class CountRequest {
+        String id;
+        String op;
     }
 
     /** JSON body for POST /api/feeder/tray. */

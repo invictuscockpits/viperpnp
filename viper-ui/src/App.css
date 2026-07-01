@@ -670,6 +670,15 @@ body {
   color: #e06a6a;
 }
 
+.left-cell {
+  font-size: 0.8rem;
+}
+
+.left-empty {
+  color: #e06a6a;
+  font-weight: 600;
+}
+
 .modal-sm {
   width: 360px;
 }

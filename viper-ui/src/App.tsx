@@ -71,6 +71,8 @@ interface FeederInfo {
   enabled: boolean;
   canEnable?: boolean;
   needs?: string[];
+  capacity?: number;
+  remaining?: number;
 }
 
 interface FeederLoc {
@@ -106,12 +108,26 @@ interface TrayCfg {
   feedCount: number;
 }
 
+interface RotatedTrayCfg {
+  firstLocation: FeederLoc | null;
+  firstRowLastLocation: FeederLoc | null;
+  lastLocation: FeederLoc | null;
+  trayCountCols: number;
+  trayCountRows: number;
+  componentRotation: number;
+  feedCount: number;
+  colPitch: number;
+  rowPitch: number;
+  trayRotation: number;
+}
+
 interface FeederConfig extends FeederInfo {
   editableLocation: boolean;
   location?: FeederLoc;
   photon?: PhotonCfg;
   strip?: StripCfg;
   tray?: TrayCfg;
+  rotatedTray?: RotatedTrayCfg;
   feedRetryCount?: number;
   pickRetryCount?: number;
 }
@@ -126,7 +142,14 @@ const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
 const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
 
 type TeachTool = "camera" | "nozzle";
-type TeachTarget = "location" | "slot" | "offset" | "refHole" | "lastHole";
+type TeachTarget =
+  | "location"
+  | "slot"
+  | "offset"
+  | "refHole"
+  | "lastHole"
+  | "firstRowLast"
+  | "lastComponent";
 
 type Tab = "machine" | "board" | "feeders";
 
@@ -561,6 +584,12 @@ function App() {
     setEditFeeder((ef) =>
       ef?.tray ? { ...ef, tray: { ...ef.tray, ...patch } } : ef,
     );
+  const setRotTrayField = (patch: Partial<RotatedTrayCfg>) =>
+    setEditFeeder((ef) =>
+      ef?.rotatedTray
+        ? { ...ef, rotatedTray: { ...ef.rotatedTray, ...patch } }
+        : ef,
+    );
 
   const postFeeder = async (url: string, body: unknown) => {
     try {
@@ -618,6 +647,37 @@ function App() {
       offsetY: t.offsetY,
       feedCount: t.feedCount,
     });
+  };
+
+  const postRotTray = (recalculate: boolean) => {
+    if (!editFeeder?.rotatedTray) return;
+    const t = editFeeder.rotatedTray;
+    postFeeder("/api/feeder/rotatedtray", {
+      id: editFeeder.id,
+      firstLocation: t.firstLocation ?? undefined,
+      firstRowLastLocation: t.firstRowLastLocation ?? undefined,
+      lastLocation: t.lastLocation ?? undefined,
+      trayCountCols: t.trayCountCols,
+      trayCountRows: t.trayCountRows,
+      componentRotation: t.componentRotation,
+      feedCount: t.feedCount,
+      recalculate,
+    });
+  };
+
+  const feederCountOp = (id: string, op: "reset" | "advance") => {
+    fetch("/api/feeder/count", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, op }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.feeders) setFeeders(d.feeders);
+      })
+      .catch(() => {
+        /* ignore */
+      });
   };
 
   const saveRetry = () => {
@@ -1207,6 +1267,7 @@ function App() {
                   >
                     <option value="photon">Photon</option>
                     <option value="tray">Tray</option>
+                    <option value="rotatedtray">Rotated Tray</option>
                     <option value="strip">Strip</option>
                   </select>
                   <input
@@ -1243,6 +1304,7 @@ function App() {
                         <th>Name</th>
                         <th>Type</th>
                         <th>Part</th>
+                        <th>Left</th>
                         <th></th>
                       </tr>
                     </thead>
@@ -1315,7 +1377,36 @@ function App() {
                               ))}
                             </select>
                           </td>
+                          <td className="mono left-cell">
+                            {f.remaining !== undefined ? (
+                              <span
+                                className={f.remaining === 0 ? "left-empty" : ""}
+                              >
+                                {f.remaining}/{f.capacity}
+                              </span>
+                            ) : (
+                              <span className="muted">—</span>
+                            )}
+                          </td>
                           <td className="row-actions">
+                            {f.remaining !== undefined && (
+                              <>
+                                <button
+                                  className="btn btn-sm"
+                                  onClick={() => feederCountOp(f.id, "advance")}
+                                  title="Advance to the next part"
+                                >
+                                  +1
+                                </button>
+                                <button
+                                  className="btn btn-sm"
+                                  onClick={() => feederCountOp(f.id, "reset")}
+                                  title="Reset to the first part"
+                                >
+                                  Reset
+                                </button>
+                              </>
+                            )}
                             {f.type === "PhotonFeeder" && (
                               <>
                                 <button
@@ -1605,6 +1696,108 @@ function App() {
                     </span>
                   </div>
                 </>
+              ) : editFeeder.rotatedTray ? (
+                <>
+                  <TeachLoc
+                    label="First part — row 1, column 1"
+                    value={editFeeder.rotatedTray.firstLocation}
+                    onChange={(loc) => setRotTrayField({ firstLocation: loc })}
+                    onGo={(t) => moveToFeederLoc(t, "location")}
+                    onCapture={(t) => captureFeederLoc(t, "location")}
+                  />
+                  <TeachLoc
+                    label="Last part in row 1 (end of first row)"
+                    value={editFeeder.rotatedTray.firstRowLastLocation}
+                    onChange={(loc) =>
+                      setRotTrayField({ firstRowLastLocation: loc })
+                    }
+                    onGo={(t) => moveToFeederLoc(t, "firstRowLast")}
+                    onCapture={(t) => captureFeederLoc(t, "firstRowLast")}
+                  />
+                  <TeachLoc
+                    label="Last part (opposite corner)"
+                    value={editFeeder.rotatedTray.lastLocation}
+                    onChange={(loc) => setRotTrayField({ lastLocation: loc })}
+                    onGo={(t) => moveToFeederLoc(t, "lastComponent")}
+                    onCapture={(t) => captureFeederLoc(t, "lastComponent")}
+                  />
+                  <div className="field-grid">
+                    <label className="loc-field">
+                      <span>Columns</span>
+                      <input
+                        type="number"
+                        step="1"
+                        min="1"
+                        value={editFeeder.rotatedTray.trayCountCols}
+                        onChange={(e) =>
+                          setRotTrayField({
+                            trayCountCols:
+                              parseInt(e.currentTarget.value, 10) || 1,
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Rows</span>
+                      <input
+                        type="number"
+                        step="1"
+                        min="1"
+                        value={editFeeder.rotatedTray.trayCountRows}
+                        onChange={(e) =>
+                          setRotTrayField({
+                            trayCountRows:
+                              parseInt(e.currentTarget.value, 10) || 1,
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Part rotation°</span>
+                      <input
+                        type="number"
+                        step="1"
+                        value={editFeeder.rotatedTray.componentRotation}
+                        onChange={(e) =>
+                          setRotTrayField({
+                            componentRotation:
+                              parseFloat(e.currentTarget.value) || 0,
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Feed count</span>
+                      <input
+                        type="number"
+                        step="1"
+                        value={editFeeder.rotatedTray.feedCount}
+                        onChange={(e) =>
+                          setRotTrayField({
+                            feedCount: parseInt(e.currentTarget.value, 10) || 0,
+                          })
+                        }
+                      />
+                    </label>
+                  </div>
+                  <div className="teach-block">
+                    <div className="teach-head">
+                      Computed grid — col pitch{" "}
+                      {editFeeder.rotatedTray.colPitch} mm, row pitch{" "}
+                      {editFeeder.rotatedTray.rowPitch} mm, tray{" "}
+                      {editFeeder.rotatedTray.trayRotation}°
+                    </div>
+                    <div className="teach-actions">
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => postRotTray(true)}
+                        title="Recompute pitch and tray angle from the three taught corners"
+                      >
+                        Recalculate grid
+                      </button>
+                    </div>
+                  </div>
+                </>
               ) : editFeeder.strip ? (
                 <>
                   <TeachLoc
@@ -1709,6 +1902,14 @@ function App() {
               )}
               {editFeeder.tray && (
                 <button className="btn btn-primary" onClick={saveTray}>
+                  Save
+                </button>
+              )}
+              {editFeeder.rotatedTray && (
+                <button
+                  className="btn btn-primary"
+                  onClick={() => postRotTray(false)}
+                >
                   Save
                 </button>
               )}
