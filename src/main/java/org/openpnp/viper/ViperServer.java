@@ -14,6 +14,7 @@ import org.openpnp.machine.photon.PhotonFeeder;
 import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
 import org.openpnp.machine.reference.feeder.ReferenceStripFeeder;
+import org.openpnp.machine.reference.feeder.ReferenceTrayFeeder;
 import org.openpnp.model.Abstract2DLocatable.Side;
 import org.openpnp.model.Board;
 import org.openpnp.model.BoardLocation;
@@ -214,7 +215,10 @@ public class ViperServer {
         app.get("/api/feeder/{id}", ViperServer::getFeederConfig);
         app.post("/api/feeder/location", ViperServer::setFeederLocation);
         app.post("/api/feeder/photon", ViperServer::setPhoton);
+        app.post("/api/feeder/photon/find", ctx -> photonAction(ctx, false));
+        app.post("/api/feeder/photon/feed", ctx -> photonAction(ctx, true));
         app.post("/api/feeder/strip", ViperServer::setStrip);
+        app.post("/api/feeder/tray", ViperServer::setTray);
         app.post("/api/feeder/move", ViperServer::moveToFeeder);
         app.post("/api/feeder/capture", ViperServer::captureFeeder);
 
@@ -493,9 +497,19 @@ public class ViperServer {
         ctx.contentType("application/json");
         try {
             FeederAdd req = GSON.fromJson(ctx.body(), FeederAdd.class);
-            Feeder f = req != null && "strip".equalsIgnoreCase(req.type)
-                    ? new ReferenceStripFeeder()
-                    : new PhotonFeeder();
+            String type = req != null && req.type != null ? req.type.toLowerCase() : "photon";
+            Feeder f;
+            switch (type) {
+                case "tray":
+                    f = new ReferenceTrayFeeder();
+                    break;
+                case "strip":
+                    f = new ReferenceStripFeeder();
+                    break;
+                default:
+                    f = new PhotonFeeder();
+                    break;
+            }
             if (req != null && req.name != null && !req.name.isEmpty()) {
                 f.setName(req.name);
             }
@@ -591,8 +605,20 @@ public class ViperServer {
             ph.put("hardwareId", pf.getHardwareId());
             ph.put("offset", locMap(pf.getOffset()));
             ph.put("slotLocation", pf.getSlot() != null ? locMap(pf.getSlot().getLocation()) : null);
-            ph.put("pickLocation", locMap(tryPickLocation(pf)));
             m.put("photon", ph);
+            m.put("editableLocation", false);
+        }
+        else if (f instanceof ReferenceTrayFeeder) {
+            ReferenceTrayFeeder tf = (ReferenceTrayFeeder) f;
+            Location off = tf.getOffsets().convertToUnits(LengthUnit.Millimeters);
+            Map<String, Object> tr = new LinkedHashMap<>();
+            tr.put("firstLocation", locMap(tf.getLocation()));
+            tr.put("trayCountX", tf.getTrayCountX());
+            tr.put("trayCountY", tf.getTrayCountY());
+            tr.put("offsetX", round(off.getX()));
+            tr.put("offsetY", round(off.getY()));
+            tr.put("feedCount", tf.getFeedCount());
+            m.put("tray", tr);
             m.put("editableLocation", false);
         }
         else if (f instanceof ReferenceStripFeeder) {
@@ -604,7 +630,6 @@ public class ViperServer {
             st.put("tapeWidth", round(sf.getTapeWidth().convertToUnits(LengthUnit.Millimeters).getValue()));
             st.put("tapeType", sf.getTapeType().name());
             st.put("feedCount", sf.getFeedCount());
-            st.put("pickLocation", locMap(tryPickLocation(sf)));
             m.put("strip", st);
             m.put("editableLocation", false);
         }
@@ -823,6 +848,77 @@ public class ViperServer {
     }
 
     /**
+     * POST /api/feeder/tray — matrix-tray geometry. Body: {id, firstLocation?,
+     * trayCountX?, trayCountY?, offsetX?, offsetY?, feedCount?}. The first
+     * location is the part at index (0,0); offsets are the X/Y pitch between
+     * adjacent parts. Pick location is derived from these by the core.
+     */
+    private static void setTray(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            TrayUpdate req = GSON.fromJson(ctx.body(), TrayUpdate.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (!(f instanceof ReferenceTrayFeeder)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"tray feeder not found\"}");
+                return;
+            }
+            ReferenceTrayFeeder tf = (ReferenceTrayFeeder) f;
+            if (req.firstLocation != null) {
+                tf.setLocation(loc(req.firstLocation));
+            }
+            if (req.trayCountX != null) {
+                tf.setTrayCountX(req.trayCountX);
+            }
+            if (req.trayCountY != null) {
+                tf.setTrayCountY(req.trayCountY);
+            }
+            if (req.offsetX != null || req.offsetY != null) {
+                Location cur = tf.getOffsets().convertToUnits(LengthUnit.Millimeters);
+                double ox = req.offsetX != null ? req.offsetX : cur.getX();
+                double oy = req.offsetY != null ? req.offsetY : cur.getY();
+                tf.setOffsets(new Location(LengthUnit.Millimeters, ox, oy, 0, 0));
+            }
+            if (req.feedCount != null) {
+                tf.setFeedCount(req.feedCount);
+            }
+            ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/feeder/photon/find — locates this Photon feeder's slot address
+     * on the RS-485 bus. POST /api/feeder/photon/feed — advances the feeder by
+     * one part. Both need the machine enabled and the feeder hardware present;
+     * they run on the machine task thread and report errors over the WebSocket.
+     */
+    private static void photonAction(io.javalin.http.Context ctx, boolean feed) {
+        ctx.contentType("application/json");
+        FeederAction req = GSON.fromJson(ctx.body(), FeederAction.class);
+        Feeder f = req != null ? machine.getFeeder(req.id) : null;
+        if (!(f instanceof PhotonFeeder)) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"photon feeder not found\"}");
+            return;
+        }
+        final PhotonFeeder pf = (PhotonFeeder) f;
+        machine.submit(() -> {
+            if (feed) {
+                pf.feed(machine.getDefaultHead().getDefaultNozzle());
+            }
+            else {
+                pf.findSlotAddress();
+            }
+            return null;
+        }, broadcastCallback());
+        ctx.result("{\"submitted\":true}");
+    }
+
+    /**
      * POST /api/feeder/move — jogs a tool to a named feeder location at safe Z.
      * Body: {id, tool: "camera"|"nozzle", target?}. target defaults to "pick"
      * (the computed pick location); "slot", "refHole", "lastHole", "location"
@@ -933,6 +1029,17 @@ public class ViperServer {
         Double partPitch;
         Double tapeWidth;
         String tapeType;
+        Integer feedCount;
+    }
+
+    /** JSON body for POST /api/feeder/tray. */
+    private static class TrayUpdate {
+        String id;
+        LocDto firstLocation;
+        Integer trayCountX;
+        Integer trayCountY;
+        Double offsetX;
+        Double offsetY;
         Integer feedCount;
     }
 

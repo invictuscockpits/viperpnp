@@ -658,6 +658,12 @@ body {
   font-size: 0.8rem;
 }
 
+.row-actions {
+  display: flex;
+  gap: 0.35rem;
+  justify-content: flex-end;
+}
+
 .btn-danger {
   border-color: #d2413a;
   color: #e06a6a;
