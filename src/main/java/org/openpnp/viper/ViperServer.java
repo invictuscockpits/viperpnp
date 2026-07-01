@@ -6,13 +6,20 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 
+import org.openpnp.gui.importer.KicadPosImporter;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
+import org.openpnp.model.Abstract2DLocatable.Side;
+import org.openpnp.model.Board;
+import org.openpnp.model.BoardLocation;
 import org.openpnp.model.Configuration;
+import org.openpnp.model.Job;
 import org.openpnp.model.LengthUnit;
 import org.openpnp.model.Location;
 import org.openpnp.model.Motion.MotionOption;
+import org.openpnp.model.Placement;
 import org.openpnp.spi.Camera;
 import org.openpnp.spi.Driver;
 import org.openpnp.spi.Head;
@@ -58,6 +65,7 @@ public class ViperServer {
     private static final Set<WsContext> SESSIONS = ConcurrentHashMap.newKeySet();
 
     private static Machine machine;
+    private static Job currentJob;
 
     public static void main(String[] args) throws Exception {
         File configDir;
@@ -128,6 +136,12 @@ public class ViperServer {
             }, broadcastCallback());
             ctx.contentType("application/json");
             ctx.result("{\"submitted\":true}");
+        });
+
+        app.post("/api/import/kicad", ViperServer::importKicad);
+        app.get("/api/job", ctx -> {
+            ctx.contentType("application/json");
+            ctx.result(GSON.toJson(describeJob(currentJob)));
         });
 
         app.ws("/ws/events", ws -> {
@@ -257,6 +271,100 @@ public class ViperServer {
         double dz;
         double dc;
         double speed;
+    }
+
+    /**
+     * Imports a KiCad .pos file (and optional bottom file) into a Board, wraps
+     * it in a single-board Job, and holds that as the current job. Reuses
+     * OpenPnP's own {@link KicadPosImporter#parseFile} (a headless static
+     * method — the Swing dialog only collects the file and options).
+     */
+    private static void importKicad(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            ImportRequest req = GSON.fromJson(ctx.body(), ImportRequest.class);
+            if (req == null || req.topFile == null || req.topFile.isEmpty()) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"topFile is required\"}");
+                return;
+            }
+            Board board = new Board();
+            board.setName(new File(req.topFile).getName());
+            for (Placement p : KicadPosImporter.parseFile(new File(req.topFile), Side.Top, true,
+                    req.createMissingParts, req.useValueOnly)) {
+                board.addPlacement(p);
+            }
+            if (req.bottomFile != null && !req.bottomFile.isEmpty()) {
+                for (Placement p : KicadPosImporter.parseFile(new File(req.bottomFile), Side.Bottom, true,
+                        req.createMissingParts, req.useValueOnly)) {
+                    board.addPlacement(p);
+                }
+            }
+            Job job = new Job();
+            BoardLocation bl = new BoardLocation(board);
+            bl.setGlobalSide(Side.Top);
+            job.addBoardOrPanelLocation(bl);
+            currentJob = job;
+            ctx.result(GSON.toJson(describeJob(job)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON summary of the current job: boards, placements and distinct parts. */
+    private static Map<String, Object> describeJob(Job job) {
+        Map<String, Object> root = new LinkedHashMap<>();
+        if (job == null) {
+            root.put("loaded", false);
+            return root;
+        }
+        root.put("loaded", true);
+
+        List<Map<String, Object>> boards = new ArrayList<>();
+        int totalPlacements = 0;
+        Set<String> parts = new TreeSet<>();
+        for (BoardLocation bl : job.getBoardLocations()) {
+            Board board = bl.getBoard();
+            Map<String, Object> bm = new LinkedHashMap<>();
+            bm.put("name", board.getName());
+            bm.put("side", bl.getGlobalSide().toString());
+
+            List<Map<String, Object>> placements = new ArrayList<>();
+            for (Placement p : board.getPlacements()) {
+                Map<String, Object> pm = new LinkedHashMap<>();
+                pm.put("id", p.getId());
+                pm.put("part", p.getPart() != null ? p.getPart().getId() : null);
+                pm.put("side", p.getSide() != null ? p.getSide().toString() : null);
+                Location l = p.getLocation().convertToUnits(LengthUnit.Millimeters);
+                pm.put("x", round(l.getX()));
+                pm.put("y", round(l.getY()));
+                pm.put("rot", round(l.getRotation()));
+                placements.add(pm);
+                totalPlacements++;
+                if (p.getPart() != null) {
+                    parts.add(p.getPart().getId());
+                }
+            }
+            bm.put("placementCount", board.getPlacements().size());
+            bm.put("placements", placements);
+            boards.add(bm);
+        }
+        root.put("boardCount", job.getBoardLocations().size());
+        root.put("placementCount", totalPlacements);
+        root.put("partCount", parts.size());
+        root.put("parts", new ArrayList<>(parts));
+        root.put("boards", boards);
+        return root;
+    }
+
+    /** JSON body for POST /api/import/kicad. */
+    private static class ImportRequest {
+        String topFile;
+        String bottomFile;
+        boolean createMissingParts = true;
+        boolean useValueOnly = false;
     }
 
     /**
