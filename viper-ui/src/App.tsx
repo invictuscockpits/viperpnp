@@ -97,6 +97,7 @@ interface StripCfg {
   tapeWidth: number;
   tapeType: string;
   feedCount: number;
+  maxFeedCount: number;
 }
 
 interface TrayCfg {
@@ -163,6 +164,51 @@ const TABS: { id: Tab; label: string }[] = [
 
 const SOON = ["Vision", "Log"];
 
+/** Number input with custom gray up/down triangle steppers (native spinners hidden). */
+function NumberInput({
+  value,
+  onChange,
+  step = 1,
+  min,
+  className,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  step?: number;
+  min?: number;
+  className?: string;
+}) {
+  const decimals = (String(step).split(".")[1] || "").length;
+  const bump = (dir: 1 | -1) => {
+    let v = parseFloat((value + dir * step).toFixed(decimals + 3));
+    if (min !== undefined && v < min) v = min;
+    onChange(v);
+  };
+  return (
+    <span className={`num-input ${className ?? ""}`}>
+      <input
+        type="number"
+        value={value}
+        step={step}
+        min={min}
+        onChange={(e) => onChange(parseFloat(e.currentTarget.value) || 0)}
+      />
+      <span className="num-spin">
+        <button type="button" tabIndex={-1} aria-label="Increase" onClick={() => bump(1)}>
+          <svg viewBox="0 0 12 8">
+            <path d="M6 2 L10 6.4 L2 6.4 Z" />
+          </svg>
+        </button>
+        <button type="button" tabIndex={-1} aria-label="Decrease" onClick={() => bump(-1)}>
+          <svg viewBox="0 0 12 8">
+            <path d="M6 6 L2 1.6 L10 1.6 Z" />
+          </svg>
+        </button>
+      </span>
+    </span>
+  );
+}
+
 /** A 4-axis location editor with optional Go-to / Capture teach buttons. */
 function TeachLoc({
   label,
@@ -185,18 +231,15 @@ function TeachLoc({
         {(["x", "y", "z", "rotation"] as const).map((k) => (
           <label key={k} className="loc-field">
             <span>{k === "rotation" ? "Rot°" : k.toUpperCase()}</span>
-            <input
-              type="number"
-              step="0.01"
-              disabled={!onChange}
-              value={v[k]}
-              onChange={(e) =>
-                onChange?.({
-                  ...v,
-                  [k]: parseFloat(e.currentTarget.value) || 0,
-                })
-              }
-            />
+            {onChange ? (
+              <NumberInput
+                step={0.01}
+                value={v[k]}
+                onChange={(nv) => onChange({ ...v, [k]: nv })}
+              />
+            ) : (
+              <input type="number" step="0.01" disabled value={v[k]} />
+            )}
           </label>
         ))}
       </div>
@@ -632,6 +675,7 @@ function App() {
       tapeWidth: s.tapeWidth,
       tapeType: s.tapeType,
       feedCount: s.feedCount,
+      maxFeedCount: s.maxFeedCount,
     });
   };
 
@@ -1525,47 +1569,27 @@ function App() {
                 <div className="field-grid">
                   <label className="loc-field">
                     <span>Feed retries</span>
-                    <input
-                      type="number"
-                      step="1"
-                      min="0"
+                    <NumberInput
+                      min={0}
                       value={editFeeder.feedRetryCount ?? 3}
-                      onChange={(e) =>
-                        setEF({
-                          feedRetryCount: parseInt(e.currentTarget.value, 10) || 0,
-                        })
-                      }
+                      onChange={(v) => setEF({ feedRetryCount: v })}
                     />
                   </label>
                   <label className="loc-field">
                     <span>Pick retries</span>
-                    <input
-                      type="number"
-                      step="1"
-                      min="0"
+                    <NumberInput
+                      min={0}
                       value={editFeeder.pickRetryCount ?? 3}
-                      onChange={(e) =>
-                        setEF({
-                          pickRetryCount: parseInt(e.currentTarget.value, 10) || 0,
-                        })
-                      }
+                      onChange={(v) => setEF({ pickRetryCount: v })}
                     />
                   </label>
                   {editFeeder.photon && (
                     <label className="loc-field">
                       <span>Bus comm retries</span>
-                      <input
-                        type="number"
-                        step="1"
-                        min="0"
+                      <NumberInput
+                        min={0}
                         value={editFeeder.photon.commMaxRetry ?? 3}
-                        onChange={(e) =>
-                          setPhotonField({
-                            commMaxRetry:
-                              parseInt(e.currentTarget.value, 10) || 0,
-                          })
-                        }
-                        title="Machine-wide RS-485 retry count for all Photon feeders"
+                        onChange={(v) => setPhotonField({ commMaxRetry: v })}
                       />
                     </label>
                   )}
@@ -1624,71 +1648,44 @@ function App() {
                   <div className="field-grid">
                     <label className="loc-field">
                       <span>Count X</span>
-                      <input
-                        type="number"
-                        step="1"
-                        min="1"
+                      <NumberInput
+                        min={1}
                         value={editFeeder.tray.trayCountX}
-                        onChange={(e) =>
-                          setTrayField({
-                            trayCountX: parseInt(e.currentTarget.value, 10) || 1,
-                          })
-                        }
+                        onChange={(v) => setTrayField({ trayCountX: v })}
                       />
                     </label>
                     <label className="loc-field">
                       <span>Count Y</span>
-                      <input
-                        type="number"
-                        step="1"
-                        min="1"
+                      <NumberInput
+                        min={1}
                         value={editFeeder.tray.trayCountY}
-                        onChange={(e) =>
-                          setTrayField({
-                            trayCountY: parseInt(e.currentTarget.value, 10) || 1,
-                          })
-                        }
+                        onChange={(v) => setTrayField({ trayCountY: v })}
                       />
                     </label>
                     <label className="loc-field">
                       <span>X pitch (mm)</span>
-                      <input
-                        type="number"
-                        step="0.01"
+                      <NumberInput
+                        step={0.01}
                         value={editFeeder.tray.offsetX}
-                        onChange={(e) =>
-                          setTrayField({
-                            offsetX: parseFloat(e.currentTarget.value) || 0,
-                          })
-                        }
+                        onChange={(v) => setTrayField({ offsetX: v })}
                       />
                     </label>
                     <label className="loc-field">
                       <span>Y pitch (mm)</span>
-                      <input
-                        type="number"
-                        step="0.01"
+                      <NumberInput
+                        step={0.01}
                         value={editFeeder.tray.offsetY}
-                        onChange={(e) =>
-                          setTrayField({
-                            offsetY: parseFloat(e.currentTarget.value) || 0,
-                          })
-                        }
+                        onChange={(v) => setTrayField({ offsetY: v })}
                       />
                     </label>
                   </div>
                   <div className="field-row">
                     <label>Feed count</label>
-                    <input
+                    <NumberInput
                       className="num-sm"
-                      type="number"
-                      step="1"
+                      min={0}
                       value={editFeeder.tray.feedCount}
-                      onChange={(e) =>
-                        setTrayField({
-                          feedCount: parseInt(e.currentTarget.value, 10) || 0,
-                        })
-                      }
+                      onChange={(v) => setTrayField({ feedCount: v })}
                     />
                     <span className="muted">
                       of {editFeeder.tray.trayCountX * editFeeder.tray.trayCountY}{" "}
@@ -1724,59 +1721,35 @@ function App() {
                   <div className="field-grid">
                     <label className="loc-field">
                       <span>Columns</span>
-                      <input
-                        type="number"
-                        step="1"
-                        min="1"
+                      <NumberInput
+                        min={1}
                         value={editFeeder.rotatedTray.trayCountCols}
-                        onChange={(e) =>
-                          setRotTrayField({
-                            trayCountCols:
-                              parseInt(e.currentTarget.value, 10) || 1,
-                          })
-                        }
+                        onChange={(v) => setRotTrayField({ trayCountCols: v })}
                       />
                     </label>
                     <label className="loc-field">
                       <span>Rows</span>
-                      <input
-                        type="number"
-                        step="1"
-                        min="1"
+                      <NumberInput
+                        min={1}
                         value={editFeeder.rotatedTray.trayCountRows}
-                        onChange={(e) =>
-                          setRotTrayField({
-                            trayCountRows:
-                              parseInt(e.currentTarget.value, 10) || 1,
-                          })
-                        }
+                        onChange={(v) => setRotTrayField({ trayCountRows: v })}
                       />
                     </label>
                     <label className="loc-field">
                       <span>Part rotation°</span>
-                      <input
-                        type="number"
-                        step="1"
+                      <NumberInput
                         value={editFeeder.rotatedTray.componentRotation}
-                        onChange={(e) =>
-                          setRotTrayField({
-                            componentRotation:
-                              parseFloat(e.currentTarget.value) || 0,
-                          })
+                        onChange={(v) =>
+                          setRotTrayField({ componentRotation: v })
                         }
                       />
                     </label>
                     <label className="loc-field">
                       <span>Feed count</span>
-                      <input
-                        type="number"
-                        step="1"
+                      <NumberInput
+                        min={0}
                         value={editFeeder.rotatedTray.feedCount}
-                        onChange={(e) =>
-                          setRotTrayField({
-                            feedCount: parseInt(e.currentTarget.value, 10) || 0,
-                          })
-                        }
+                        onChange={(v) => setRotTrayField({ feedCount: v })}
                       />
                     </label>
                   </div>
@@ -1817,28 +1790,17 @@ function App() {
                   <div className="field-grid">
                     <label className="loc-field">
                       <span>Part pitch (mm)</span>
-                      <input
-                        type="number"
-                        step="0.1"
+                      <NumberInput
+                        step={0.1}
                         value={editFeeder.strip.partPitch}
-                        onChange={(e) =>
-                          setStripField({
-                            partPitch: parseFloat(e.currentTarget.value) || 0,
-                          })
-                        }
+                        onChange={(v) => setStripField({ partPitch: v })}
                       />
                     </label>
                     <label className="loc-field">
                       <span>Tape width (mm)</span>
-                      <input
-                        type="number"
-                        step="1"
+                      <NumberInput
                         value={editFeeder.strip.tapeWidth}
-                        onChange={(e) =>
-                          setStripField({
-                            tapeWidth: parseFloat(e.currentTarget.value) || 0,
-                          })
-                        }
+                        onChange={(v) => setStripField({ tapeWidth: v })}
                       />
                     </label>
                     <label className="loc-field">
@@ -1859,15 +1821,18 @@ function App() {
                     </label>
                     <label className="loc-field">
                       <span>Feed count</span>
-                      <input
-                        type="number"
-                        step="1"
+                      <NumberInput
+                        min={0}
                         value={editFeeder.strip.feedCount}
-                        onChange={(e) =>
-                          setStripField({
-                            feedCount: parseInt(e.currentTarget.value, 10) || 0,
-                          })
-                        }
+                        onChange={(v) => setStripField({ feedCount: v })}
+                      />
+                    </label>
+                    <label className="loc-field">
+                      <span>Total parts (0=∞)</span>
+                      <NumberInput
+                        min={0}
+                        value={editFeeder.strip.maxFeedCount}
+                        onChange={(v) => setStripField({ maxFeedCount: v })}
                       />
                     </label>
                   </div>

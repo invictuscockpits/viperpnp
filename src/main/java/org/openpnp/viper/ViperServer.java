@@ -1128,6 +1128,7 @@ public class ViperServer {
             st.put("tapeWidth", round(sf.getTapeWidth().convertToUnits(LengthUnit.Millimeters).getValue()));
             st.put("tapeType", sf.getTapeType().name());
             st.put("feedCount", sf.getFeedCount());
+            st.put("maxFeedCount", sf.getMaxFeedCount());
             m.put("strip", st);
             m.put("editableLocation", false);
         }
@@ -1367,6 +1368,9 @@ public class ViperServer {
             }
             if (req.feedCount != null) {
                 sf.setFeedCount(req.feedCount);
+            }
+            if (req.maxFeedCount != null) {
+                sf.setMaxFeedCount(Math.max(0, req.maxFeedCount));
             }
             ctx.result(GSON.toJson(feederConfig(f)));
         }
@@ -1722,6 +1726,7 @@ public class ViperServer {
         Double tapeWidth;
         String tapeType;
         Integer feedCount;
+        Integer maxFeedCount;
     }
 
     /** JSON body for POST /api/feeder/retry. */
