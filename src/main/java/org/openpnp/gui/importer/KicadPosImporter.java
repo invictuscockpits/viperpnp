@@ -69,7 +69,7 @@ public class KicadPosImporter implements BoardImporter {
         return board;
     }
 
-    static List<Placement> parseFile(File file, Side side, boolean assignParts,  boolean createMissingParts, 
+    public static List<Placement> parseFile(File file, Side side, boolean assignParts,  boolean createMissingParts,
     		boolean useOnlyValueAsPartId)
             throws Exception {
         BufferedReader reader =
