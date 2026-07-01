@@ -665,6 +665,22 @@ body {
   padding: 0.3rem 0.45rem;
 }
 
+.needs-setup {
+  background: none;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+  border-radius: 4px;
+  padding: 0.12rem 0.4rem;
+  font-size: 0.68rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.needs-setup:hover {
+  color: var(--green);
+  border-color: var(--green);
+}
+
 .row-actions {
   display: flex;
   gap: 0.35rem;

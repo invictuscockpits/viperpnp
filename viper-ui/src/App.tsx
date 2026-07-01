@@ -69,6 +69,8 @@ interface FeederInfo {
   type: string;
   part: string | null;
   enabled: boolean;
+  canEnable?: boolean;
+  needs?: string[];
 }
 
 interface FeederLoc {
@@ -1241,15 +1243,25 @@ function App() {
                             ⠿
                           </td>
                           <td>
-                            <input
-                              type="checkbox"
-                              checked={f.enabled}
-                              onChange={(e) =>
-                                updateFeeder(f.id, {
-                                  enabled: e.currentTarget.checked,
-                                })
-                              }
-                            />
+                            {f.canEnable === false ? (
+                              <button
+                                className="needs-setup"
+                                onClick={() => openEditFeeder(f.id)}
+                                title={`Set up before enabling: ${(f.needs ?? []).join(", ")}`}
+                              >
+                                needs setup
+                              </button>
+                            ) : (
+                              <input
+                                type="checkbox"
+                                checked={f.enabled}
+                                onChange={(e) =>
+                                  updateFeeder(f.id, {
+                                    enabled: e.currentTarget.checked,
+                                  })
+                                }
+                              />
+                            )}
                           </td>
                           <td className="mono">{f.name}</td>
                           <td className="muted">{f.type}</td>

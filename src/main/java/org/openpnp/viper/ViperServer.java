@@ -803,7 +803,38 @@ public class ViperServer {
         }
     }
 
-    /** Feeder list snapshot: name, type, assigned part, enabled. */
+    /**
+     * What a feeder still needs before it can be enabled. A Photon feeder's
+     * isEnabled() is gated on being fully configured (hardware discovered, part,
+     * slot address, offset, slot location), so ticking Active on an
+     * unconfigured Photon has no effect. This lists the missing prerequisites so
+     * the UI can disable the checkbox and explain why. Other feeder types are
+     * always enable-able and return an empty list.
+     */
+    private static List<String> feederNeeds(Feeder f) {
+        List<String> needs = new ArrayList<>();
+        if (f instanceof PhotonFeeder) {
+            PhotonFeeder pf = (PhotonFeeder) f;
+            if (pf.getHardwareId() == null) {
+                needs.add("hardware");
+            }
+            if (pf.getPart() == null) {
+                needs.add("part");
+            }
+            if (pf.getSlotAddress() == null) {
+                needs.add("slot");
+            }
+            else if (pf.getSlot() == null || pf.getSlot().getLocation() == null) {
+                needs.add("slot location");
+            }
+            if (pf.getOffset() == null) {
+                needs.add("offset");
+            }
+        }
+        return needs;
+    }
+
+    /** Feeder list snapshot: name, type, assigned part, enabled, setup needs. */
     private static Map<String, Object> describeFeeders() {
         Map<String, Object> root = new LinkedHashMap<>();
         List<Map<String, Object>> feeders = new ArrayList<>();
@@ -814,6 +845,9 @@ public class ViperServer {
             fm.put("type", f.getClass().getSimpleName());
             fm.put("part", f.getPart() != null ? f.getPart().getId() : null);
             fm.put("enabled", f.isEnabled());
+            List<String> needs = feederNeeds(f);
+            fm.put("canEnable", needs.isEmpty());
+            fm.put("needs", needs);
             feeders.add(fm);
         }
         root.put("feeders", feeders);
