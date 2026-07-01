@@ -128,12 +128,6 @@ interface FeederConfig extends FeederInfo {
   pickRetryCount?: number;
 }
 
-interface SkippedPlacement {
-  id: string;
-  part: string | null;
-  board: string;
-}
-
 interface BoardInfo {
   file: string | null;
   name: string;
@@ -333,15 +327,8 @@ function App() {
     null,
   );
   const [scanning, setScanning] = useState(false);
-  const [jobRunning, setJobRunning] = useState(false);
   const [configDirty, setConfigDirty] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [jobStatus, setJobStatus] = useState("");
-  const [keepGoing, setKeepGoing] = useState(true);
-  const [skipReport, setSkipReport] = useState<{
-    skipped: SkippedPlacement[];
-    aborted: boolean;
-  } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const dragIndex = useRef<number | null>(null);
 
@@ -421,19 +408,6 @@ function App() {
           setScanning(false);
         } else if (data && data.event === "config") {
           setConfigDirty(!!data.dirty);
-        } else if (data && data.event === "jobStarted") {
-          setJobRunning(true);
-          setJobStatus(String(data.text ?? ""));
-          setSkipReport(null);
-        } else if (data && data.event === "jobStatus") {
-          setJobStatus(String(data.text ?? ""));
-        } else if (data && data.event === "jobComplete") {
-          setJobRunning(false);
-          setJobStatus("");
-          setSkipReport({
-            skipped: data.skipped ?? [],
-            aborted: !!data.aborted,
-          });
         } else if (data && data.event === "error") {
           setError(String(data.message));
           setScanning(false);
@@ -867,26 +841,6 @@ function App() {
       feedRetryCount: editFeeder.feedRetryCount,
       pickRetryCount: editFeeder.pickRetryCount,
       commMaxRetry: editFeeder.photon?.commMaxRetry,
-    });
-  };
-
-  const runJob = () => {
-    setSkipReport(null);
-    fetch("/api/job/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ errorHandling: keepGoing ? "Defer" : "Alert" }),
-    })
-      .then((r) => r.json())
-      .then((d) => {
-        if (d.error) setError(String(d.message ?? d.error));
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  };
-
-  const abortJob = () => {
-    fetch("/api/job/abort", { method: "POST" }).catch(() => {
-      /* ignore */
     });
   };
 
@@ -1395,36 +1349,6 @@ function App() {
                   Create missing parts
                 </label>
               </div>
-              {boards.length > 0 && (
-                <div className="run-bar">
-                  {jobRunning ? (
-                    <button className="btn btn-danger" onClick={abortJob}>
-                      Abort
-                    </button>
-                  ) : (
-                    <button className="btn btn-primary" onClick={runJob}>
-                      Run job
-                    </button>
-                  )}
-                  <label
-                    className="run-toggle"
-                    title="On: a feeder fault retries, then the placement is skipped and the job keeps going (Defer). Off: stop on the first error (Alert)."
-                  >
-                    <input
-                      type="checkbox"
-                      checked={keepGoing}
-                      disabled={jobRunning}
-                      onChange={(e) => setKeepGoing(e.currentTarget.checked)}
-                    />
-                    Keep going on feeder faults
-                  </label>
-                  {jobRunning && (
-                    <span className="muted run-status">
-                      {jobStatus || "Running…"}
-                    </span>
-                  )}
-                </div>
-              )}
               {importErr && <div className="banner banner-warn">{importErr}</div>}
               {boards.length === 0 ? (
                 <div className="muted">
@@ -2075,69 +1999,6 @@ function App() {
                     Save location
                   </button>
                 )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {skipReport && (
-        <div className="modal-backdrop" onClick={() => setSkipReport(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              <h3>
-                {skipReport.aborted ? "Job aborted" : "Job complete"}
-                {skipReport.skipped.length > 0 &&
-                  ` — ${skipReport.skipped.length} skipped`}
-              </h3>
-              <button
-                className="icon-btn"
-                onClick={() => setSkipReport(null)}
-                title="Close"
-              >
-                ✕
-              </button>
-            </div>
-            <div className="modal-body">
-              {skipReport.skipped.length === 0 ? (
-                <div className="muted">
-                  Every enabled placement was placed. Nothing skipped.
-                </div>
-              ) : (
-                <>
-                  <div className="teach-head">
-                    These placements were skipped (feeder fault, alignment, or
-                    out of parts). Re-run to retry them.
-                  </div>
-                  <div className="ptable-wrap">
-                    <table className="ptable">
-                      <thead>
-                        <tr>
-                          <th>Ref</th>
-                          <th>Part</th>
-                          <th>Board</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {skipReport.skipped.map((s) => (
-                          <tr key={s.id}>
-                            <td className="mono">{s.id}</td>
-                            <td className="muted">{s.part ?? "—"}</td>
-                            <td className="muted">{s.board}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </>
-              )}
-            </div>
-            <div className="modal-foot">
-              <button
-                className="btn btn-primary"
-                onClick={() => setSkipReport(null)}
-              >
-                OK
-              </button>
             </div>
           </div>
         </div>
