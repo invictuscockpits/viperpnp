@@ -306,6 +306,11 @@ function App() {
   const [formatMenuOpen, setFormatMenuOpen] = useState(false);
   const [savePath, setSavePath] = useState("");
   const [createParts, setCreateParts] = useState(true);
+  const [importConflict, setImportConflict] = useState<{
+    name: string;
+    file: string;
+  } | null>(null);
+  const [renameValue, setRenameValue] = useState("");
   const [boards, setBoards] = useState<BoardInfo[]>([]);
   const [activeBoard, setActiveBoard] = useState<string | null>(null);
   const [boardPlacements, setBoardPlacements] = useState<Placement[]>([]);
@@ -500,7 +505,10 @@ function App() {
     }
   };
 
-  const doImport = async () => {
+  const runImport = async (overrides: {
+    boardName?: string;
+    replace?: boolean;
+  }) => {
     setImporting(true);
     setImportErr(null);
     try {
@@ -512,13 +520,20 @@ function App() {
           topFile: importPath,
           savePath: savePath || undefined,
           createMissingParts: createParts,
+          ...overrides,
         }),
       });
       const data = await res.json();
+      if (res.status === 409 && data.conflict) {
+        setImportConflict({ name: data.name, file: data.file });
+        setRenameValue(`${data.name}-copy`);
+        return;
+      }
       if (data && (data.event === "error" || data.error)) {
         setImportErr(String(data.message ?? data.error));
       } else {
         setBoards(data.boards ?? []);
+        setImportConflict(null);
       }
     } catch (e) {
       setImportErr(e instanceof Error ? e.message : String(e));
@@ -526,6 +541,8 @@ function App() {
       setImporting(false);
     }
   };
+
+  const doImport = () => runImport({});
 
   const openBoard = async (file: string | null) => {
     if (!file) return;
@@ -2144,6 +2161,66 @@ function App() {
                   <BoardMap placements={placements} />
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {importConflict && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setImportConflict(null)}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>Board already exists</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setImportConflict(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p className="confirm-text">
+                A board named{" "}
+                <span className="mono">{importConflict.name}</span> is already in
+                the library. Rename this import, replace the existing board, or
+                cancel.
+              </p>
+              <div className="field-row">
+                <label>New name</label>
+                <input
+                  className="import-input"
+                  value={renameValue}
+                  onChange={(e) => setRenameValue(e.currentTarget.value)}
+                />
+              </div>
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setImportConflict(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-danger"
+                onClick={() => {
+                  setImportConflict(null);
+                  runImport({ replace: true });
+                }}
+              >
+                Replace
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={!renameValue.trim()}
+                onClick={() => {
+                  setImportConflict(null);
+                  runImport({ boardName: renameValue.trim() });
+                }}
+              >
+                Rename &amp; import
+              </button>
             </div>
           </div>
         </div>

@@ -552,7 +552,25 @@ public class ViperServer {
                 return;
             }
             String fmt = req.format != null ? req.format.toLowerCase() : "kicad";
-            String name = boardName(req.topFile);
+            String name = req.boardName != null && !req.boardName.trim().isEmpty()
+                    ? req.boardName.trim() : boardName(req.topFile);
+            File file = resolveBoardFile(req.savePath, name);
+            try {
+                file = file.getCanonicalFile();
+            }
+            catch (Exception ignore) {
+                // fall back to the absolute file
+            }
+            // A board already lives here: let the client rename/replace/cancel.
+            if (!req.replace && findBoard(file.getAbsolutePath()) != null) {
+                Map<String, Object> conflict = new LinkedHashMap<>();
+                conflict.put("conflict", true);
+                conflict.put("name", name);
+                conflict.put("file", file.getAbsolutePath());
+                ctx.status(409);
+                ctx.result(GSON.toJson(conflict));
+                return;
+            }
             Board board = new Board();
             board.setName(name);
             for (Placement p : parsePlacements(fmt, new File(req.topFile), Side.Top, req)) {
@@ -570,7 +588,6 @@ public class ViperServer {
                 }
             }
             // Persist as a .board.xml file and add it to the library.
-            File file = resolveBoardFile(req.savePath, name);
             file.getParentFile().mkdirs();
             board.setFile(file);
             Configuration.get().saveBoard(board);
@@ -691,35 +708,30 @@ public class ViperServer {
      * placement teach/origin/run all work while boards live as reusable files.
      */
     private static void syncJob() {
-        if (currentJob == null) {
-            currentJob = new Job();
-        }
-        List<Board> lib = Configuration.get().getBoards();
-        // Drop locations whose board left the library.
-        List<BoardLocation> stale = new ArrayList<>();
-        for (BoardLocation bl : currentJob.getBoardLocations()) {
-            if (!lib.contains(bl.getBoard())) {
-                stale.add(bl);
-            }
-        }
-        for (BoardLocation bl : stale) {
-            currentJob.removeBoardOrPanelLocation(bl);
-        }
-        // Add a location for any new library board.
-        for (Board b : lib) {
-            boolean has = false;
+        // Rebuild the job from the library (only adds locations — never removes,
+        // because BoardLocation.dispose() pokes the Swing GUI, which is null
+        // headless). Origins/side of surviving boards are carried over by object.
+        Map<Board, BoardLocation> prior = new java.util.IdentityHashMap<>();
+        if (currentJob != null) {
             for (BoardLocation bl : currentJob.getBoardLocations()) {
-                if (bl.getBoard() == b) {
-                    has = true;
-                    break;
-                }
-            }
-            if (!has) {
-                BoardLocation bl = new BoardLocation(b);
-                bl.setGlobalSide(Side.Top);
-                currentJob.addBoardOrPanelLocation(bl);
+                prior.put(bl.getBoard(), bl);
             }
         }
+        Job job = new Job();
+        for (Board b : Configuration.get().getBoards()) {
+            BoardLocation bl = new BoardLocation(b);
+            BoardLocation was = prior.get(b);
+            if (was != null) {
+                bl.setLocation(was.getLocation());
+                bl.setGlobalSide(was.getGlobalSide());
+                bl.setPlacementTransform(was.getPlacementTransform());
+            }
+            else {
+                bl.setGlobalSide(Side.Top);
+            }
+            job.addBoardOrPanelLocation(bl);
+        }
+        currentJob = job;
     }
 
     /** The library board a placement request targets: by file, else the first. */
@@ -2182,6 +2194,8 @@ public class ViperServer {
         String topFile;
         String bottomFile;
         String savePath;
+        String boardName;
+        boolean replace = false;
         boolean createMissingParts = true;
         boolean useValueOnly = false;
     }
