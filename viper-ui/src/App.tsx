@@ -75,6 +75,7 @@ interface PhotonCfg {
   hardwareId: string | null;
   offset: FeederLoc | null;
   slotLocation: FeederLoc | null;
+  commMaxRetry: number;
 }
 
 interface StripCfg {
@@ -101,6 +102,8 @@ interface FeederConfig extends FeederInfo {
   photon?: PhotonCfg;
   strip?: StripCfg;
   tray?: TrayCfg;
+  feedRetryCount?: number;
+  pickRetryCount?: number;
 }
 
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
@@ -539,6 +542,16 @@ function App() {
       offsetX: t.offsetX,
       offsetY: t.offsetY,
       feedCount: t.feedCount,
+    });
+  };
+
+  const saveRetry = () => {
+    if (!editFeeder) return;
+    postFeeder("/api/feeder/retry", {
+      id: editFeeder.id,
+      feedRetryCount: editFeeder.feedRetryCount,
+      pickRetryCount: editFeeder.pickRetryCount,
+      commMaxRetry: editFeeder.photon?.commMaxRetry,
     });
   };
 
@@ -1170,6 +1183,66 @@ function App() {
                     </option>
                   ))}
                 </select>
+              </div>
+
+              <div className="teach-block">
+                <div className="teach-head">
+                  Reliability — retries before a hard stop. Each feed retry
+                  re-locates and re-initializes the feeder first (a reconnect).
+                </div>
+                <div className="field-grid">
+                  <label className="loc-field">
+                    <span>Feed retries</span>
+                    <input
+                      type="number"
+                      step="1"
+                      min="0"
+                      value={editFeeder.feedRetryCount ?? 3}
+                      onChange={(e) =>
+                        setEF({
+                          feedRetryCount: parseInt(e.currentTarget.value, 10) || 0,
+                        })
+                      }
+                    />
+                  </label>
+                  <label className="loc-field">
+                    <span>Pick retries</span>
+                    <input
+                      type="number"
+                      step="1"
+                      min="0"
+                      value={editFeeder.pickRetryCount ?? 3}
+                      onChange={(e) =>
+                        setEF({
+                          pickRetryCount: parseInt(e.currentTarget.value, 10) || 0,
+                        })
+                      }
+                    />
+                  </label>
+                  {editFeeder.photon && (
+                    <label className="loc-field">
+                      <span>Bus comm retries</span>
+                      <input
+                        type="number"
+                        step="1"
+                        min="0"
+                        value={editFeeder.photon.commMaxRetry ?? 3}
+                        onChange={(e) =>
+                          setPhotonField({
+                            commMaxRetry:
+                              parseInt(e.currentTarget.value, 10) || 0,
+                          })
+                        }
+                        title="Machine-wide RS-485 retry count for all Photon feeders"
+                      />
+                    </label>
+                  )}
+                </div>
+                <div className="teach-actions">
+                  <button className="btn btn-sm" onClick={saveRetry}>
+                    Save reliability
+                  </button>
+                </div>
               </div>
 
               {editFeeder.photon ? (

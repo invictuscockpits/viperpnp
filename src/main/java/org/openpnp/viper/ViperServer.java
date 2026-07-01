@@ -11,6 +11,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import org.openpnp.gui.importer.KicadPosImporter;
 import org.openpnp.machine.photon.PhotonFeeder;
+import org.openpnp.machine.photon.PhotonProperties;
 import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
 import org.openpnp.machine.reference.feeder.ReferenceStripFeeder;
@@ -34,6 +35,7 @@ import org.openpnp.spi.HeadMountable;
 import org.openpnp.spi.Machine;
 import org.openpnp.spi.MachineListener;
 import org.openpnp.spi.Nozzle;
+import org.openpnp.spi.base.AbstractFeeder;
 import org.openpnp.util.MovableUtils;
 
 import com.google.common.util.concurrent.FutureCallback;
@@ -219,6 +221,7 @@ public class ViperServer {
         app.post("/api/feeder/photon/feed", ctx -> photonAction(ctx, true));
         app.post("/api/feeder/strip", ViperServer::setStrip);
         app.post("/api/feeder/tray", ViperServer::setTray);
+        app.post("/api/feeder/retry", ViperServer::setFeederRetry);
         app.post("/api/feeder/move", ViperServer::moveToFeeder);
         app.post("/api/feeder/capture", ViperServer::captureFeeder);
 
@@ -598,6 +601,11 @@ public class ViperServer {
         m.put("type", f.getClass().getSimpleName());
         m.put("part", f.getPart() != null ? f.getPart().getId() : null);
         m.put("enabled", f.isEnabled());
+        if (f instanceof AbstractFeeder) {
+            AbstractFeeder af = (AbstractFeeder) f;
+            m.put("feedRetryCount", af.getFeedRetryCount());
+            m.put("pickRetryCount", af.getPickRetryCount());
+        }
         if (f instanceof PhotonFeeder) {
             PhotonFeeder pf = (PhotonFeeder) f;
             Map<String, Object> ph = new LinkedHashMap<>();
@@ -605,6 +613,7 @@ public class ViperServer {
             ph.put("hardwareId", pf.getHardwareId());
             ph.put("offset", locMap(pf.getOffset()));
             ph.put("slotLocation", pf.getSlot() != null ? locMap(pf.getSlot().getLocation()) : null);
+            ph.put("commMaxRetry", new PhotonProperties(machine).getFeederCommunicationMaxRetry());
             m.put("photon", ph);
             m.put("editableLocation", false);
         }
@@ -891,6 +900,42 @@ public class ViperServer {
     }
 
     /**
+     * POST /api/feeder/retry — reliability knobs. Body: {id, feedRetryCount?,
+     * pickRetryCount?, commMaxRetry?}. feed/pick retry counts are per-feeder;
+     * commMaxRetry is the machine-wide Photon RS-485 retry. On a job, each feed
+     * retry re-locates and re-initializes the feeder (a reconnect) before
+     * retrying, so raising feedRetryCount gives reconnect-and-retry before the
+     * hard stop that disables the feeder.
+     */
+    private static void setFeederRetry(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            RetryUpdate req = GSON.fromJson(ctx.body(), RetryUpdate.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (!(f instanceof AbstractFeeder)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"feeder not found\"}");
+                return;
+            }
+            AbstractFeeder af = (AbstractFeeder) f;
+            if (req.feedRetryCount != null) {
+                af.setFeedRetryCount(Math.max(0, req.feedRetryCount));
+            }
+            if (req.pickRetryCount != null) {
+                af.setPickRetryCount(Math.max(0, req.pickRetryCount));
+            }
+            if (req.commMaxRetry != null) {
+                new PhotonProperties(machine).setFeederCommunicationMaxRetry(Math.max(0, req.commMaxRetry));
+            }
+            ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
      * POST /api/feeder/photon/find — locates this Photon feeder's slot address
      * on the RS-485 bus. POST /api/feeder/photon/feed — advances the feeder by
      * one part. Both need the machine enabled and the feeder hardware present;
@@ -1030,6 +1075,14 @@ public class ViperServer {
         Double tapeWidth;
         String tapeType;
         Integer feedCount;
+    }
+
+    /** JSON body for POST /api/feeder/retry. */
+    private static class RetryUpdate {
+        String id;
+        Integer feedRetryCount;
+        Integer pickRetryCount;
+        Integer commMaxRetry;
     }
 
     /** JSON body for POST /api/feeder/tray. */
