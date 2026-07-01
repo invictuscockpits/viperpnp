@@ -32,11 +32,19 @@ interface Position {
   units: string;
 }
 
+interface IoState {
+  vac1: boolean | null;
+  vac2: boolean | null;
+  topLight: boolean | null;
+  bottomLight: boolean | null;
+}
+
 interface Status {
   enabled: boolean;
   homed: boolean;
   busy: boolean;
   position: Position | null;
+  io?: IoState;
 }
 
 interface JobBoard {
@@ -365,6 +373,8 @@ function App() {
   const park = () => post("/api/machine/park");
   const cameraToNozzle = () => post("/api/machine/camera-to-nozzle");
   const nozzleToCamera = () => post("/api/machine/nozzle-to-camera");
+  const toggleIo = (target: keyof IoState, on: boolean) =>
+    post("/api/io", { target, on });
   const jog = (ax: "x" | "y" | "z" | "c", dir: 1 | -1) => {
     const d = dir * step;
     post("/api/jog", {
@@ -843,6 +853,30 @@ function App() {
             </button>
           </div>
 
+        </div>
+
+        <div className="io-panel">
+          {(
+            [
+              { key: "vac1", label: "Vac 1" },
+              { key: "vac2", label: "Vac 2" },
+              { key: "topLight", label: "Top light" },
+              { key: "bottomLight", label: "Bottom light" },
+            ] as { key: keyof IoState; label: string }[]
+          ).map(({ key, label }) => {
+            const on = !!status?.io?.[key];
+            return (
+              <button
+                key={key}
+                className={`io-btn ${on ? "io-on" : ""}`}
+                disabled={!enabled}
+                onClick={() => toggleIo(key, !on)}
+              >
+                {label}
+                <span className="io-state">{on ? "ON" : "OFF"}</span>
+              </button>
+            );
+          })}
         </div>
 
         <div className="dro">

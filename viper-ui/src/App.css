@@ -664,6 +664,52 @@ body {
   justify-content: flex-end;
 }
 
+.io-panel {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+}
+
+.io-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.45rem 0.6rem;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.io-btn:hover:not(:disabled) {
+  border-color: var(--green);
+}
+
+.io-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.io-btn .io-state {
+  font-size: 0.68rem;
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+}
+
+.io-btn.io-on {
+  background: var(--green-dim);
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.io-btn.io-on .io-state {
+  color: var(--green);
+}
+
 .run-bar {
   display: flex;
   align-items: center;

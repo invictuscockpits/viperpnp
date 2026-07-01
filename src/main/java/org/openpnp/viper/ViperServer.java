@@ -13,6 +13,7 @@ import org.openpnp.gui.importer.KicadPosImporter;
 import org.openpnp.machine.photon.PhotonFeeder;
 import org.openpnp.machine.photon.PhotonProperties;
 import org.openpnp.machine.reference.ReferenceFeeder;
+import org.openpnp.machine.reference.ReferenceNozzle;
 import org.openpnp.machine.reference.ReferencePnpJobProcessor;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
 import org.openpnp.machine.reference.feeder.ReferenceStripFeeder;
@@ -28,6 +29,7 @@ import org.openpnp.model.Location;
 import org.openpnp.model.Motion.MotionOption;
 import org.openpnp.model.Part;
 import org.openpnp.model.Placement;
+import org.openpnp.spi.Actuator;
 import org.openpnp.spi.Camera;
 import org.openpnp.spi.Driver;
 import org.openpnp.spi.Feeder;
@@ -146,6 +148,8 @@ public class ViperServer {
             ctx.contentType("application/json");
             ctx.result("{\"submitted\":true}");
         });
+
+        app.post("/api/io", ViperServer::setIo);
 
         app.post("/api/machine/camera-to-nozzle", ctx -> {
             machine.submit(() -> {
@@ -290,7 +294,87 @@ public class ViperServer {
         status.put("homed", machine.isHomed());
         status.put("busy", machine.isBusy());
         status.put("position", position());
+        status.put("io", ioSnapshot());
         return status;
+    }
+
+    /** On/off state of the sidebar toggles (null when the actuator can't be read). */
+    private static Map<String, Object> ioSnapshot() {
+        Map<String, Object> io = new LinkedHashMap<>();
+        for (String t : new String[] {"vac1", "vac2", "topLight", "bottomLight"}) {
+            Boolean state = null;
+            try {
+                Actuator a = resolveIo(t);
+                if (a != null) {
+                    state = a.isActuated();
+                }
+            }
+            catch (Exception e) {
+                state = null;
+            }
+            io.put(t, state);
+        }
+        return io;
+    }
+
+    /**
+     * Resolves the actuator behind a sidebar toggle from the live machine, so it
+     * follows the config rather than hardcoded names: vac1/vac2 = the vacuum
+     * valve of nozzle 1/2; topLight = the head (down) camera light; bottomLight =
+     * the first machine (up) camera light. Returns null if not present.
+     */
+    private static Actuator resolveIo(String target) throws Exception {
+        Head head = machine.getDefaultHead();
+        if ("vac1".equals(target) || "vac2".equals(target)) {
+            List<Nozzle> nozzles = head.getNozzles();
+            int i = "vac1".equals(target) ? 0 : 1;
+            if (i < nozzles.size() && nozzles.get(i) instanceof ReferenceNozzle) {
+                return ((ReferenceNozzle) nozzles.get(i)).getVacuumActuator();
+            }
+            return null;
+        }
+        if ("topLight".equals(target)) {
+            Camera c = head.getDefaultCamera();
+            return c != null ? c.getLightActuator() : null;
+        }
+        if ("bottomLight".equals(target)) {
+            List<Camera> cams = machine.getCameras();
+            return cams.isEmpty() ? null : cams.get(0).getLightActuator();
+        }
+        return null;
+    }
+
+    /**
+     * POST /api/io — toggles a sidebar actuator. Body: {target: "vac1"|"vac2"|
+     * "topLight"|"bottomLight", on}. Runs on the machine task thread.
+     */
+    private static void setIo(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            IoRequest req = GSON.fromJson(ctx.body(), IoRequest.class);
+            final Actuator act = req != null ? resolveIo(req.target) : null;
+            if (act == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"no actuator for that target\"}");
+                return;
+            }
+            final boolean on = req.on;
+            machine.submit(() -> {
+                act.actuate(on);
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/io. */
+    private static class IoRequest {
+        String target;
+        boolean on;
     }
 
     /** Current default-nozzle position in mm, or null if unavailable. */
