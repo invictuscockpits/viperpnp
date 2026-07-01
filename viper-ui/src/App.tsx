@@ -192,6 +192,23 @@ interface CameraInfo {
   light: string | null;
 }
 
+interface NozzleInfo {
+  id: string;
+  name: string;
+  mount: string;
+  vacuum: string;
+  blowOff: string;
+  tip: string | null;
+}
+interface NozzleTipInfo {
+  id: string;
+  name: string;
+}
+interface ActuatorOpt {
+  id: string;
+  name: string;
+}
+
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
 const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
 const IMPORT_FORMATS = [
@@ -262,19 +279,19 @@ const MACHINE_CARDS: {
     id: "nozzles",
     title: "Nozzles & Tips",
     desc: "Nozzles, vacuum, tips",
-    ready: false,
+    ready: true,
   },
   {
     id: "cameras",
     title: "Cameras",
     desc: "Top & bottom cameras",
-    ready: false,
+    ready: true,
   },
   {
     id: "actuators",
     title: "Actuators & I/O",
     desc: "Vacuum, lights, valves",
-    ready: false,
+    ready: true,
   },
   {
     id: "general",
@@ -464,6 +481,9 @@ function App() {
   const [driverPorts, setDriverPorts] = useState<string[]>([]);
   const [actuators, setActuators] = useState<ActuatorInfo[]>([]);
   const [cameras, setCameras] = useState<CameraInfo[]>([]);
+  const [nozzles, setNozzles] = useState<NozzleInfo[]>([]);
+  const [nzTips, setNzTips] = useState<NozzleTipInfo[]>([]);
+  const [nozzleActs, setNozzleActs] = useState<ActuatorOpt[]>([]);
   const [reference, setReference] = useState("camera");
   const [tab, setTab] = useState<Tab>("board");
   const [feeders, setFeeders] = useState<FeederInfo[]>([]);
@@ -579,10 +599,54 @@ function App() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
 
+  const loadNozzles = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/nozzles/detail")).json();
+      setNozzles(d.nozzles ?? []);
+      setNzTips(d.nozzleTips ?? []);
+      setNozzleActs(d.actuators ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const applyNozzleResp = (d: {
+    nozzles?: NozzleInfo[];
+    nozzleTips?: NozzleTipInfo[];
+    actuators?: ActuatorOpt[];
+  }) => {
+    if (d.nozzles) setNozzles(d.nozzles);
+    if (d.nozzleTips) setNzTips(d.nozzleTips);
+    if (d.actuators) setNozzleActs(d.actuators);
+  };
+
+  const updateNozzle = (id: string, patch: object) => {
+    fetch("/api/nozzle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, ...patch }),
+    })
+      .then((r) => r.json())
+      .then(applyNozzleResp)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
+  const renameNozzleTip = (id: string, name: string) => {
+    fetch("/api/nozzletip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, name }),
+    })
+      .then((r) => r.json())
+      .then(applyNozzleResp)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
   const openCard = (id: string) => {
     if (id === "connection") loadDrivers();
     if (id === "actuators") loadActuators();
     if (id === "cameras") loadCameras();
+    if (id === "nozzles") loadNozzles();
     setMachineCard(id);
   };
 
@@ -3665,10 +3729,111 @@ function App() {
         </div>
       )}
 
+      {machineCard === "nozzles" && (
+        <div className="modal-backdrop" onClick={() => setMachineCard(null)}>
+          <div
+            className="modal modal-wide"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3>Nozzles &amp; Tips</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setMachineCard(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body plc-body">
+              <div className="sub-head">Nozzles</div>
+              {nozzles.length === 0 && (
+                <div className="muted">no nozzles on this machine</div>
+              )}
+              {nozzles.map((n) => (
+                <div key={n.id} className="teach-block">
+                  <div className="teach-head">
+                    <span className="mono">{n.name}</span> · {n.mount} · tip:{" "}
+                    {n.tip ?? "none loaded"}
+                  </div>
+                  <div className="field-grid">
+                    <label className="loc-field">
+                      <span>Vacuum actuator</span>
+                      <select
+                        className="type-select"
+                        value={n.vacuum}
+                        onChange={(e) =>
+                          updateNozzle(n.id, { vacuum: e.currentTarget.value })
+                        }
+                      >
+                        <option value="">— none —</option>
+                        {nozzleActs.map((a) => (
+                          <option key={a.id} value={a.id}>
+                            {a.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="loc-field">
+                      <span>Blow-off actuator</span>
+                      <select
+                        className="type-select"
+                        value={n.blowOff}
+                        onChange={(e) =>
+                          updateNozzle(n.id, { blowOff: e.currentTarget.value })
+                        }
+                      >
+                        <option value="">— none —</option>
+                        {nozzleActs.map((a) => (
+                          <option key={a.id} value={a.id}>
+                            {a.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                </div>
+              ))}
+              <div className="sub-head" style={{ marginTop: 14 }}>
+                Nozzle tips
+              </div>
+              {nzTips.length === 0 && (
+                <div className="muted">no nozzle tips defined</div>
+              )}
+              {nzTips.map((t) => (
+                <div key={t.id} className="field-grid nt-row">
+                  <label className="loc-field" style={{ flex: 1 }}>
+                    <span>Name</span>
+                    <input
+                      className="import-input"
+                      defaultValue={t.name}
+                      onBlur={(e) => {
+                        const v = e.currentTarget.value.trim();
+                        if (v && v !== t.name) renameNozzleTip(t.id, v);
+                      }}
+                    />
+                  </label>
+                  <span className="muted mono nt-id">{t.id}</span>
+                </div>
+              ))}
+            </div>
+            <div className="modal-foot">
+              <button
+                className="btn btn-primary"
+                onClick={() => setMachineCard(null)}
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {machineCard &&
         machineCard !== "connection" &&
         machineCard !== "actuators" &&
-        machineCard !== "cameras" && (
+        machineCard !== "cameras" &&
+        machineCard !== "nozzles" && (
         <div className="modal-backdrop" onClick={() => setMachineCard(null)}>
           <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">

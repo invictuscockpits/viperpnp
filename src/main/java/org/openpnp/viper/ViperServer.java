@@ -231,6 +231,9 @@ public class ViperServer {
         app.post("/api/actuator", ViperServer::actuateActuator);
         app.get("/api/cameras/detail", ViperServer::listCameras);
         app.post("/api/camera", ViperServer::updateCamera);
+        app.get("/api/nozzles/detail", ViperServer::listNozzles);
+        app.post("/api/nozzle", ViperServer::updateNozzle);
+        app.post("/api/nozzletip", ViperServer::updateNozzleTip);
         app.get("/api/parts/detail", ViperServer::listPartsDetail);
         app.post("/api/part", ViperServer::updatePart);
         app.post("/api/part/add", ViperServer::addPart);
@@ -1045,6 +1048,144 @@ public class ViperServer {
         Integer baud;
         String ip;
         Integer tcpPort;
+    }
+
+    // ---------------------------------------------------- Nozzles & tips
+
+    private static Map<String, Object> describeNozzles() {
+        List<Map<String, Object>> nozzles = new ArrayList<>();
+        List<Map<String, Object>> acts = new ArrayList<>();
+        try {
+            for (Head h : machine.getHeads()) {
+                for (Nozzle n : h.getNozzles()) {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("id", n.getId());
+                    m.put("name", n.getName());
+                    m.put("mount", h.getName());
+                    if (n instanceof ReferenceNozzle) {
+                        ReferenceNozzle rn = (ReferenceNozzle) n;
+                        m.put("vacuum", rn.getVacuumActuator() != null
+                                ? rn.getVacuumActuator().getId() : "");
+                        m.put("blowOff", rn.getBlowOffActuator() != null
+                                ? rn.getBlowOffActuator().getId() : "");
+                    }
+                    m.put("tip", n.getNozzleTip() != null ? n.getNozzleTip().getName() : null);
+                    nozzles.add(m);
+                }
+                for (Actuator a : h.getActuators()) {
+                    Map<String, Object> am = new LinkedHashMap<>();
+                    am.put("id", a.getId());
+                    am.put("name", a.getName());
+                    acts.add(am);
+                }
+            }
+        }
+        catch (Exception e) {
+            // best effort
+        }
+        for (Actuator a : machine.getActuators()) {
+            Map<String, Object> am = new LinkedHashMap<>();
+            am.put("id", a.getId());
+            am.put("name", a.getName());
+            acts.add(am);
+        }
+        List<Map<String, Object>> tips = new ArrayList<>();
+        for (NozzleTip nt : machine.getNozzleTips()) {
+            Map<String, Object> tm = new LinkedHashMap<>();
+            tm.put("id", nt.getId());
+            tm.put("name", nt.getName());
+            tips.add(tm);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("nozzles", nozzles);
+        root.put("actuators", acts);
+        root.put("nozzleTips", tips);
+        return root;
+    }
+
+    private static void listNozzles(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        ctx.result(GSON.toJson(describeNozzles()));
+    }
+
+    private static Nozzle findNozzle(String id) {
+        try {
+            for (Head h : machine.getHeads()) {
+                for (Nozzle n : h.getNozzles()) {
+                    if (n.getId().equals(id)) {
+                        return n;
+                    }
+                }
+            }
+        }
+        catch (Exception e) {
+            // ignore
+        }
+        return null;
+    }
+
+    /** POST /api/nozzle — Body: {id, vacuum?(actuator id), blowOff?(actuator id)}. */
+    private static void updateNozzle(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            NozzleUpdate req = GSON.fromJson(ctx.body(), NozzleUpdate.class);
+            Nozzle n = req != null ? findNozzle(req.id) : null;
+            if (!(n instanceof ReferenceNozzle)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle not found\"}");
+                return;
+            }
+            ReferenceNozzle rn = (ReferenceNozzle) n;
+            if (req.vacuum != null) {
+                rn.setVacuumActuator(req.vacuum.isEmpty() ? null : findActuator(req.vacuum));
+            }
+            if (req.blowOff != null) {
+                rn.setBlowOffActuator(req.blowOff.isEmpty() ? null : findActuator(req.blowOff));
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describeNozzles()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/nozzletip — rename. Body: {id, name}. */
+    private static void updateNozzleTip(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            NozzleUpdate req = GSON.fromJson(ctx.body(), NozzleUpdate.class);
+            NozzleTip found = null;
+            for (NozzleTip nt : machine.getNozzleTips()) {
+                if (req != null && nt.getId().equals(req.id)) {
+                    found = nt;
+                    break;
+                }
+            }
+            if (found == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle tip not found\"}");
+                return;
+            }
+            if (req.name != null && !req.name.trim().isEmpty()) {
+                found.setName(req.name.trim());
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describeNozzles()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for nozzle endpoints. */
+    private static class NozzleUpdate {
+        String id;
+        String name;
+        String vacuum;
+        String blowOff;
     }
 
     // ------------------------------------------------------------- Cameras
