@@ -199,12 +199,30 @@ interface NozzleInfo {
   mount: string;
   vacuum: string;
   blowOff: string;
+  vacuumSense: string;
   tip: string | null;
 }
 interface NozzleTipInfo {
   id: string;
   name: string;
+  methodPartOn?: string;
+  methodPartOff?: string;
+  establishPartOnLevel?: boolean;
+  partOnCheckAfterPick?: boolean;
+  partOnCheckAlign?: boolean;
+  partOnCheckBeforePlace?: boolean;
+  partOffCheckAfterPlace?: boolean;
+  partOffCheckBeforePick?: boolean;
+  vacuumLevelPartOnLow?: number;
+  vacuumLevelPartOnHigh?: number;
+  vacuumDifferencePartOnLow?: number;
+  vacuumDifferencePartOnHigh?: number;
+  vacuumLevelPartOffLow?: number;
+  vacuumLevelPartOffHigh?: number;
+  vacuumDifferencePartOffLow?: number;
+  vacuumDifferencePartOffHigh?: number;
 }
+const VAC_METHODS = ["None", "Absolute", "Difference"];
 interface ActuatorOpt {
   id: string;
   name: string;
@@ -661,11 +679,11 @@ function App() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
 
-  const renameNozzleTip = (id: string, name: string) => {
+  const updateTip = (id: string, patch: object) => {
     fetch("/api/nozzletip", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, name }),
+      body: JSON.stringify({ id, ...patch }),
     })
       .then((r) => r.json())
       .then(applyNozzleResp)
@@ -3867,31 +3885,295 @@ function App() {
                         ))}
                       </select>
                     </label>
+                    <label className="loc-field">
+                      <span>Vacuum sense actuator</span>
+                      <select
+                        className="type-select"
+                        value={n.vacuumSense}
+                        onChange={(e) =>
+                          updateNozzle(n.id, {
+                            vacuumSense: e.currentTarget.value,
+                          })
+                        }
+                      >
+                        <option value="">— none —</option>
+                        {nozzleActs.map((a) => (
+                          <option key={a.id} value={a.id}>
+                            {a.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                   </div>
                 </div>
               ))}
               <div className="sub-head" style={{ marginTop: 14 }}>
-                Nozzle tips
+                Nozzle tips — part detection
               </div>
               {nzTips.length === 0 && (
                 <div className="muted">no nozzle tips defined</div>
               )}
-              {nzTips.map((t) => (
-                <div key={t.id} className="field-grid nt-row">
-                  <label className="loc-field" style={{ flex: 1 }}>
-                    <span>Name</span>
-                    <input
-                      className="import-input"
-                      defaultValue={t.name}
-                      onBlur={(e) => {
-                        const v = e.currentTarget.value.trim();
-                        if (v && v !== t.name) renameNozzleTip(t.id, v);
-                      }}
-                    />
-                  </label>
-                  <span className="muted mono nt-id">{t.id}</span>
-                </div>
-              ))}
+              {nzTips.map((t) => {
+                const onMethod = t.methodPartOn ?? "None";
+                const offMethod = t.methodPartOff ?? "None";
+                return (
+                  <div key={t.id} className="teach-block">
+                    <div className="field-grid nt-row">
+                      <label className="loc-field" style={{ flex: 1 }}>
+                        <span>Tip name</span>
+                        <input
+                          className="import-input"
+                          defaultValue={t.name}
+                          onBlur={(e) => {
+                            const v = e.currentTarget.value.trim();
+                            if (v && v !== t.name) updateTip(t.id, { name: v });
+                          }}
+                        />
+                      </label>
+                      <span className="muted mono nt-id">{t.id}</span>
+                    </div>
+
+                    <div className="detect-grp">
+                      <div className="detect-title">
+                        Part-ON check (after pick — did it grab the part?)
+                      </div>
+                      <div className="field-grid">
+                        <label className="loc-field">
+                          <span>Method</span>
+                          <select
+                            className="type-select"
+                            value={onMethod}
+                            onChange={(e) =>
+                              updateTip(t.id, {
+                                methodPartOn: e.currentTarget.value,
+                              })
+                            }
+                          >
+                            {VAC_METHODS.map((m) => (
+                              <option key={m} value={m}>
+                                {m}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        {onMethod !== "None" && (
+                          <>
+                            <label className="loc-field">
+                              <span>Level low (kPa)</span>
+                              <NumberInput
+                                step={0.1}
+                                value={t.vacuumLevelPartOnLow ?? 0}
+                                onChange={(v) =>
+                                  updateTip(t.id, { vacuumLevelPartOnLow: v })
+                                }
+                              />
+                            </label>
+                            <label className="loc-field">
+                              <span>Level high (kPa)</span>
+                              <NumberInput
+                                step={0.1}
+                                value={t.vacuumLevelPartOnHigh ?? 0}
+                                onChange={(v) =>
+                                  updateTip(t.id, { vacuumLevelPartOnHigh: v })
+                                }
+                              />
+                            </label>
+                          </>
+                        )}
+                        {onMethod === "Difference" && (
+                          <>
+                            <label className="loc-field">
+                              <span>Diff low (kPa)</span>
+                              <NumberInput
+                                step={0.1}
+                                value={t.vacuumDifferencePartOnLow ?? 0}
+                                onChange={(v) =>
+                                  updateTip(t.id, {
+                                    vacuumDifferencePartOnLow: v,
+                                  })
+                                }
+                              />
+                            </label>
+                            <label className="loc-field">
+                              <span>Diff high (kPa)</span>
+                              <NumberInput
+                                step={0.1}
+                                value={t.vacuumDifferencePartOnHigh ?? 0}
+                                onChange={(v) =>
+                                  updateTip(t.id, {
+                                    vacuumDifferencePartOnHigh: v,
+                                  })
+                                }
+                              />
+                            </label>
+                          </>
+                        )}
+                      </div>
+                      {onMethod !== "None" && (
+                        <div className="detect-checks">
+                          <label className="check-row">
+                            <input
+                              type="checkbox"
+                              checked={t.partOnCheckAfterPick ?? false}
+                              onChange={(e) =>
+                                updateTip(t.id, {
+                                  partOnCheckAfterPick: e.currentTarget.checked,
+                                })
+                              }
+                            />
+                            <span>after pick</span>
+                          </label>
+                          <label className="check-row">
+                            <input
+                              type="checkbox"
+                              checked={t.partOnCheckAlign ?? false}
+                              onChange={(e) =>
+                                updateTip(t.id, {
+                                  partOnCheckAlign: e.currentTarget.checked,
+                                })
+                              }
+                            />
+                            <span>at align</span>
+                          </label>
+                          <label className="check-row">
+                            <input
+                              type="checkbox"
+                              checked={t.partOnCheckBeforePlace ?? false}
+                              onChange={(e) =>
+                                updateTip(t.id, {
+                                  partOnCheckBeforePlace:
+                                    e.currentTarget.checked,
+                                })
+                              }
+                            />
+                            <span>before place</span>
+                          </label>
+                          <label className="check-row">
+                            <input
+                              type="checkbox"
+                              checked={t.establishPartOnLevel ?? false}
+                              onChange={(e) =>
+                                updateTip(t.id, {
+                                  establishPartOnLevel: e.currentTarget.checked,
+                                })
+                              }
+                            />
+                            <span>auto-baseline level</span>
+                          </label>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="detect-grp">
+                      <div className="detect-title">
+                        Part-OFF check (after place — did it let go?)
+                      </div>
+                      <div className="field-grid">
+                        <label className="loc-field">
+                          <span>Method</span>
+                          <select
+                            className="type-select"
+                            value={offMethod}
+                            onChange={(e) =>
+                              updateTip(t.id, {
+                                methodPartOff: e.currentTarget.value,
+                              })
+                            }
+                          >
+                            {VAC_METHODS.map((m) => (
+                              <option key={m} value={m}>
+                                {m}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        {offMethod !== "None" && (
+                          <>
+                            <label className="loc-field">
+                              <span>Level low (kPa)</span>
+                              <NumberInput
+                                step={0.1}
+                                value={t.vacuumLevelPartOffLow ?? 0}
+                                onChange={(v) =>
+                                  updateTip(t.id, { vacuumLevelPartOffLow: v })
+                                }
+                              />
+                            </label>
+                            <label className="loc-field">
+                              <span>Level high (kPa)</span>
+                              <NumberInput
+                                step={0.1}
+                                value={t.vacuumLevelPartOffHigh ?? 0}
+                                onChange={(v) =>
+                                  updateTip(t.id, { vacuumLevelPartOffHigh: v })
+                                }
+                              />
+                            </label>
+                          </>
+                        )}
+                        {offMethod === "Difference" && (
+                          <>
+                            <label className="loc-field">
+                              <span>Diff low (kPa)</span>
+                              <NumberInput
+                                step={0.1}
+                                value={t.vacuumDifferencePartOffLow ?? 0}
+                                onChange={(v) =>
+                                  updateTip(t.id, {
+                                    vacuumDifferencePartOffLow: v,
+                                  })
+                                }
+                              />
+                            </label>
+                            <label className="loc-field">
+                              <span>Diff high (kPa)</span>
+                              <NumberInput
+                                step={0.1}
+                                value={t.vacuumDifferencePartOffHigh ?? 0}
+                                onChange={(v) =>
+                                  updateTip(t.id, {
+                                    vacuumDifferencePartOffHigh: v,
+                                  })
+                                }
+                              />
+                            </label>
+                          </>
+                        )}
+                      </div>
+                      {offMethod !== "None" && (
+                        <div className="detect-checks">
+                          <label className="check-row">
+                            <input
+                              type="checkbox"
+                              checked={t.partOffCheckAfterPlace ?? false}
+                              onChange={(e) =>
+                                updateTip(t.id, {
+                                  partOffCheckAfterPlace:
+                                    e.currentTarget.checked,
+                                })
+                              }
+                            />
+                            <span>after place</span>
+                          </label>
+                          <label className="check-row">
+                            <input
+                              type="checkbox"
+                              checked={t.partOffCheckBeforePick ?? false}
+                              onChange={(e) =>
+                                updateTip(t.id, {
+                                  partOffCheckBeforePick:
+                                    e.currentTarget.checked,
+                                })
+                              }
+                            />
+                            <span>before pick</span>
+                          </label>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
             <div className="modal-foot">
               <button

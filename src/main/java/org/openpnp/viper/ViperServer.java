@@ -17,6 +17,8 @@ import org.openpnp.machine.photon.PhotonProperties;
 import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.machine.reference.ReferenceMachine;
 import org.openpnp.machine.reference.ReferenceNozzle;
+import org.openpnp.machine.reference.ReferenceNozzleTip;
+import org.openpnp.machine.reference.ReferenceNozzleTip.VacuumMeasurementMethod;
 import org.openpnp.machine.reference.ReferencePnpJobProcessor;
 import org.openpnp.machine.reference.axis.ReferenceControllerAxis;
 import org.openpnp.machine.reference.camera.ReferenceCamera;
@@ -1076,6 +1078,8 @@ public class ViperServer {
                                 ? rn.getVacuumActuator().getId() : "");
                         m.put("blowOff", rn.getBlowOffActuator() != null
                                 ? rn.getBlowOffActuator().getId() : "");
+                        m.put("vacuumSense", rn.getVacuumSenseActuator() != null
+                                ? rn.getVacuumSenseActuator().getId() : "");
                     }
                     m.put("tip", n.getNozzleTip() != null ? n.getNozzleTip().getName() : null);
                     nozzles.add(m);
@@ -1102,6 +1106,27 @@ public class ViperServer {
             Map<String, Object> tm = new LinkedHashMap<>();
             tm.put("id", nt.getId());
             tm.put("name", nt.getName());
+            if (nt instanceof ReferenceNozzleTip) {
+                ReferenceNozzleTip t = (ReferenceNozzleTip) nt;
+                tm.put("methodPartOn", t.getMethodPartOn() != null
+                        ? t.getMethodPartOn().name() : "None");
+                tm.put("methodPartOff", t.getMethodPartOff() != null
+                        ? t.getMethodPartOff().name() : "None");
+                tm.put("establishPartOnLevel", t.isEstablishPartOnLevel());
+                tm.put("partOnCheckAfterPick", t.isPartOnCheckAfterPick());
+                tm.put("partOnCheckAlign", t.isPartOnCheckAlign());
+                tm.put("partOnCheckBeforePlace", t.isPartOnCheckBeforePlace());
+                tm.put("partOffCheckAfterPlace", t.isPartOffCheckAfterPlace());
+                tm.put("partOffCheckBeforePick", t.isPartOffCheckBeforePick());
+                tm.put("vacuumLevelPartOnLow", t.getVacuumLevelPartOnLow());
+                tm.put("vacuumLevelPartOnHigh", t.getVacuumLevelPartOnHigh());
+                tm.put("vacuumDifferencePartOnLow", t.getVacuumDifferencePartOnLow());
+                tm.put("vacuumDifferencePartOnHigh", t.getVacuumDifferencePartOnHigh());
+                tm.put("vacuumLevelPartOffLow", t.getVacuumLevelPartOffLow());
+                tm.put("vacuumLevelPartOffHigh", t.getVacuumLevelPartOffHigh());
+                tm.put("vacuumDifferencePartOffLow", t.getVacuumDifferencePartOffLow());
+                tm.put("vacuumDifferencePartOffHigh", t.getVacuumDifferencePartOffHigh());
+            }
             tips.add(tm);
         }
         Map<String, Object> root = new LinkedHashMap<>();
@@ -1132,7 +1157,7 @@ public class ViperServer {
         return null;
     }
 
-    /** POST /api/nozzle — Body: {id, vacuum?(actuator id), blowOff?(actuator id)}. */
+    /** POST /api/nozzle — Body: {id, vacuum?, blowOff?, vacuumSense? (actuator ids, "" clears)}. */
     private static void updateNozzle(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
@@ -1150,6 +1175,10 @@ public class ViperServer {
             if (req.blowOff != null) {
                 rn.setBlowOffActuator(req.blowOff.isEmpty() ? null : findActuator(req.blowOff));
             }
+            if (req.vacuumSense != null) {
+                rn.setVacuumSenseActuator(
+                        req.vacuumSense.isEmpty() ? null : findActuator(req.vacuumSense));
+            }
             markDirty();
             ctx.result(GSON.toJson(describeNozzles()));
         }
@@ -1159,7 +1188,7 @@ public class ViperServer {
         }
     }
 
-    /** POST /api/nozzletip — rename. Body: {id, name}. */
+    /** POST /api/nozzletip — rename and/or edit part-detection. Body: {id, name?, methodPartOn?, ...}. */
     private static void updateNozzleTip(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
@@ -1179,6 +1208,57 @@ public class ViperServer {
             if (req.name != null && !req.name.trim().isEmpty()) {
                 found.setName(req.name.trim());
             }
+            if (found instanceof ReferenceNozzleTip) {
+                ReferenceNozzleTip t = (ReferenceNozzleTip) found;
+                if (req.methodPartOn != null) {
+                    t.setMethodPartOn(VacuumMeasurementMethod.valueOf(req.methodPartOn));
+                }
+                if (req.methodPartOff != null) {
+                    t.setMethodPartOff(VacuumMeasurementMethod.valueOf(req.methodPartOff));
+                }
+                if (req.establishPartOnLevel != null) {
+                    t.setEstablishPartOnLevel(req.establishPartOnLevel);
+                }
+                if (req.partOnCheckAfterPick != null) {
+                    t.setPartOnCheckAfterPick(req.partOnCheckAfterPick);
+                }
+                if (req.partOnCheckAlign != null) {
+                    t.setPartOnCheckAlign(req.partOnCheckAlign);
+                }
+                if (req.partOnCheckBeforePlace != null) {
+                    t.setPartOnCheckBeforePlace(req.partOnCheckBeforePlace);
+                }
+                if (req.partOffCheckAfterPlace != null) {
+                    t.setPartOffCheckAfterPlace(req.partOffCheckAfterPlace);
+                }
+                if (req.partOffCheckBeforePick != null) {
+                    t.setPartOffCheckBeforePick(req.partOffCheckBeforePick);
+                }
+                if (req.vacuumLevelPartOnLow != null) {
+                    t.setVacuumLevelPartOnLow(req.vacuumLevelPartOnLow);
+                }
+                if (req.vacuumLevelPartOnHigh != null) {
+                    t.setVacuumLevelPartOnHigh(req.vacuumLevelPartOnHigh);
+                }
+                if (req.vacuumDifferencePartOnLow != null) {
+                    t.setVacuumDifferencePartOnLow(req.vacuumDifferencePartOnLow);
+                }
+                if (req.vacuumDifferencePartOnHigh != null) {
+                    t.setVacuumDifferencePartOnHigh(req.vacuumDifferencePartOnHigh);
+                }
+                if (req.vacuumLevelPartOffLow != null) {
+                    t.setVacuumLevelPartOffLow(req.vacuumLevelPartOffLow);
+                }
+                if (req.vacuumLevelPartOffHigh != null) {
+                    t.setVacuumLevelPartOffHigh(req.vacuumLevelPartOffHigh);
+                }
+                if (req.vacuumDifferencePartOffLow != null) {
+                    t.setVacuumDifferencePartOffLow(req.vacuumDifferencePartOffLow);
+                }
+                if (req.vacuumDifferencePartOffHigh != null) {
+                    t.setVacuumDifferencePartOffHigh(req.vacuumDifferencePartOffHigh);
+                }
+            }
             markDirty();
             ctx.result(GSON.toJson(describeNozzles()));
         }
@@ -1194,6 +1274,23 @@ public class ViperServer {
         String name;
         String vacuum;
         String blowOff;
+        String vacuumSense;
+        String methodPartOn;
+        String methodPartOff;
+        Boolean establishPartOnLevel;
+        Boolean partOnCheckAfterPick;
+        Boolean partOnCheckAlign;
+        Boolean partOnCheckBeforePlace;
+        Boolean partOffCheckAfterPlace;
+        Boolean partOffCheckBeforePick;
+        Double vacuumLevelPartOnLow;
+        Double vacuumLevelPartOnHigh;
+        Double vacuumDifferencePartOnLow;
+        Double vacuumDifferencePartOnHigh;
+        Double vacuumLevelPartOffLow;
+        Double vacuumLevelPartOffHigh;
+        Double vacuumDifferencePartOffLow;
+        Double vacuumDifferencePartOffHigh;
     }
 
     // -------------------------------------------------------- Motion & axes

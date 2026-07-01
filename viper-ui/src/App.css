@@ -1325,6 +1325,31 @@ input[type="number"] {
   flex: none;
 }
 
+.detect-grp {
+  border-left: 2px solid var(--border);
+  padding-left: 0.7rem;
+  margin-top: 0.4rem;
+}
+
+.detect-title {
+  font-size: 0.78rem;
+  color: var(--text);
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
+.detect-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 1rem;
+  margin-top: 0.4rem;
+}
+
+.detect-checks .check-row {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
 .nt-row {
   align-items: flex-end;
 }
