@@ -1236,6 +1236,7 @@ function App() {
     }
     if (tab === "board") {
       loadBoards();
+      loadParts();
     }
     if (tab === "jobs") {
       loadJobs();
@@ -4163,9 +4164,13 @@ function App() {
                           }
                         >
                           <option value="">—</option>
-                          {parts.map((pt) => (
-                            <option key={pt} value={pt}>
-                              {pt}
+                          {p.part &&
+                            !partsDetail.some((pt) => pt.id === p.part) && (
+                              <option value={p.part}>{p.part}</option>
+                            )}
+                          {partsDetail.map((pt) => (
+                            <option key={pt.id} value={pt.id}>
+                              {pt.id}
                             </option>
                           ))}
                         </select>
@@ -5863,9 +5868,15 @@ function App() {
                   }
                 >
                   <option value="">—</option>
-                  {parts.map((pt) => (
-                    <option key={pt} value={pt}>
-                      {pt}
+                  {editPlacement.part &&
+                    !partsDetail.some((pt) => pt.id === editPlacement.part) && (
+                      <option value={editPlacement.part}>
+                        {editPlacement.part}
+                      </option>
+                    )}
+                  {partsDetail.map((pt) => (
+                    <option key={pt.id} value={pt.id}>
+                      {pt.id}
                     </option>
                   ))}
                 </select>
