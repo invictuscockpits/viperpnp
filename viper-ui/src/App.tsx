@@ -57,22 +57,6 @@ interface Status {
   io?: IoState;
 }
 
-interface JobBoard {
-  name: string;
-  side: string;
-  placementCount: number;
-  placements: Placement[];
-}
-
-interface JobInfo {
-  loaded: boolean;
-  boardCount?: number;
-  placementCount?: number;
-  partCount?: number;
-  parts?: string[];
-  boards?: JobBoard[];
-}
-
 interface FeederInfo {
   id: string;
   name: string;
@@ -147,6 +131,14 @@ interface SkippedPlacement {
   id: string;
   part: string | null;
   board: string;
+}
+
+interface BoardInfo {
+  file: string | null;
+  name: string;
+  placements: number;
+  fiducials: number;
+  dirty: boolean;
 }
 
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
@@ -310,7 +302,6 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [step, setStep] = useState(1);
   const [speed, setSpeed] = useState(1);
-  const [job, setJob] = useState<JobInfo | null>(null);
   const [importPath, setImportPath] = useState(
     "C:/dev/viperpnp/samples/kicad-example-F.Cu.pos",
   );
@@ -318,7 +309,14 @@ function App() {
   const [importing, setImporting] = useState(false);
   const [importFormat, setImportFormat] = useState("kicad");
   const [formatMenuOpen, setFormatMenuOpen] = useState(false);
+  const [savePath, setSavePath] = useState("");
+  const [boards, setBoards] = useState<BoardInfo[]>([]);
+  const [activeBoard, setActiveBoard] = useState<string | null>(null);
+  const [boardPlacements, setBoardPlacements] = useState<Placement[]>([]);
   const [placementsOpen, setPlacementsOpen] = useState(false);
+  const [removeBoardTarget, setRemoveBoardTarget] = useState<BoardInfo | null>(
+    null,
+  );
   const [selPlacement, setSelPlacement] = useState<string | null>(null);
   const [editPlacement, setEditPlacement] = useState<Placement | null>(null);
   const [reference, setReference] = useState("camera");
@@ -357,18 +355,6 @@ function App() {
     }
   }, []);
 
-  const loadJob = useCallback(async () => {
-    try {
-      const res = await fetch("/api/job");
-      setJob((await res.json()) as JobInfo);
-    } catch {
-      setJob(null);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadJob();
-  }, [loadJob]);
 
   const loadFeeders = useCallback(async () => {
     try {
@@ -385,11 +371,24 @@ function App() {
     }
   }, []);
 
+  const loadBoards = useCallback(async () => {
+    try {
+      const res = await fetch("/api/boards");
+      const d = await res.json();
+      setBoards(d.boards ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   useEffect(() => {
     if (tab === "feeders") {
       loadFeeders();
     }
-  }, [tab, loadFeeders]);
+    if (tab === "board") {
+      loadBoards();
+    }
+  }, [tab, loadFeeders, loadBoards]);
 
   useEffect(() => {
     let closed = false;
@@ -497,13 +496,17 @@ function App() {
       const res = await fetch("/api/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ format: importFormat, topFile: importPath }),
+        body: JSON.stringify({
+          format: importFormat,
+          topFile: importPath,
+          savePath: savePath || undefined,
+        }),
       });
       const data = await res.json();
       if (data && (data.event === "error" || data.error)) {
         setImportErr(String(data.message ?? data.error));
       } else {
-        setJob(data as JobInfo);
+        setBoards(data.boards ?? []);
       }
     } catch (e) {
       setImportErr(e instanceof Error ? e.message : String(e));
@@ -512,32 +515,69 @@ function App() {
     }
   };
 
-  const postJob = async (url: string, body: unknown) => {
+  const openBoard = async (file: string | null) => {
+    if (!file) return;
+    setActiveBoard(file);
+    setSelPlacement(null);
+    setPlacementsOpen(true);
+    try {
+      const res = await fetch("/api/board", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ board: file }),
+      });
+      const d = await res.json();
+      setBoardPlacements(d.placements ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const confirmRemoveBoard = async () => {
+    if (!removeBoardTarget) return;
+    try {
+      const res = await fetch("/api/boards/remove", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ board: removeBoardTarget.file }),
+      });
+      const d = await res.json();
+      if (d.boards) setBoards(d.boards);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemoveBoardTarget(null);
+    }
+  };
+
+  // Board-scoped placement op: response is the board's refreshed placements.
+  const postPlacement = async (url: string, body: object) => {
     try {
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ board: activeBoard, ...body }),
       });
       const data = await res.json();
       if (data && (data.event === "error" || data.error)) {
         setError(String(data.message ?? data.error));
       } else {
-        setJob(data as JobInfo);
+        setBoardPlacements(data.placements ?? []);
+        loadBoards();
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
 
-  const addPlacement = () => postJob("/api/job/placement/add", {});
+  const addPlacement = () => postPlacement("/api/job/placement/add", {});
   const deleteSelPlacement = () => {
     if (!selPlacement) return;
-    postJob("/api/job/placement/delete", { id: selPlacement });
+    postPlacement("/api/job/placement/delete", { id: selPlacement });
     setSelPlacement(null);
   };
   const setBoardOrigin = (id: string) =>
-    postJob("/api/job/board-origin", { id });
+    postPlacement("/api/job/board-origin", { id });
 
   const updatePlacement = async (
     id: string,
@@ -556,16 +596,17 @@ function App() {
       const res = await fetch("/api/job/placement", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id, ...patch }),
+        body: JSON.stringify({ board: activeBoard, id, ...patch }),
       });
       const data = await res.json();
       if (data && (data.event === "error" || data.error)) {
-        setImportErr(String(data.message ?? data.error));
+        setError(String(data.message ?? data.error));
       } else {
-        setJob(data as JobInfo);
+        setBoardPlacements(data.placements ?? []);
+        loadBoards();
       }
     } catch (e) {
-      setImportErr(e instanceof Error ? e.message : String(e));
+      setError(e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -858,7 +899,7 @@ function App() {
     });
   };
 
-  const placements = (job?.boards ?? []).flatMap((b) => b.placements);
+  const placements = boardPlacements;
   const pos = status?.position;
   const shortImpl = inventory?.impl.split(".").pop() ?? "—";
   const cameraName = inventory?.heads?.[0]?.cameras?.[0] ?? "Top";
@@ -1228,7 +1269,7 @@ function App() {
           {tab === "board" && (
             <section className="board card">
               <div className="board-head">
-                <h2>Board input</h2>
+                <h2>Boards</h2>
                 <div className="import-row">
                   <input
                     className="import-input"
@@ -1275,18 +1316,17 @@ function App() {
                       </div>
                     )}
                   </div>
-                  <button
-                    className="btn btn-icon"
-                    onClick={() => setPlacementsOpen(true)}
-                    disabled={!job?.loaded}
-                    title="Open the placements list"
-                    aria-label="Open placements"
-                  >
-                    <EyeIcon size={17} />
-                  </button>
                 </div>
               </div>
-              {job?.loaded && (
+              <div className="import-row save-row">
+                <input
+                  className="import-input"
+                  value={savePath}
+                  onChange={(e) => setSavePath(e.currentTarget.value)}
+                  placeholder="save to (default: config/boards) — folder or .board.xml path"
+                />
+              </div>
+              {boards.length > 0 && (
                 <div className="run-bar">
                   {jobRunning ? (
                     <button className="btn btn-danger" onClick={abortJob}>
@@ -1317,26 +1357,58 @@ function App() {
                 </div>
               )}
               {importErr && <div className="banner banner-warn">{importErr}</div>}
-              {job?.loaded ? (
-                <>
-                  <div className="board-summary">
-                    <span className="tag">{job.boards?.[0]?.name}</span>
-                    <span className="muted">
-                      {job.placementCount} placements · {job.partCount} parts ·{" "}
-                      {placements.filter((p) => p.enabled).length} enabled ·{" "}
-                      {placements.filter((p) => p.type === "Fiducial").length}{" "}
-                      fiducials
-                    </span>
-                    <span className="legend">
-                      <span className="lg lg-top" /> Top
-                      <span className="lg lg-fid" /> Fiducial
-                    </span>
-                  </div>
-                  <BoardMap placements={placements} />
-                </>
-              ) : (
+              {boards.length === 0 ? (
                 <div className="muted">
-                  No board loaded. Import a KiCad .pos to see its placement map.
+                  No boards yet. Import a board file (KiCad, CSV, Eagle) to add
+                  one to the library.
+                </div>
+              ) : (
+                <div className="ptable-wrap">
+                  <table className="ptable">
+                    <thead>
+                      <tr>
+                        <th>Board</th>
+                        <th>Placements</th>
+                        <th>Fiducials</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {boards.map((b) => (
+                        <tr key={b.file ?? b.name}>
+                          <td className="mono">
+                            {b.name}
+                            {b.dirty && (
+                              <span className="dirty-dot" title="Unsaved edits">
+                                {" "}
+                                •
+                              </span>
+                            )}
+                          </td>
+                          <td className="mono">{b.placements}</td>
+                          <td className="mono">{b.fiducials}</td>
+                          <td className="row-actions">
+                            <button
+                              className="btn btn-sm btn-icon"
+                              onClick={() => openBoard(b.file)}
+                              title="Open placements"
+                              aria-label="Open placements"
+                            >
+                              <EyeIcon size={15} />
+                            </button>
+                            <button
+                              className="btn btn-sm btn-icon btn-trash"
+                              onClick={() => setRemoveBoardTarget(b)}
+                              title="Remove board from library"
+                              aria-label="Remove board"
+                            >
+                              <TrashIcon size={15} />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               )}
             </section>
@@ -2015,7 +2087,10 @@ function App() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="modal-head">
-              <h3>Placements — {job?.boards?.[0]?.name ?? "board"}</h3>
+              <h3>
+                Placements —{" "}
+                {boards.find((b) => b.file === activeBoard)?.name ?? "board"}
+              </h3>
               <button
                 className="icon-btn"
                 onClick={() => setPlacementsOpen(false)}
@@ -2134,6 +2209,46 @@ function App() {
                   ))}
                 </tbody>
               </table>
+              {placements.length > 0 && (
+                <div className="plc-map">
+                  <BoardMap placements={placements} />
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {removeBoardTarget && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setRemoveBoardTarget(null)}
+        >
+          <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>Remove board?</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setRemoveBoardTarget(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p className="confirm-text">
+                Remove <span className="mono">{removeBoardTarget.name}</span>{" "}
+                from the library? The <span className="mono">.board.xml</span>{" "}
+                file stays on disk — you can re-import it later.
+              </p>
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setRemoveBoardTarget(null)}>
+                Cancel
+              </button>
+              <button className="btn btn-danger" onClick={confirmRemoveBoard}>
+                Remove
+              </button>
             </div>
           </div>
         </div>

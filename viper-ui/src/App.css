@@ -789,7 +789,20 @@ body {
 }
 
 .plc-body {
-  max-height: 60vh;
+  max-height: 68vh;
+}
+
+.plc-map {
+  margin-top: 0.8rem;
+}
+
+.save-row {
+  margin-top: 0.5rem;
+}
+
+.dirty-dot {
+  color: var(--green);
+  font-weight: 700;
 }
 
 .ptable tr.row-sel td {

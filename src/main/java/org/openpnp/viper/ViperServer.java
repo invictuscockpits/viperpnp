@@ -107,6 +107,7 @@ public class ViperServer {
         System.out.println("[viper] core booted headless from " + configDir + " in "
                 + (System.currentTimeMillis() - t0) + " ms");
 
+        loadBoardsFolder();
         machine.addListener(new StatusBroadcastListener());
 
         int port = Integer.getInteger("viper.port", 8077);
@@ -216,6 +217,9 @@ public class ViperServer {
         app.post("/api/job/placement/add", ViperServer::addPlacement);
         app.post("/api/job/placement/delete", ViperServer::deletePlacement);
         app.post("/api/job/board-origin", ViperServer::setBoardOriginFromPlacement);
+        app.get("/api/boards", ViperServer::listBoards);
+        app.post("/api/board", ViperServer::getBoardPlacements);
+        app.post("/api/boards/remove", ViperServer::removeBoard);
         app.post("/api/job/run", ViperServer::runJob);
         app.post("/api/job/abort", ViperServer::abortJob);
         app.get("/api/job/state", ctx -> {
@@ -237,6 +241,12 @@ public class ViperServer {
                 for (Feeder f : machine.getFeeders()) {
                     if (f.getPart() == null) {
                         f.setPart(null);
+                    }
+                }
+                // Persist edited boards to their .board.xml files.
+                for (Board b : Configuration.get().getBoards()) {
+                    if (b.isDirty() && b.getFile() != null) {
+                        Configuration.get().saveBoard(b);
                     }
                 }
                 Configuration.get().save();
@@ -542,8 +552,9 @@ public class ViperServer {
                 return;
             }
             String fmt = req.format != null ? req.format.toLowerCase() : "kicad";
+            String name = boardName(req.topFile);
             Board board = new Board();
-            board.setName(new File(req.topFile).getName());
+            board.setName(name);
             for (Placement p : parsePlacements(fmt, new File(req.topFile), Side.Top, req)) {
                 board.addPlacement(p);
             }
@@ -552,12 +563,14 @@ public class ViperServer {
                     board.addPlacement(p);
                 }
             }
-            Job job = new Job();
-            BoardLocation bl = new BoardLocation(board);
-            bl.setGlobalSide(Side.Top);
-            job.addBoardOrPanelLocation(bl);
-            currentJob = job;
-            ctx.result(GSON.toJson(describeJob(job)));
+            // Persist as a .board.xml file and add it to the library.
+            File file = resolveBoardFile(req.savePath, name);
+            file.getParentFile().mkdirs();
+            board.setFile(file);
+            Configuration.get().saveBoard(board);
+            Configuration.get().addBoard(board);
+            syncJob();
+            ctx.result(GSON.toJson(describeBoards()));
         }
         catch (Exception e) {
             ctx.status(500);
@@ -583,46 +596,195 @@ public class ViperServer {
         }
     }
 
-    /** Finds a placement by id in the current job, or null. */
-    private static Placement findPlacement(String id) {
-        if (currentJob == null || id == null) {
-            return null;
-        }
-        for (BoardLocation bl : currentJob.getBoardLocations()) {
-            for (Placement p : bl.getBoard().getPlacements()) {
-                if (p.getId().equals(id)) {
-                    return p;
-                }
-            }
-        }
-        return null;
+    /** The default boards folder, &lt;configDir&gt;/boards. */
+    private static File boardsDir() {
+        return new File(Configuration.get().getConfigurationDirectory(), "boards");
     }
 
-    /** The BoardLocation whose board contains the given placement, or null. */
-    private static BoardLocation findBoardLocation(String placementId) {
-        if (currentJob == null || placementId == null) {
+    /** A board name from a source file path (basename without its extension). */
+    private static String boardName(String path) {
+        String base = new File(path).getName();
+        int dot = base.indexOf('.');
+        return dot > 0 ? base.substring(0, dot) : base;
+    }
+
+    /** Resolves where a board's .board.xml is written, honoring a custom path. */
+    private static File resolveBoardFile(String savePath, String name) {
+        String fileName = name.replaceAll("[^a-zA-Z0-9._-]", "_") + ".board.xml";
+        if (savePath != null && !savePath.trim().isEmpty()) {
+            String sp = savePath.trim();
+            if (sp.toLowerCase().endsWith(".board.xml")) {
+                return new File(sp);
+            }
+            return new File(sp, fileName);
+        }
+        return new File(boardsDir(), fileName);
+    }
+
+    /** Loads every *.board.xml under the boards folder into the library at startup. */
+    private static void loadBoardsFolder() {
+        File dir = boardsDir();
+        dir.mkdirs();
+        File[] files = dir.listFiles((d, n) -> n.toLowerCase().endsWith(".board.xml"));
+        if (files == null) {
+            return;
+        }
+        for (File f : files) {
+            try {
+                Configuration.get().addBoard(f);
+            }
+            catch (Exception e) {
+                System.out.println("[viper] failed to load board " + f + ": " + e.getMessage());
+            }
+        }
+        syncJob();
+    }
+
+    /** The board library: every loaded board with its placement/fiducial counts. */
+    private static Map<String, Object> describeBoards() {
+        List<Map<String, Object>> boards = new ArrayList<>();
+        for (Board b : Configuration.get().getBoards()) {
+            Map<String, Object> bm = new LinkedHashMap<>();
+            bm.put("file", b.getFile() != null ? b.getFile().getAbsolutePath() : null);
+            bm.put("name", b.getName());
+            int pl = 0;
+            int fid = 0;
+            for (Placement p : b.getPlacements()) {
+                if (p.getType() == Placement.Type.Fiducial) {
+                    fid++;
+                }
+                else {
+                    pl++;
+                }
+            }
+            bm.put("placements", pl);
+            bm.put("fiducials", fid);
+            bm.put("dirty", b.isDirty());
+            boards.add(bm);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("boards", boards);
+        return root;
+    }
+
+    /** Finds a library board by its canonical file path. */
+    private static Board findBoard(String file) {
+        if (file == null) {
             return null;
         }
-        for (BoardLocation bl : currentJob.getBoardLocations()) {
-            for (Placement p : bl.getBoard().getPlacements()) {
-                if (p.getId().equals(placementId)) {
-                    return bl;
-                }
+        for (Board b : Configuration.get().getBoards()) {
+            if (b.getFile() != null && b.getFile().getAbsolutePath().equals(file)) {
+                return b;
             }
         }
         return null;
     }
 
     /**
-     * Updates a single placement in the current job — the core of OpenPnP's
-     * board-input editor. Body (all optional): {id, type, enabled, side,
-     * errorHandling, partId, x, y, rot}. Returns the refreshed job.
+     * Keeps {@link #currentJob} holding one BoardLocation per library board, so
+     * placement teach/origin/run all work while boards live as reusable files.
+     */
+    private static void syncJob() {
+        if (currentJob == null) {
+            currentJob = new Job();
+        }
+        List<Board> lib = Configuration.get().getBoards();
+        // Drop locations whose board left the library.
+        List<BoardLocation> stale = new ArrayList<>();
+        for (BoardLocation bl : currentJob.getBoardLocations()) {
+            if (!lib.contains(bl.getBoard())) {
+                stale.add(bl);
+            }
+        }
+        for (BoardLocation bl : stale) {
+            currentJob.removeBoardOrPanelLocation(bl);
+        }
+        // Add a location for any new library board.
+        for (Board b : lib) {
+            boolean has = false;
+            for (BoardLocation bl : currentJob.getBoardLocations()) {
+                if (bl.getBoard() == b) {
+                    has = true;
+                    break;
+                }
+            }
+            if (!has) {
+                BoardLocation bl = new BoardLocation(b);
+                bl.setGlobalSide(Side.Top);
+                currentJob.addBoardOrPanelLocation(bl);
+            }
+        }
+    }
+
+    /** The library board a placement request targets: by file, else the first. */
+    private static Board resolveBoard(String file) {
+        if (file != null && !file.isEmpty()) {
+            return findBoard(file);
+        }
+        List<Board> lib = Configuration.get().getBoards();
+        return lib.isEmpty() ? null : lib.get(0);
+    }
+
+    /** The BoardLocation in the current job that wraps the given board. */
+    private static BoardLocation boardLocationFor(Board board) {
+        if (currentJob == null || board == null) {
+            return null;
+        }
+        for (BoardLocation bl : currentJob.getBoardLocations()) {
+            if (bl.getBoard() == board) {
+                return bl;
+            }
+        }
+        return null;
+    }
+
+    /** GET /api/boards — the board library. */
+    private static void listBoards(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        ctx.result(GSON.toJson(describeBoards()));
+    }
+
+    /** POST /api/board — one board's placements. Body: {board: file}. */
+    private static void getBoardPlacements(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        BoardUpdate req = GSON.fromJson(ctx.body(), BoardUpdate.class);
+        Board board = req != null ? resolveBoard(req.board) : null;
+        if (board == null) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"board not found\"}");
+            return;
+        }
+        ctx.result(GSON.toJson(describeBoardPlacements(board)));
+    }
+
+    /** POST /api/boards/remove — drops a board from the library. Body: {board}. */
+    private static void removeBoard(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        BoardUpdate req = GSON.fromJson(ctx.body(), BoardUpdate.class);
+        Board board = req != null ? resolveBoard(req.board) : null;
+        if (board == null) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"board not found\"}");
+            return;
+        }
+        // Clear dirty so removeBoard doesn't try to pop a (headless) save dialog.
+        board.setDirty(false);
+        Configuration.get().removeBoard(board);
+        syncJob();
+        ctx.result(GSON.toJson(describeBoards()));
+    }
+
+    /**
+     * Updates one placement of a board — the core of OpenPnP's board-input
+     * editor. Body (all optional): {board, id, type, enabled, side,
+     * errorHandling, partId, x, y, rot}. Returns the board's placements.
      */
     private static void updatePlacement(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
             PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
-            Placement found = req != null ? findPlacement(req.id) : null;
+            Board board = req != null ? resolveBoard(req.board) : null;
+            Placement found = board != null ? board.getPlacements().get(req.id) : null;
             if (found == null) {
                 ctx.status(404);
                 ctx.result("{\"error\":\"placement not found\"}");
@@ -652,7 +814,9 @@ public class ViperServer {
                         l.getZ(),
                         req.rot != null ? req.rot : l.getRotation()));
             }
-            ctx.result(GSON.toJson(describeJob(currentJob)));
+            board.setDirty(true);
+            markDirty();
+            ctx.result(GSON.toJson(describeBoardPlacements(board)));
         }
         catch (Exception e) {
             ctx.status(500);
@@ -661,29 +825,31 @@ public class ViperServer {
     }
 
     /**
-     * POST /api/job/placement/add — adds a new placement to the first board.
-     * Body (optional): {id, partId}. Returns the refreshed job.
+     * POST /api/job/placement/add — adds a new placement to a board. Body:
+     * {board, id?, partId?}. Returns the board's placements.
      */
     private static void addPlacement(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
-            if (currentJob == null || currentJob.getBoardLocations().isEmpty()) {
+            PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
+            Board board = req != null ? resolveBoard(req.board) : null;
+            if (board == null) {
                 ctx.status(400);
                 ctx.result("{\"error\":\"no board loaded\"}");
                 return;
             }
-            PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
-            Board board = currentJob.getBoardLocations().get(0).getBoard();
-            String id = req != null && req.id != null && !req.id.trim().isEmpty()
+            String id = req.id != null && !req.id.trim().isEmpty()
                     ? req.id.trim() : nextPlacementId(board);
             Placement p = new Placement(id);
             p.setSide(Side.Top);
             p.setType(Placement.Type.Placement);
-            if (req != null && req.partId != null && !req.partId.isEmpty()) {
+            if (req.partId != null && !req.partId.isEmpty()) {
                 p.setPart(Configuration.get().getPart(req.partId));
             }
             board.addPlacement(p);
-            ctx.result(GSON.toJson(describeJob(currentJob)));
+            board.setDirty(true);
+            markDirty();
+            ctx.result(GSON.toJson(describeBoardPlacements(board)));
         }
         catch (Exception e) {
             ctx.status(500);
@@ -691,7 +857,7 @@ public class ViperServer {
         }
     }
 
-    /** A unique reference like R1, R2 … for a newly added placement. */
+    /** A unique reference like P1, P2 … for a newly added placement. */
     private static String nextPlacementId(Board board) {
         int n = board.getPlacements().size() + 1;
         while (board.getPlacements().get("P" + n) != null) {
@@ -700,20 +866,22 @@ public class ViperServer {
         return "P" + n;
     }
 
-    /** POST /api/job/placement/delete — removes a placement. Body: {id}. */
+    /** POST /api/job/placement/delete — removes a placement. Body: {board, id}. */
     private static void deletePlacement(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
             PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
-            BoardLocation bl = req != null ? findBoardLocation(req.id) : null;
-            Placement found = req != null ? findPlacement(req.id) : null;
-            if (bl == null || found == null) {
+            Board board = req != null ? resolveBoard(req.board) : null;
+            Placement found = board != null ? board.getPlacements().get(req.id) : null;
+            if (found == null) {
                 ctx.status(404);
                 ctx.result("{\"error\":\"placement not found\"}");
                 return;
             }
-            bl.getBoard().removePlacement(found);
-            ctx.result(GSON.toJson(describeJob(currentJob)));
+            board.removePlacement(found);
+            board.setDirty(true);
+            markDirty();
+            ctx.result(GSON.toJson(describeBoardPlacements(board)));
         }
         catch (Exception e) {
             ctx.status(500);
@@ -723,20 +891,21 @@ public class ViperServer {
 
     /**
      * POST /api/job/board-origin — sets the board origin so the given placement
-     * lands under the current camera. Body: {id}. We clear any fiducial-derived
-     * transform, then shift the board translation by (camera − current placement
-     * machine location), keeping board Z and rotation. A single point fixes the
-     * origin (translation); rotation still needs a second point / fiducials.
+     * lands under the current camera. Body: {board, id}. Clears any fiducial-
+     * derived transform, then shifts the board translation by (camera − current
+     * placement machine location), keeping board Z and rotation. A single point
+     * fixes the origin (translation); rotation still needs fiducials.
      */
     private static void setBoardOriginFromPlacement(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
             PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
-            Placement p = req != null ? findPlacement(req.id) : null;
-            BoardLocation bl = req != null ? findBoardLocation(req.id) : null;
+            Board board = req != null ? resolveBoard(req.board) : null;
+            Placement p = board != null ? board.getPlacements().get(req.id) : null;
+            BoardLocation bl = boardLocationFor(board);
             if (p == null || bl == null) {
                 ctx.status(404);
-                ctx.result("{\"error\":\"placement not found\"}");
+                ctx.result("{\"error\":\"placement or board not found\"}");
                 return;
             }
             Camera camera = machine.getDefaultHead().getDefaultCamera();
@@ -750,7 +919,8 @@ public class ViperServer {
                     origin.getY() + (cam.getY() - current.getY()),
                     origin.getZ(),
                     origin.getRotation()));
-            ctx.result(GSON.toJson(describeJob(currentJob)));
+            markDirty();
+            ctx.result(GSON.toJson(describeBoardPlacements(board)));
         }
         catch (Exception e) {
             ctx.status(500);
@@ -760,6 +930,7 @@ public class ViperServer {
 
     /** JSON body for placement endpoints. */
     private static class PlacementUpdate {
+        String board;
         String id;
         String type;
         Boolean enabled;
@@ -769,6 +940,11 @@ public class ViperServer {
         Double x;
         Double y;
         Double rot;
+    }
+
+    /** JSON body for board-scoped endpoints. */
+    private static class BoardUpdate {
+        String board;
     }
 
     /**
@@ -1927,6 +2103,36 @@ public class ViperServer {
     }
 
     /** JSON summary of the current job: boards, placements and distinct parts. */
+    /** Serializes a single placement. */
+    private static Map<String, Object> placementMap(Placement p) {
+        Map<String, Object> pm = new LinkedHashMap<>();
+        pm.put("id", p.getId());
+        pm.put("part", p.getPart() != null ? p.getPart().getId() : null);
+        pm.put("side", p.getSide() != null ? p.getSide().toString() : null);
+        pm.put("type", p.getType() != null ? p.getType().toString() : "Placement");
+        pm.put("enabled", p.isEnabled());
+        pm.put("errorHandling", p.getErrorHandling() != null
+                ? p.getErrorHandling().toString() : "Default");
+        Location l = p.getLocation().convertToUnits(LengthUnit.Millimeters);
+        pm.put("x", round(l.getX()));
+        pm.put("y", round(l.getY()));
+        pm.put("rot", round(l.getRotation()));
+        return pm;
+    }
+
+    /** One board's placements — the payload for the placements popup. */
+    private static Map<String, Object> describeBoardPlacements(Board board) {
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("file", board.getFile() != null ? board.getFile().getAbsolutePath() : null);
+        root.put("name", board.getName());
+        List<Map<String, Object>> placements = new ArrayList<>();
+        for (Placement p : board.getPlacements()) {
+            placements.add(placementMap(p));
+        }
+        root.put("placements", placements);
+        return root;
+    }
+
     private static Map<String, Object> describeJob(Job job) {
         Map<String, Object> root = new LinkedHashMap<>();
         if (job == null) {
@@ -1946,19 +2152,7 @@ public class ViperServer {
 
             List<Map<String, Object>> placements = new ArrayList<>();
             for (Placement p : board.getPlacements()) {
-                Map<String, Object> pm = new LinkedHashMap<>();
-                pm.put("id", p.getId());
-                pm.put("part", p.getPart() != null ? p.getPart().getId() : null);
-                pm.put("side", p.getSide() != null ? p.getSide().toString() : null);
-                pm.put("type", p.getType() != null ? p.getType().toString() : "Placement");
-                pm.put("enabled", p.isEnabled());
-                pm.put("errorHandling", p.getErrorHandling() != null
-                        ? p.getErrorHandling().toString() : "Default");
-                Location l = p.getLocation().convertToUnits(LengthUnit.Millimeters);
-                pm.put("x", round(l.getX()));
-                pm.put("y", round(l.getY()));
-                pm.put("rot", round(l.getRotation()));
-                placements.add(pm);
+                placements.add(placementMap(p));
                 totalPlacements++;
                 if (p.getPart() != null) {
                     parts.add(p.getPart().getId());
@@ -1981,6 +2175,7 @@ public class ViperServer {
         String format;
         String topFile;
         String bottomFile;
+        String savePath;
         boolean createMissingParts = true;
         boolean useValueOnly = false;
     }
