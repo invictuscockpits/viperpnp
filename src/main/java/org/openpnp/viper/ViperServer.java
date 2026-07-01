@@ -222,6 +222,24 @@ public class ViperServer {
         app.post("/api/feeder/strip", ViperServer::setStrip);
         app.post("/api/feeder/tray", ViperServer::setTray);
         app.post("/api/feeder/retry", ViperServer::setFeederRetry);
+        app.post("/api/feeders/scan", ctx -> {
+            machine.submit(() -> {
+                PhotonFeeder.findAllFeeders((addr, state) -> { });
+                return null;
+            }, new FutureCallback<Object>() {
+                @Override
+                public void onSuccess(Object result) {
+                    broadcast(GSON.toJson(feedersEvent()));
+                }
+
+                @Override
+                public void onFailure(Throwable t) {
+                    broadcast(GSON.toJson(errorMap(t)));
+                }
+            });
+            ctx.contentType("application/json");
+            ctx.result("{\"submitted\":true}");
+        });
         app.post("/api/feeder/move", ViperServer::moveToFeeder);
         app.post("/api/feeder/capture", ViperServer::captureFeeder);
 
@@ -445,6 +463,13 @@ public class ViperServer {
         String id;
         String type;
         Boolean enabled;
+    }
+
+    /** Feeder list wrapped as a WebSocket event so clients can refresh live. */
+    private static Map<String, Object> feedersEvent() {
+        Map<String, Object> e = describeFeeders();
+        e.put("event", "feeders");
+        return e;
     }
 
     /** Feeder list snapshot: name, type, assigned part, enabled. */
@@ -693,6 +718,7 @@ public class ViperServer {
                 return f instanceof PhotonFeeder && ((PhotonFeeder) f).getSlot() != null
                         ? ((PhotonFeeder) f).getSlot().getLocation() : null;
             case "pick":
+            case "offset":
                 return tryPickLocation(f);
             case "refHole":
                 return f instanceof ReferenceStripFeeder
@@ -713,6 +739,18 @@ public class ViperServer {
             case "slot":
                 if (f instanceof PhotonFeeder && ((PhotonFeeder) f).getSlot() != null) {
                     ((PhotonFeeder) f).getSlot().setLocation(loc);
+                    return true;
+                }
+                return false;
+            case "offset":
+                if (f instanceof PhotonFeeder) {
+                    PhotonFeeder pf = (PhotonFeeder) f;
+                    if (pf.getSlot() == null || pf.getSlot().getLocation() == null) {
+                        return false;
+                    }
+                    // loc is the absolute part position; store it relative to the slot.
+                    pf.setOffset(loc.getLocalLocationRelativeTo(
+                            pf.getSlot().getLocation().convertToUnits(LengthUnit.Millimeters)));
                     return true;
                 }
                 return false;

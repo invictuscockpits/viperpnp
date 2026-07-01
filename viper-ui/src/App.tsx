@@ -110,7 +110,7 @@ const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
 const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
 
 type TeachTool = "camera" | "nozzle";
-type TeachTarget = "location" | "slot" | "refHole" | "lastHole";
+type TeachTarget = "location" | "slot" | "offset" | "refHole" | "lastHole";
 
 type Tab = "machine" | "board" | "feeders";
 
@@ -225,6 +225,7 @@ function App() {
   const [feederType, setFeederType] = useState("photon");
   const [feederName, setFeederName] = useState("");
   const [editFeeder, setEditFeeder] = useState<FeederConfig | null>(null);
+  const [scanning, setScanning] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const dragIndex = useRef<number | null>(null);
 
@@ -292,8 +293,12 @@ function App() {
         if (data && typeof data.enabled === "boolean") {
           setStatus(data as Status);
           setError(null);
+        } else if (data && data.event === "feeders") {
+          setFeeders(data.feeders ?? []);
+          setScanning(false);
         } else if (data && data.event === "error") {
           setError(String(data.message));
+          setScanning(false);
         }
       });
       ws.addEventListener("close", () => {
@@ -553,6 +558,13 @@ function App() {
       pickRetryCount: editFeeder.pickRetryCount,
       commMaxRetry: editFeeder.photon?.commMaxRetry,
     });
+  };
+
+  const scanBus = () => {
+    setScanning(true);
+    fetch("/api/feeders/scan", { method: "POST" })
+      .then(() => setTimeout(() => setScanning(false), 8000))
+      .catch(() => setScanning(false));
   };
 
   const photonAction = (id: string, action: "find" | "feed") => {
@@ -1038,6 +1050,14 @@ function App() {
                   <button className="btn btn-primary" onClick={addFeeder}>
                     Add feeder
                   </button>
+                  <button
+                    className="btn"
+                    onClick={scanBus}
+                    disabled={scanning}
+                    title="Scan the RS-485 bus and map all Photon feeders"
+                  >
+                    {scanning ? "Scanning…" : "Scan bus"}
+                  </button>
                 </div>
               </div>
               {feeders.length === 0 ? (
@@ -1281,6 +1301,8 @@ function App() {
                     label="Part offset (within the slot)"
                     value={editFeeder.photon.offset}
                     onChange={(loc) => setPhotonField({ offset: loc })}
+                    onGo={(t) => moveToFeederLoc(t, "offset")}
+                    onCapture={(t) => captureFeederLoc(t, "offset")}
                   />
                 </>
               ) : editFeeder.tray ? (
