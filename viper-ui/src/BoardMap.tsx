@@ -4,6 +4,7 @@ export interface Placement {
   side: string | null;
   type: string;
   enabled: boolean;
+  errorHandling?: string;
   x: number;
   y: number;
   rot: number;

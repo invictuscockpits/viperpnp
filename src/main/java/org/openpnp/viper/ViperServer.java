@@ -9,6 +9,7 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 
+import org.openpnp.gui.importer.EagleMountsmdUlpImporter;
 import org.openpnp.gui.importer.KicadPosImporter;
 import org.openpnp.machine.photon.PhotonFeeder;
 import org.openpnp.machine.photon.PhotonProperties;
@@ -205,11 +206,15 @@ public class ViperServer {
         });
 
         app.post("/api/import/kicad", ViperServer::importKicad);
+        app.post("/api/import", ViperServer::importKicad);
         app.get("/api/job", ctx -> {
             ctx.contentType("application/json");
             ctx.result(GSON.toJson(describeJob(currentJob)));
         });
         app.post("/api/job/placement", ViperServer::updatePlacement);
+        app.post("/api/job/placement/add", ViperServer::addPlacement);
+        app.post("/api/job/placement/delete", ViperServer::deletePlacement);
+        app.post("/api/job/board-origin", ViperServer::setBoardOriginFromPlacement);
         app.post("/api/job/run", ViperServer::runJob);
         app.post("/api/job/abort", ViperServer::abortJob);
         app.get("/api/job/state", ctx -> {
@@ -535,15 +540,14 @@ public class ViperServer {
                 ctx.result("{\"error\":\"topFile is required\"}");
                 return;
             }
+            String fmt = req.format != null ? req.format.toLowerCase() : "kicad";
             Board board = new Board();
             board.setName(new File(req.topFile).getName());
-            for (Placement p : KicadPosImporter.parseFile(new File(req.topFile), Side.Top, true,
-                    req.createMissingParts, req.useValueOnly)) {
+            for (Placement p : parsePlacements(fmt, new File(req.topFile), Side.Top, req)) {
                 board.addPlacement(p);
             }
             if (req.bottomFile != null && !req.bottomFile.isEmpty()) {
-                for (Placement p : KicadPosImporter.parseFile(new File(req.bottomFile), Side.Bottom, true,
-                        req.createMissingParts, req.useValueOnly)) {
+                for (Placement p : parsePlacements(fmt, new File(req.bottomFile), Side.Bottom, req)) {
                     board.addPlacement(p);
                 }
             }
@@ -560,32 +564,60 @@ public class ViperServer {
         }
     }
 
+    /** Dispatches to the matching OpenPnP importer's headless parseFile. */
+    private static List<Placement> parsePlacements(String fmt, File file, Side side,
+            ImportRequest req) throws Exception {
+        switch (fmt) {
+            case "eagle":
+                return EagleMountsmdUlpImporter.parseFile(file, side, req.createMissingParts);
+            case "kicad":
+                return KicadPosImporter.parseFile(file, side, true,
+                        req.createMissingParts, req.useValueOnly);
+            default:
+                throw new Exception("Import format '" + fmt + "' is not supported yet.");
+        }
+    }
+
+    /** Finds a placement by id in the current job, or null. */
+    private static Placement findPlacement(String id) {
+        if (currentJob == null || id == null) {
+            return null;
+        }
+        for (BoardLocation bl : currentJob.getBoardLocations()) {
+            for (Placement p : bl.getBoard().getPlacements()) {
+                if (p.getId().equals(id)) {
+                    return p;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** The BoardLocation whose board contains the given placement, or null. */
+    private static BoardLocation findBoardLocation(String placementId) {
+        if (currentJob == null || placementId == null) {
+            return null;
+        }
+        for (BoardLocation bl : currentJob.getBoardLocations()) {
+            for (Placement p : bl.getBoard().getPlacements()) {
+                if (p.getId().equals(placementId)) {
+                    return bl;
+                }
+            }
+        }
+        return null;
+    }
+
     /**
-     * Updates a single placement in the current job (its Type and/or enabled
-     * flag) — the core of OpenPnP's board-input editor. Body: {id, type?,
-     * enabled?}. Returns the refreshed job.
+     * Updates a single placement in the current job — the core of OpenPnP's
+     * board-input editor. Body (all optional): {id, type, enabled, side,
+     * errorHandling, partId, x, y, rot}. Returns the refreshed job.
      */
     private static void updatePlacement(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
             PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
-            if (currentJob == null || req == null || req.id == null) {
-                ctx.status(400);
-                ctx.result("{\"error\":\"no job loaded or missing placement id\"}");
-                return;
-            }
-            Placement found = null;
-            for (BoardLocation bl : currentJob.getBoardLocations()) {
-                for (Placement p : bl.getBoard().getPlacements()) {
-                    if (p.getId().equals(req.id)) {
-                        found = p;
-                        break;
-                    }
-                }
-                if (found != null) {
-                    break;
-                }
-            }
+            Placement found = req != null ? findPlacement(req.id) : null;
             if (found == null) {
                 ctx.status(404);
                 ctx.result("{\"error\":\"placement not found\"}");
@@ -597,6 +629,24 @@ public class ViperServer {
             if (req.enabled != null) {
                 found.setEnabled(req.enabled);
             }
+            if (req.side != null) {
+                found.setSide(Side.valueOf(req.side));
+            }
+            if (req.errorHandling != null) {
+                found.setErrorHandling(Placement.ErrorHandling.valueOf(req.errorHandling));
+            }
+            if (req.partId != null) {
+                found.setPart(req.partId.isEmpty() ? null
+                        : Configuration.get().getPart(req.partId));
+            }
+            if (req.x != null || req.y != null || req.rot != null) {
+                Location l = found.getLocation().convertToUnits(LengthUnit.Millimeters);
+                found.setLocation(new Location(LengthUnit.Millimeters,
+                        req.x != null ? req.x : l.getX(),
+                        req.y != null ? req.y : l.getY(),
+                        l.getZ(),
+                        req.rot != null ? req.rot : l.getRotation()));
+            }
             ctx.result(GSON.toJson(describeJob(currentJob)));
         }
         catch (Exception e) {
@@ -605,11 +655,115 @@ public class ViperServer {
         }
     }
 
-    /** JSON body for POST /api/job/placement. */
+    /**
+     * POST /api/job/placement/add — adds a new placement to the first board.
+     * Body (optional): {id, partId}. Returns the refreshed job.
+     */
+    private static void addPlacement(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            if (currentJob == null || currentJob.getBoardLocations().isEmpty()) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"no board loaded\"}");
+                return;
+            }
+            PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
+            Board board = currentJob.getBoardLocations().get(0).getBoard();
+            String id = req != null && req.id != null && !req.id.trim().isEmpty()
+                    ? req.id.trim() : nextPlacementId(board);
+            Placement p = new Placement(id);
+            p.setSide(Side.Top);
+            p.setType(Placement.Type.Placement);
+            if (req != null && req.partId != null && !req.partId.isEmpty()) {
+                p.setPart(Configuration.get().getPart(req.partId));
+            }
+            board.addPlacement(p);
+            ctx.result(GSON.toJson(describeJob(currentJob)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** A unique reference like R1, R2 … for a newly added placement. */
+    private static String nextPlacementId(Board board) {
+        int n = board.getPlacements().size() + 1;
+        while (board.getPlacements().get("P" + n) != null) {
+            n++;
+        }
+        return "P" + n;
+    }
+
+    /** POST /api/job/placement/delete — removes a placement. Body: {id}. */
+    private static void deletePlacement(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
+            BoardLocation bl = req != null ? findBoardLocation(req.id) : null;
+            Placement found = req != null ? findPlacement(req.id) : null;
+            if (bl == null || found == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"placement not found\"}");
+                return;
+            }
+            bl.getBoard().removePlacement(found);
+            ctx.result(GSON.toJson(describeJob(currentJob)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/job/board-origin — sets the board origin so the given placement
+     * lands under the current camera. Body: {id}. We clear any fiducial-derived
+     * transform, then shift the board translation by (camera − current placement
+     * machine location), keeping board Z and rotation. A single point fixes the
+     * origin (translation); rotation still needs a second point / fiducials.
+     */
+    private static void setBoardOriginFromPlacement(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PlacementUpdate req = GSON.fromJson(ctx.body(), PlacementUpdate.class);
+            Placement p = req != null ? findPlacement(req.id) : null;
+            BoardLocation bl = req != null ? findBoardLocation(req.id) : null;
+            if (p == null || bl == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"placement not found\"}");
+                return;
+            }
+            Camera camera = machine.getDefaultHead().getDefaultCamera();
+            Location cam = camera.getLocation().convertToUnits(LengthUnit.Millimeters);
+            bl.setPlacementTransform(null);
+            Location current = Utils2D.calculateBoardPlacementLocation(bl, p)
+                    .convertToUnits(LengthUnit.Millimeters);
+            Location origin = bl.getLocation().convertToUnits(LengthUnit.Millimeters);
+            bl.setLocation(new Location(LengthUnit.Millimeters,
+                    origin.getX() + (cam.getX() - current.getX()),
+                    origin.getY() + (cam.getY() - current.getY()),
+                    origin.getZ(),
+                    origin.getRotation()));
+            ctx.result(GSON.toJson(describeJob(currentJob)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for placement endpoints. */
     private static class PlacementUpdate {
         String id;
         String type;
         Boolean enabled;
+        String side;
+        String errorHandling;
+        String partId;
+        Double x;
+        Double y;
+        Double rot;
     }
 
     /**
@@ -1793,6 +1947,8 @@ public class ViperServer {
                 pm.put("side", p.getSide() != null ? p.getSide().toString() : null);
                 pm.put("type", p.getType() != null ? p.getType().toString() : "Placement");
                 pm.put("enabled", p.isEnabled());
+                pm.put("errorHandling", p.getErrorHandling() != null
+                        ? p.getErrorHandling().toString() : "Default");
                 Location l = p.getLocation().convertToUnits(LengthUnit.Millimeters);
                 pm.put("x", round(l.getX()));
                 pm.put("y", round(l.getY()));
@@ -1817,6 +1973,7 @@ public class ViperServer {
 
     /** JSON body for POST /api/import/kicad. */
     private static class ImportRequest {
+        String format;
         String topFile;
         String bottomFile;
         boolean createMissingParts = true;

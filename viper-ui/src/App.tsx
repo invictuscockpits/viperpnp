@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { BoardMap, type Placement } from "./BoardMap";
 import {
   CameraIcon,
+  CrosshairIcon,
+  EyeIcon,
   GearIcon,
   NozzleIcon,
   SearchIcon,
@@ -149,6 +151,11 @@ interface SkippedPlacement {
 
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
 const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
+const IMPORT_FORMATS = [
+  { id: "kicad", label: "KiCad" },
+  { id: "eagle", label: "Eagle .mnt" },
+];
+const ERROR_HANDLING = ["Default", "Alert", "Defer"];
 
 type TeachTool = "camera" | "nozzle";
 type TeachTarget =
@@ -308,6 +315,11 @@ function App() {
   );
   const [importErr, setImportErr] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  const [importFormat, setImportFormat] = useState("kicad");
+  const [formatMenuOpen, setFormatMenuOpen] = useState(false);
+  const [placementsOpen, setPlacementsOpen] = useState(false);
+  const [selPlacement, setSelPlacement] = useState<string | null>(null);
+  const [editPlacement, setEditPlacement] = useState<Placement | null>(null);
   const [reference, setReference] = useState("camera");
   const [tab, setTab] = useState<Tab>("board");
   const [feeders, setFeeders] = useState<FeederInfo[]>([]);
@@ -481,10 +493,10 @@ function App() {
     setImporting(true);
     setImportErr(null);
     try {
-      const res = await fetch("/api/import/kicad", {
+      const res = await fetch("/api/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topFile: importPath }),
+        body: JSON.stringify({ format: importFormat, topFile: importPath }),
       });
       const data = await res.json();
       if (data && (data.event === "error" || data.error)) {
@@ -499,9 +511,45 @@ function App() {
     }
   };
 
+  const postJob = async (url: string, body: unknown) => {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data && (data.event === "error" || data.error)) {
+        setError(String(data.message ?? data.error));
+      } else {
+        setJob(data as JobInfo);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const addPlacement = () => postJob("/api/job/placement/add", {});
+  const deleteSelPlacement = () => {
+    if (!selPlacement) return;
+    postJob("/api/job/placement/delete", { id: selPlacement });
+    setSelPlacement(null);
+  };
+  const setBoardOrigin = (id: string) =>
+    postJob("/api/job/board-origin", { id });
+
   const updatePlacement = async (
     id: string,
-    patch: { type?: string; enabled?: boolean },
+    patch: {
+      type?: string;
+      enabled?: boolean;
+      side?: string;
+      errorHandling?: string;
+      partId?: string;
+      x?: number;
+      y?: number;
+      rot?: number;
+    },
   ) => {
     try {
       const res = await fetch("/api/job/placement", {
@@ -1185,14 +1233,55 @@ function App() {
                     className="import-input"
                     value={importPath}
                     onChange={(e) => setImportPath(e.currentTarget.value)}
-                    placeholder="path to a KiCad .pos on the server"
+                    placeholder="path to a board file on the server"
                   />
+                  <div className="split-btn">
+                    <button
+                      className="btn btn-primary split-main"
+                      onClick={doImport}
+                      disabled={importing}
+                    >
+                      {importing
+                        ? "Importing…"
+                        : `Import ${
+                            IMPORT_FORMATS.find((f) => f.id === importFormat)
+                              ?.label ?? "KiCad"
+                          }`}
+                    </button>
+                    <button
+                      className="btn btn-primary split-arrow"
+                      onClick={() => setFormatMenuOpen((o) => !o)}
+                      aria-label="Choose import format"
+                    >
+                      ▾
+                    </button>
+                    {formatMenuOpen && (
+                      <div className="split-menu">
+                        {IMPORT_FORMATS.map((f) => (
+                          <button
+                            key={f.id}
+                            className={`split-item ${
+                              f.id === importFormat ? "active" : ""
+                            }`}
+                            onClick={() => {
+                              setImportFormat(f.id);
+                              setFormatMenuOpen(false);
+                            }}
+                          >
+                            {f.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                   <button
-                    className="btn btn-primary"
-                    onClick={doImport}
-                    disabled={importing}
+                    className="btn btn-icon"
+                    onClick={() => setPlacementsOpen(true)}
+                    disabled={!job?.loaded}
+                    title="Open the placements list"
+                    aria-label="Open placements"
                   >
-                    {importing ? "Importing…" : "Import KiCad"}
+                    <EyeIcon size={17} />
                   </button>
                 </div>
               </div>
@@ -1242,62 +1331,7 @@ function App() {
                       <span className="lg lg-fid" /> Fiducial
                     </span>
                   </div>
-                  <div className="board-body">
-                    <div className="ptable-wrap">
-                      <table className="ptable">
-                        <thead>
-                          <tr>
-                            <th>On</th>
-                            <th>Ref</th>
-                            <th>Part</th>
-                            <th>Type</th>
-                            <th>X</th>
-                            <th>Y</th>
-                            <th>Rot</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {placements.map((p) => (
-                            <tr key={p.id} className={p.enabled ? "" : "row-off"}>
-                              <td>
-                                <input
-                                  type="checkbox"
-                                  checked={p.enabled}
-                                  onChange={(e) =>
-                                    updatePlacement(p.id, {
-                                      enabled: e.currentTarget.checked,
-                                    })
-                                  }
-                                />
-                              </td>
-                              <td className="mono">{p.id}</td>
-                              <td className="muted ptable-part">
-                                {p.part ?? "—"}
-                              </td>
-                              <td>
-                                <select
-                                  className="type-select"
-                                  value={p.type}
-                                  onChange={(e) =>
-                                    updatePlacement(p.id, {
-                                      type: e.currentTarget.value,
-                                    })
-                                  }
-                                >
-                                  <option value="Placement">Placement</option>
-                                  <option value="Fiducial">Fiducial</option>
-                                </select>
-                              </td>
-                              <td className="mono">{p.x.toFixed(2)}</td>
-                              <td className="mono">{p.y.toFixed(2)}</td>
-                              <td className="mono">{p.rot.toFixed(0)}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                    <BoardMap placements={placements} />
-                  </div>
+                  <BoardMap placements={placements} />
                 </>
               ) : (
                 <div className="muted">
@@ -1970,6 +2004,302 @@ function App() {
       {tip && (
         <div className="warn-tip-fixed" style={{ left: tip.x, top: tip.y }}>
           {tip.text}
+        </div>
+      )}
+
+      {placementsOpen && (
+        <div className="modal-backdrop" onClick={() => setPlacementsOpen(false)}>
+          <div
+            className="modal modal-wide"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3>Placements — {job?.boards?.[0]?.name ?? "board"}</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setPlacementsOpen(false)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="placements-toolbar">
+              <button className="btn btn-sm" onClick={addPlacement}>
+                + Add
+              </button>
+              <button
+                className="btn btn-sm btn-trash"
+                onClick={deleteSelPlacement}
+                disabled={!selPlacement}
+              >
+                <TrashIcon size={14} /> Delete
+              </button>
+              <span className="muted plc-count">
+                {placements.length} placements ·{" "}
+                {placements.filter((p) => p.type === "Fiducial").length}{" "}
+                fiducials
+              </span>
+            </div>
+            <div className="modal-body plc-body">
+              <table className="ptable">
+                <thead>
+                  <tr>
+                    <th>Active</th>
+                    <th>ID</th>
+                    <th>Part</th>
+                    <th>Side</th>
+                    <th>Type</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {placements.map((p) => (
+                    <tr
+                      key={p.id}
+                      className={`${p.enabled ? "" : "row-off"} ${
+                        selPlacement === p.id ? "row-sel" : ""
+                      }`}
+                      onClick={() => setSelPlacement(p.id)}
+                    >
+                      <td onClick={(e) => e.stopPropagation()}>
+                        <input
+                          type="checkbox"
+                          checked={p.enabled}
+                          onChange={(e) =>
+                            updatePlacement(p.id, {
+                              enabled: e.currentTarget.checked,
+                            })
+                          }
+                        />
+                      </td>
+                      <td className="mono">{p.id}</td>
+                      <td onClick={(e) => e.stopPropagation()}>
+                        <select
+                          className="type-select"
+                          value={p.part ?? ""}
+                          onChange={(e) =>
+                            updatePlacement(p.id, {
+                              partId: e.currentTarget.value,
+                            })
+                          }
+                        >
+                          <option value="">—</option>
+                          {parts.map((pt) => (
+                            <option key={pt} value={pt}>
+                              {pt}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td onClick={(e) => e.stopPropagation()}>
+                        <select
+                          className="type-select"
+                          value={p.side ?? "Top"}
+                          onChange={(e) =>
+                            updatePlacement(p.id, {
+                              side: e.currentTarget.value,
+                            })
+                          }
+                        >
+                          <option value="Top">Top</option>
+                          <option value="Bottom">Bottom</option>
+                        </select>
+                      </td>
+                      <td onClick={(e) => e.stopPropagation()}>
+                        <select
+                          className="type-select"
+                          value={p.type}
+                          onChange={(e) =>
+                            updatePlacement(p.id, {
+                              type: e.currentTarget.value,
+                            })
+                          }
+                        >
+                          <option value="Placement">Placement</option>
+                          <option value="Fiducial">Fiducial</option>
+                        </select>
+                      </td>
+                      <td onClick={(e) => e.stopPropagation()}>
+                        <button
+                          className="btn btn-sm btn-icon"
+                          onClick={() => setEditPlacement(p)}
+                          title="Edit placement"
+                          aria-label="Edit placement"
+                        >
+                          <GearIcon size={15} />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {editPlacement && (
+        <div className="modal-backdrop" onClick={() => setEditPlacement(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>
+                Placement — <span className="mono">{editPlacement.id}</span>
+              </h3>
+              <button
+                className="icon-btn"
+                onClick={() => setEditPlacement(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="field-row">
+                <label>Part</label>
+                <select
+                  className="type-select"
+                  value={editPlacement.part ?? ""}
+                  onChange={(e) =>
+                    setEditPlacement({
+                      ...editPlacement,
+                      part: e.currentTarget.value || null,
+                    })
+                  }
+                >
+                  <option value="">—</option>
+                  {parts.map((pt) => (
+                    <option key={pt} value={pt}>
+                      {pt}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field-grid">
+                <label className="loc-field">
+                  <span>Side</span>
+                  <select
+                    className="type-select"
+                    value={editPlacement.side ?? "Top"}
+                    onChange={(e) =>
+                      setEditPlacement({
+                        ...editPlacement,
+                        side: e.currentTarget.value,
+                      })
+                    }
+                  >
+                    <option value="Top">Top</option>
+                    <option value="Bottom">Bottom</option>
+                  </select>
+                </label>
+                <label className="loc-field">
+                  <span>Type</span>
+                  <select
+                    className="type-select"
+                    value={editPlacement.type}
+                    onChange={(e) =>
+                      setEditPlacement({
+                        ...editPlacement,
+                        type: e.currentTarget.value,
+                      })
+                    }
+                  >
+                    <option value="Placement">Placement</option>
+                    <option value="Fiducial">Fiducial</option>
+                  </select>
+                </label>
+                <label className="loc-field">
+                  <span>Error handling</span>
+                  <select
+                    className="type-select"
+                    value={editPlacement.errorHandling ?? "Default"}
+                    onChange={(e) =>
+                      setEditPlacement({
+                        ...editPlacement,
+                        errorHandling: e.currentTarget.value,
+                      })
+                    }
+                  >
+                    {ERROR_HANDLING.map((eh) => (
+                      <option key={eh} value={eh}>
+                        {eh}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div className="field-grid">
+                <label className="loc-field">
+                  <span>X (mm)</span>
+                  <NumberInput
+                    step={0.01}
+                    value={editPlacement.x}
+                    onChange={(v) =>
+                      setEditPlacement({ ...editPlacement, x: v })
+                    }
+                  />
+                </label>
+                <label className="loc-field">
+                  <span>Y (mm)</span>
+                  <NumberInput
+                    step={0.01}
+                    value={editPlacement.y}
+                    onChange={(v) =>
+                      setEditPlacement({ ...editPlacement, y: v })
+                    }
+                  />
+                </label>
+                <label className="loc-field">
+                  <span>Rotation°</span>
+                  <NumberInput
+                    value={editPlacement.rot}
+                    onChange={(v) =>
+                      setEditPlacement({ ...editPlacement, rot: v })
+                    }
+                  />
+                </label>
+              </div>
+              <div className="teach-block">
+                <div className="teach-head">
+                  Jog the camera over this part on the board, then set the board
+                  origin from it (fixes translation; rotation still needs
+                  fiducials).
+                </div>
+                <div className="teach-actions">
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => setBoardOrigin(editPlacement.id)}
+                  >
+                    <CrosshairIcon size={14} /> Set board origin from camera
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div className="modal-foot">
+              <button
+                className="btn"
+                onClick={() => setEditPlacement(null)}
+              >
+                Close
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  updatePlacement(editPlacement.id, {
+                    partId: editPlacement.part ?? "",
+                    side: editPlacement.side ?? "Top",
+                    type: editPlacement.type,
+                    errorHandling: editPlacement.errorHandling ?? "Default",
+                    x: editPlacement.x,
+                    y: editPlacement.y,
+                    rot: editPlacement.rot,
+                  });
+                  setEditPlacement(null);
+                }}
+              >
+                Save
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

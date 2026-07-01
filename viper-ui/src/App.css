@@ -712,6 +712,94 @@ body {
   width: 360px;
 }
 
+.modal-wide {
+  width: 620px;
+  max-width: 94vw;
+}
+
+/* Split import button */
+.split-btn {
+  position: relative;
+  display: inline-flex;
+}
+
+.split-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.split-arrow {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid rgba(0, 0, 0, 0.25);
+  padding: 0.5rem 0.5rem;
+}
+
+.split-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.5);
+  min-width: 130px;
+  overflow: hidden;
+}
+
+.split-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text);
+  padding: 0.5rem 0.7rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.split-item:hover {
+  background: var(--panel);
+  color: var(--green);
+}
+
+.split-item.active {
+  color: var(--green);
+}
+
+.placements-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.placements-toolbar .btn-trash {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.plc-count {
+  margin-left: auto;
+  font-size: 0.8rem;
+}
+
+.plc-body {
+  max-height: 60vh;
+}
+
+.ptable tr.row-sel td {
+  background: var(--green-dim);
+}
+
+.ptable tbody tr {
+  cursor: pointer;
+}
+
 .confirm-text {
   margin: 0;
   font-size: 0.9rem;
