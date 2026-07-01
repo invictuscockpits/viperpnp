@@ -108,6 +108,16 @@ public abstract class CsvImporter {
     // the selected file.
     public Board importBoard(Frame parent) throws Exception {
     	// get strings to parse CSV context
+    	initPatterns();
+
+    	// open the file import dialog
+        Dlg dlg = new Dlg(parent);
+        dlg.setVisible(true);
+        return board;
+    }
+
+    /** Loads the column-detection patterns; call before {@link #parseCsv}. */
+    private void initPatterns() {
     	referencePattern = getReferencePattern();
     	valuePattern     = getValuePattern();
     	packagePattern   = getPackagePattern();
@@ -117,11 +127,17 @@ public abstract class CsvImporter {
     	sidePattern      = getSidePattern();
     	heightPattern    = getHeightPattern();
     	commentPattern   = getCommentPattern();
+    }
 
-    	// open the file import dialog
-        Dlg dlg = new Dlg(parent);
-        dlg.setVisible(true);
-        return board;
+    /**
+     * Headless centroid-CSV parse: detects the columns from the header (per this
+     * importer's patterns) and returns the placements, with each placement's Side
+     * read from the file. No Swing dialog — the counterpart to
+     * {@link #importBoard(Frame)}.
+     */
+    public List<Placement> parseCsv(File file, boolean createMissingParts) throws Exception {
+        initPatterns();
+        return parseFile(file, createMissingParts, false);
     }
 
     // the following variable will contain the column indexes in which that data has

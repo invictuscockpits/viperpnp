@@ -153,6 +153,7 @@ const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
 const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
 const IMPORT_FORMATS = [
   { id: "kicad", label: "KiCad" },
+  { id: "csv", label: "CSV (centroid)" },
   { id: "eagle", label: "Eagle .mnt" },
 ];
 const ERROR_HANDLING = ["Default", "Alert", "Defer"];

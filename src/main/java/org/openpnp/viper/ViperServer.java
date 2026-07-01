@@ -11,6 +11,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import org.openpnp.gui.importer.EagleMountsmdUlpImporter;
 import org.openpnp.gui.importer.KicadPosImporter;
+import org.openpnp.gui.importer.ReferenceCsvImporter;
 import org.openpnp.machine.photon.PhotonFeeder;
 import org.openpnp.machine.photon.PhotonProperties;
 import org.openpnp.machine.reference.ReferenceFeeder;
@@ -570,6 +571,10 @@ public class ViperServer {
         switch (fmt) {
             case "eagle":
                 return EagleMountsmdUlpImporter.parseFile(file, side, req.createMissingParts);
+            case "csv":
+                // A centroid CSV carries each part's side, so it is parsed once
+                // (the per-file side is ignored); columns are auto-detected.
+                return new ReferenceCsvImporter().parseCsv(file, req.createMissingParts);
             case "kicad":
                 return KicadPosImporter.parseFile(file, side, true,
                         req.createMissingParts, req.useValueOnly);

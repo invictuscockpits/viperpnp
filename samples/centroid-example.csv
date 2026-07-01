@@ -1,0 +1,6 @@
+Designator,Val,Package,PosX,PosY,Rot,Layer
+R1,10k,0402,10.5,20.3,90,Top
+C1,100nF,0603,15.0,-5.0,0,Top
+R2,4k7,0402,30.0,20.0,180,Bottom
+U1,ATMEGA328,QFP32,25.0,25.0,45,Top
+FID1,,FIDUCIAL,0,0,0,Top
