@@ -1,5 +1,8 @@
 package org.openpnp.viper;
 
+import java.awt.geom.AffineTransform;
+import java.awt.geom.NoninvertibleTransformException;
+import java.awt.geom.Point2D;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -39,10 +42,13 @@ import org.openpnp.model.Motion.MotionOption;
 import org.openpnp.model.Package;
 import org.openpnp.model.Part;
 import org.openpnp.model.Placement;
+import org.openpnp.model.PlacementsHolderLocation;
+import org.openpnp.model.PlacementsHolderLocation.PlacementsTransformStatus;
 import org.openpnp.spi.Actuator;
 import org.openpnp.spi.Axis;
 import org.openpnp.spi.base.AbstractHead;
 import org.openpnp.spi.Camera;
+import org.openpnp.spi.FiducialLocator;
 import org.openpnp.spi.Driver;
 import org.openpnp.spi.Feeder;
 import org.openpnp.spi.Head;
@@ -280,6 +286,12 @@ public class ViperServer {
         app.post("/api/job/board", ViperServer::updateJobBoard);
         app.post("/api/job/board/move", ViperServer::moveToJobBoard);
         app.post("/api/job/board/capture", ViperServer::captureJobBoard);
+        app.post("/api/job/board/fiducials", ViperServer::jobBoardFiducials);
+        app.post("/api/job/board/align/go", ViperServer::alignGo);
+        app.post("/api/job/board/align/capture", ViperServer::alignCapture);
+        app.post("/api/job/board/align/auto", ViperServer::alignAuto);
+        app.post("/api/job/board/align/clear", ViperServer::alignClear);
+        app.post("/api/job/board/align", ViperServer::alignBoard);
         app.get("/api/job/state", ctx -> {
             Map<String, Object> s = new LinkedHashMap<>();
             s.put("running", jobRunning);
@@ -2876,6 +2888,18 @@ public class ViperServer {
         m.put("z", round(loc.getZ()));
         m.put("rotation", round(loc.getRotation()));
         m.put("placements", b.getPlacements().size());
+        int fidCount = 0;
+        for (Placement p : b.getPlacements()) {
+            if (p.getType() == Placement.Type.Fiducial) {
+                fidCount++;
+            }
+        }
+        m.put("fiducialCount", fidCount);
+        boolean aligned = bl.getPlacementsTransformStatus() == PlacementsTransformStatus.LocallySet;
+        m.put("aligned", aligned);
+        if (aligned) {
+            m.put("alignAngle", round(Utils2D.affineInfo(bl.getPlacementTransform()).rotationAngleDeg));
+        }
         return m;
     }
 
@@ -3093,12 +3117,234 @@ public class ViperServer {
         String uid;
         String tool;
         String side;
+        String placementId;
         Double x;
         Double y;
         Double z;
         Double rotation;
         Boolean enabled;
         Boolean checkFids;
+    }
+
+    // ---------------------------------------------- Fiducial alignment
+
+    /** POST /api/job/board/fiducials — Body: {file, uid}. The board's fiducials (design coords). */
+    private static void jobBoardFiducials(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+        Job j = req != null ? findJob(req.file) : null;
+        BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+        if (bl == null) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"board location not found\"}");
+            return;
+        }
+        List<Map<String, Object>> fids = new ArrayList<>();
+        for (Placement p : bl.getBoard().getPlacements()) {
+            if (p.getType() != Placement.Type.Fiducial) {
+                continue;
+            }
+            Location loc = p.getLocation().convertToUnits(LengthUnit.Millimeters);
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", p.getId());
+            m.put("x", round(loc.getX()));
+            m.put("y", round(loc.getY()));
+            m.put("part", p.getPart() != null ? p.getPart().getId() : null);
+            fids.add(m);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("fiducials", fids);
+        root.put("aligned", bl.getPlacementsTransformStatus() == PlacementsTransformStatus.LocallySet);
+        ctx.result(GSON.toJson(root));
+    }
+
+    /** POST /api/job/board/align/go — jog the camera to a fiducial's expected machine location. */
+    private static void alignGo(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+        Job j = req != null ? findJob(req.file) : null;
+        BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+        Placement p = bl != null ? bl.getBoard().getPlacements().get(req.placementId) : null;
+        if (bl == null || p == null) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"board location or fiducial not found\"}");
+            return;
+        }
+        final Location target = Utils2D.calculateBoardPlacementLocation(bl, p);
+        machine.submit(() -> {
+            Camera cam = machine.getDefaultHead().getDefaultCamera();
+            MovableUtils.moveToLocationAtSafeZ(cam, target);
+            return null;
+        }, broadcastCallback());
+        ctx.result("{\"submitted\":true}");
+    }
+
+    /** POST /api/job/board/align/capture — read the current camera position (a measured fiducial). */
+    private static void alignCapture(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+            Camera cam = machine.getDefaultHead().getDefaultCamera();
+            Location loc = cam.getLocation().convertToUnits(LengthUnit.Millimeters);
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("placementId", req != null ? req.placementId : null);
+            m.put("x", round(loc.getX()));
+            m.put("y", round(loc.getY()));
+            ctx.result(GSON.toJson(m));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/job/board/align — compute and apply the board's placement transform from
+     * measured fiducial positions. Body: {file, uid, points:[{placementId, x, y}]} (>=2 points,
+     * x/y are measured machine coords in mm). Mirrors MultiPlacementBoardLocationProcess.
+     */
+    private static void alignBoard(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            AlignRequest req = GSON.fromJson(ctx.body(), AlignRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+            if (bl == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"board location not found\"}");
+                return;
+            }
+            if (req.points == null || req.points.size() < 2) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"need at least 2 measured fiducials\"}");
+                return;
+            }
+            Board board = bl.getBoard();
+            List<Location> expected = new ArrayList<>();
+            List<Location> measured = new ArrayList<>();
+            for (AlignPoint pt : req.points) {
+                Placement p = board.getPlacements().get(pt.placementId);
+                if (p == null) {
+                    continue;
+                }
+                expected.add(p.getLocation());
+                measured.add(new Location(LengthUnit.Millimeters, pt.x, pt.y, 0, 0));
+            }
+            if (expected.size() < 2) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"fiducials not found on board\"}");
+                return;
+            }
+            AffineTransform tx = Utils2D.deriveAffineTransform(expected, measured);
+            if (bl.getGlobalSide() == Side.Bottom) {
+                tx.scale(-1, 1);
+            }
+            bl.setLocalToGlobalTransform(tx);
+            // Recompute the board origin from the transform (mirrors the OpenPnP process).
+            Location origin = new Location(LengthUnit.Millimeters);
+            if (bl.getGlobalSide() == Side.Bottom && board.getDimensions() != null) {
+                origin = origin.add(board.getDimensions().derive(null, 0., 0., 0.));
+            }
+            double keepZ = bl.getLocation() != null
+                    ? bl.getLocation().convertToUnits(LengthUnit.Millimeters).getZ() : 0;
+            Location newLoc = Utils2D.calculateBoardPlacementLocation(bl, origin)
+                    .convertToUnits(LengthUnit.Millimeters).derive(null, null, keepZ, null);
+            bl.setLocation(newLoc);
+            bl.setLocalToGlobalTransform(tx); // setLocation cleared it — set again
+            j.setDirty(true);
+
+            // Residual: worst gap between a measured point and the transformed design point.
+            double residual = 0;
+            for (int i = 0; i < expected.size(); i++) {
+                Location e = expected.get(i).convertToUnits(LengthUnit.Millimeters);
+                Point2D dst = new Point2D.Double();
+                tx.transform(new Point2D.Double(e.getX(), e.getY()), dst);
+                Location mm = measured.get(i);
+                residual = Math.max(residual, Math.hypot(dst.getX() - mm.getX(), dst.getY() - mm.getY()));
+            }
+            Utils2D.AffineInfo ai = Utils2D.affineInfo(tx);
+            Map<String, Object> resp = describeJobBoards(j);
+            Map<String, Object> align = new LinkedHashMap<>();
+            align.put("angle", round(ai.rotationAngleDeg));
+            align.put("xTranslation", round(ai.xTranslation));
+            align.put("yTranslation", round(ai.yTranslation));
+            align.put("xScale", round(ai.xScale));
+            align.put("yScale", round(ai.yScale));
+            align.put("residual", round(residual));
+            align.put("points", expected.size());
+            resp.put("align", align);
+            ctx.result(GSON.toJson(resp));
+        }
+        catch (NoninvertibleTransformException e) {
+            ctx.status(400);
+            ctx.result("{\"error\":\"fiducials are collinear or coincident — pick spread-out points\"}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/job/board/align/auto — locate fiducials by camera vision and set the transform. */
+    private static void alignAuto(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+            if (bl == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"board location not found\"}");
+                return;
+            }
+            FiducialLocator locator = machine.getFiducialLocator();
+            final BoardLocation target = bl;
+            machine.submit(() -> {
+                locator.locatePlacementsHolder(target);
+                return null;
+            }, broadcastCallback());
+            j.setDirty(true);
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/job/board/align/clear — drop the placement transform (back to nominal position). */
+    private static void alignClear(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+            if (bl == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"board location not found\"}");
+                return;
+            }
+            bl.setPlacementTransform(null);
+            j.setDirty(true);
+            ctx.result(GSON.toJson(describeJobBoards(j)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/job/board/align. */
+    private static class AlignRequest {
+        String file;
+        String uid;
+        List<AlignPoint> points;
+    }
+
+    private static class AlignPoint {
+        String placementId;
+        double x;
+        double y;
     }
 
     /** Marks the config as having unsaved changes and notifies clients. */

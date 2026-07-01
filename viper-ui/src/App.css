@@ -1426,6 +1426,42 @@ input[type="number"] {
   margin-right: auto;
 }
 
+.align-panel {
+  margin-top: 0.6rem;
+}
+
+.align-fid-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  flex-wrap: wrap;
+  font-size: 0.82rem;
+}
+
+.align-fid-id {
+  min-width: 3rem;
+  font-weight: 600;
+}
+
+.align-fid-xy {
+  min-width: 8rem;
+  font-size: 0.76rem;
+}
+
+.align-fid-cap {
+  font-size: 0.76rem;
+  color: var(--muted);
+}
+
+.align-fid-cap.ok {
+  color: var(--green);
+}
+
+.align-actions {
+  margin-top: 0.5rem;
+}
+
 .detect-grp {
   border-left: 2px solid var(--border);
   padding-left: 0.7rem;

@@ -159,6 +159,9 @@ interface JobBoardLoc {
   z: number;
   rotation: number;
   placements: number;
+  fiducialCount: number;
+  aligned: boolean;
+  alignAngle?: number;
 }
 
 interface PartInfo {
@@ -549,6 +552,18 @@ function App() {
     [],
   );
   const [addBoardSel, setAddBoardSel] = useState("");
+  const [alignUid, setAlignUid] = useState<string | null>(null);
+  const [alignFids, setAlignFids] = useState<
+    { id: string; x: number; y: number; part: string | null }[]
+  >([]);
+  const [alignMeasured, setAlignMeasured] = useState<
+    Record<string, { x: number; y: number }>
+  >({});
+  const [alignResult, setAlignResult] = useState<{
+    angle: number;
+    residual: number;
+    points: number;
+  } | null>(null);
   const [jobRunning, setJobRunning] = useState(false);
   const [jobStatus, setJobStatus] = useState("");
   const [keepGoing, setKeepGoing] = useState(true);
@@ -785,6 +800,95 @@ function App() {
         if (d.boards) applyJobBoards(d);
       })
       .catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
+  };
+
+  const openAlign = async (uid: string) => {
+    if (!jobEditFile) return;
+    setJobErr("");
+    setAlignMeasured({});
+    setAlignResult(null);
+    try {
+      const d = await (
+        await fetch("/api/job/board/fiducials", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file: jobEditFile, uid }),
+        })
+      ).json();
+      setAlignFids(d.fiducials ?? []);
+      setAlignUid(uid);
+    } catch (e) {
+      setJobErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const alignGo = (placementId: string) => {
+    if (!jobEditFile || !alignUid) return;
+    fetch("/api/job/board/align/go", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file: jobEditFile, uid: alignUid, placementId }),
+    }).catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
+  };
+
+  const alignCapture = async (placementId: string) => {
+    if (!jobEditFile || !alignUid) return;
+    try {
+      const d = await (
+        await fetch("/api/job/board/align/capture", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file: jobEditFile, uid: alignUid, placementId }),
+        })
+      ).json();
+      setAlignMeasured((m) => ({ ...m, [placementId]: { x: d.x, y: d.y } }));
+    } catch (e) {
+      setJobErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const computeAlign = async () => {
+    if (!jobEditFile || !alignUid) return;
+    const points = Object.entries(alignMeasured).map(([placementId, p]) => ({
+      placementId,
+      x: p.x,
+      y: p.y,
+    }));
+    if (points.length < 2) {
+      setJobErr("Capture at least 2 fiducials first.");
+      return;
+    }
+    try {
+      const res = await fetch("/api/job/board/align", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: jobEditFile, uid: alignUid, points }),
+      });
+      const d = await res.json();
+      if (!res.ok) {
+        setJobErr(d.error ?? "Alignment failed.");
+        return;
+      }
+      applyJobBoards(d);
+      loadJobs();
+      if (d.align) setAlignResult(d.align);
+    } catch (e) {
+      setJobErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const autoAlign = (uid: string) => {
+    if (!jobEditFile) return;
+    postJobBoard("/api/job/board/align/auto", { file: jobEditFile, uid });
+  };
+
+  const clearAlign = (uid: string) => {
+    if (!jobEditFile) return;
+    postJobBoard("/api/job/board/align/clear", { file: jobEditFile, uid });
+    if (alignUid === uid) {
+      setAlignMeasured({});
+      setAlignResult(null);
+    }
   };
 
   const runJob = async () => {
@@ -5258,7 +5362,13 @@ function App() {
                   <div key={b.uid} className="teach-block">
                     <div className="teach-head">
                       <span className="mono">{b.boardName}</span> ·{" "}
-                      {b.placements} placements
+                      {b.placements} placements · {b.fiducialCount} fiducial
+                      {b.fiducialCount === 1 ? "" : "s"}
+                      {b.aligned && (
+                        <span className="job-active-tag" title="Fiducial-aligned">
+                          aligned {b.alignAngle}°
+                        </span>
+                      )}
                       <button
                         className="btn btn-sm btn-icon btn-trash jb-remove"
                         onClick={() => removeBoardFromJob(b.uid)}
@@ -5359,7 +5469,118 @@ function App() {
                         />
                         Check fiducials
                       </label>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() =>
+                          alignUid === b.uid
+                            ? setAlignUid(null)
+                            : openAlign(b.uid)
+                        }
+                        title="Locate this board by its fiducials (rotation + offset)"
+                      >
+                        <CrosshairIcon size={13} />{" "}
+                        {alignUid === b.uid ? "Close align" : "Align…"}
+                      </button>
                     </div>
+
+                    {alignUid === b.uid && (
+                      <div className="detect-grp align-panel">
+                        <div className="detect-title">
+                          Fiducial alignment — capture ≥2 fiducials, then compute
+                        </div>
+                        {alignFids.length === 0 ? (
+                          <div className="muted">
+                            No fiducials on this board. Mark placements as type
+                            Fiducial in the board's placements editor (IDs
+                            starting FID are auto-labeled).
+                          </div>
+                        ) : (
+                          <>
+                            {alignFids.map((f) => {
+                              const cap = alignMeasured[f.id];
+                              return (
+                                <div key={f.id} className="align-fid-row">
+                                  <span className="mono align-fid-id">
+                                    {f.id}
+                                  </span>
+                                  <span className="muted align-fid-xy">
+                                    design ({f.x}, {f.y})
+                                  </span>
+                                  <button
+                                    className="btn btn-sm"
+                                    onClick={() => alignGo(f.id)}
+                                    title="Jog camera to where this fiducial is expected"
+                                  >
+                                    <CrosshairIcon size={12} /> Go
+                                  </button>
+                                  <button
+                                    className="btn btn-sm"
+                                    onClick={() => alignCapture(f.id)}
+                                    title="Capture the current camera position for this fiducial"
+                                  >
+                                    <CameraIcon size={12} /> Capture
+                                  </button>
+                                  <span
+                                    className={`align-fid-cap ${
+                                      cap ? "ok" : ""
+                                    }`}
+                                  >
+                                    {cap
+                                      ? `✓ (${cap.x}, ${cap.y})`
+                                      : "not captured"}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                            <div className="teach-actions align-actions">
+                              <button
+                                className="btn btn-sm btn-primary"
+                                onClick={computeAlign}
+                                disabled={
+                                  Object.keys(alignMeasured).length < 2
+                                }
+                              >
+                                Compute alignment (
+                                {Object.keys(alignMeasured).length})
+                              </button>
+                              <button
+                                className="btn btn-sm"
+                                onClick={() => autoAlign(b.uid)}
+                                disabled={!enabled}
+                                title="Auto-locate fiducials by camera vision (needs the machine + configured fiducial vision)"
+                              >
+                                Auto (vision)
+                              </button>
+                              {b.aligned && (
+                                <button
+                                  className="btn btn-sm"
+                                  onClick={() => clearAlign(b.uid)}
+                                  title="Remove the alignment transform"
+                                >
+                                  Clear
+                                </button>
+                              )}
+                            </div>
+                            {alignResult && (
+                              <div
+                                className={`banner ${
+                                  alignResult.residual > 0.5
+                                    ? "banner-warn"
+                                    : "banner-ok"
+                                }`}
+                              >
+                                Aligned from {alignResult.points} fiducials —
+                                rotation {alignResult.angle}°, residual{" "}
+                                {alignResult.residual} mm
+                                {alignResult.residual > 0.5
+                                  ? " (high — re-capture more carefully)"
+                                  : "."}
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    )}
                   </div>
                 ))
               )}
