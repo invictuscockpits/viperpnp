@@ -1347,6 +1347,16 @@ input[type="number"] {
   vertical-align: middle;
 }
 
+.jb-remove {
+  margin-left: 0.6rem;
+  vertical-align: middle;
+}
+
+.job-save-note {
+  font-size: 0.72rem;
+  margin-right: auto;
+}
+
 .detect-grp {
   border-left: 2px solid var(--border);
   padding-left: 0.7rem;

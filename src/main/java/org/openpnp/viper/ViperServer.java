@@ -274,6 +274,12 @@ public class ViperServer {
         app.post("/api/jobs/save", ViperServer::saveJob);
         app.post("/api/jobs/remove", ViperServer::removeJob);
         app.post("/api/jobs/rename", ViperServer::renameJob);
+        app.post("/api/job/boards", ViperServer::jobBoards);
+        app.post("/api/job/board/add", ViperServer::addJobBoard);
+        app.post("/api/job/board/remove", ViperServer::removeJobBoard);
+        app.post("/api/job/board", ViperServer::updateJobBoard);
+        app.post("/api/job/board/move", ViperServer::moveToJobBoard);
+        app.post("/api/job/board/capture", ViperServer::captureJobBoard);
         app.get("/api/job/state", ctx -> {
             Map<String, Object> s = new LinkedHashMap<>();
             s.put("running", jobRunning);
@@ -2848,6 +2854,251 @@ public class ViperServer {
         String file;
         String name;
         String savePath;
+    }
+
+    // ----------------------------------------------- Job board locations
+
+    /** A board location's editable state (position on the machine, side, flags). */
+    private static Map<String, Object> boardLocMap(BoardLocation bl) {
+        Board b = bl.getBoard();
+        Location loc = bl.getLocation() != null
+                ? bl.getLocation().convertToUnits(LengthUnit.Millimeters)
+                : new Location(LengthUnit.Millimeters);
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("uid", bl.getUniqueId());
+        m.put("boardFile", b.getFile() != null ? b.getFile().getAbsolutePath() : null);
+        m.put("boardName", b.getName());
+        m.put("side", bl.getGlobalSide().toString());
+        m.put("enabled", bl.isEnabled());
+        m.put("checkFids", bl.isCheckFiducials());
+        m.put("x", round(loc.getX()));
+        m.put("y", round(loc.getY()));
+        m.put("z", round(loc.getZ()));
+        m.put("rotation", round(loc.getRotation()));
+        m.put("placements", b.getPlacements().size());
+        return m;
+    }
+
+    /** The editable board-location list for a job + the library boards available to add. */
+    private static Map<String, Object> describeJobBoards(Job job) {
+        List<Map<String, Object>> boards = new ArrayList<>();
+        for (BoardLocation bl : job.getBoardLocations()) {
+            boards.add(boardLocMap(bl));
+        }
+        List<Map<String, Object>> lib = new ArrayList<>();
+        for (Board b : Configuration.get().getBoards()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("file", b.getFile() != null ? b.getFile().getAbsolutePath() : null);
+            m.put("name", b.getName());
+            lib.add(m);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("file", job.getFile() != null ? job.getFile().getAbsolutePath() : null);
+        root.put("name", jobName(job.getFile()));
+        root.put("boards", boards);
+        root.put("library", lib);
+        return root;
+    }
+
+    private static BoardLocation findBoardLoc(Job job, String uid) {
+        if (job == null || uid == null) {
+            return null;
+        }
+        for (BoardLocation bl : job.getBoardLocations()) {
+            if (uid.equals(bl.getUniqueId())) {
+                return bl;
+            }
+        }
+        return null;
+    }
+
+    /** POST /api/job/boards — Body: {file}. Editable board-location list for a job. */
+    private static void jobBoards(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        JobFileRequest req = GSON.fromJson(ctx.body(), JobFileRequest.class);
+        Job j = req != null ? findJob(req.file) : null;
+        if (j == null) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"job not found\"}");
+            return;
+        }
+        ctx.result(GSON.toJson(describeJobBoards(j)));
+    }
+
+    /** POST /api/job/board/add — Body: {file, boardFile}. Adds a library board to the job. */
+    private static void addJobBoard(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            Board b = req != null ? findBoard(req.boardFile) : null;
+            if (j == null || b == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"job or board not found\"}");
+                return;
+            }
+            BoardLocation bl = new BoardLocation(b);
+            bl.setGlobalSide(Side.Top);
+            bl.setLocation(new Location(LengthUnit.Millimeters));
+            j.addBoardOrPanelLocation(bl);
+            j.setDirty(true);
+            syncJob();
+            ctx.result(GSON.toJson(describeJobBoards(j)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/job/board/remove — Body: {file, uid}. Rebuilds the job without that board. */
+    private static void removeJobBoard(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+            Job src = req != null ? findJob(req.file) : null;
+            BoardLocation drop = findBoardLoc(src, req != null ? req.uid : null);
+            if (src == null || drop == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"job or board location not found\"}");
+                return;
+            }
+            // BoardLocation removal must avoid removeBoardOrPanelLocation, whose
+            // dispose() pokes the (null, headless) Swing job tab — rebuild instead.
+            Job nj = new Job();
+            nj.setFile(src.getFile());
+            for (BoardLocation bl : src.getBoardLocations()) {
+                if (bl == drop) {
+                    continue;
+                }
+                BoardLocation nb = new BoardLocation(bl.getBoard());
+                nb.setLocation(bl.getLocation());
+                nb.setGlobalSide(bl.getGlobalSide());
+                nb.setLocallyEnabled(bl.isEnabled());
+                nb.setCheckFiducials(bl.isCheckFiducials());
+                nb.setPlacementTransform(bl.getPlacementTransform());
+                nj.addBoardOrPanelLocation(nb);
+            }
+            nj.setDirty(true);
+            int idx = jobLibrary.indexOf(src);
+            if (idx >= 0) {
+                jobLibrary.set(idx, nj);
+            }
+            syncJob();
+            ctx.result(GSON.toJson(describeJobBoards(nj)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/job/board — Body: {file, uid, x?, y?, z?, rotation?, side?, enabled?, checkFids?}. */
+    private static void updateJobBoard(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+            if (bl == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"board location not found\"}");
+                return;
+            }
+            if (req.side != null) {
+                bl.setGlobalSide("Bottom".equalsIgnoreCase(req.side) ? Side.Bottom : Side.Top);
+            }
+            if (req.enabled != null) {
+                bl.setLocallyEnabled(req.enabled);
+            }
+            if (req.checkFids != null) {
+                bl.setCheckFiducials(req.checkFids);
+            }
+            if (req.x != null || req.y != null || req.z != null || req.rotation != null) {
+                Location cur = bl.getLocation() != null
+                        ? bl.getLocation().convertToUnits(LengthUnit.Millimeters)
+                        : new Location(LengthUnit.Millimeters);
+                bl.setLocation(new Location(LengthUnit.Millimeters,
+                        req.x != null ? req.x : cur.getX(),
+                        req.y != null ? req.y : cur.getY(),
+                        req.z != null ? req.z : cur.getZ(),
+                        req.rotation != null ? req.rotation : cur.getRotation()));
+            }
+            j.setDirty(true);
+            ctx.result(GSON.toJson(describeJobBoards(j)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/job/board/move — jog a tool to a board-location origin at safe Z. Body: {file, uid, tool}. */
+    private static void moveToJobBoard(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+        Job j = req != null ? findJob(req.file) : null;
+        BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+        if (bl == null) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"board location not found\"}");
+            return;
+        }
+        final Location target = bl.getLocation();
+        final boolean nozzle = "nozzle".equalsIgnoreCase(req.tool);
+        machine.submit(() -> {
+            Head head = machine.getDefaultHead();
+            HeadMountable hm = nozzle ? head.getDefaultNozzle() : head.getDefaultCamera();
+            MovableUtils.moveToLocationAtSafeZ(hm, target);
+            return null;
+        }, broadcastCallback());
+        ctx.result("{\"submitted\":true}");
+    }
+
+    /** POST /api/job/board/capture — set a board-location origin from the current tool position. */
+    private static void captureJobBoard(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+            if (bl == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"board location not found\"}");
+                return;
+            }
+            Head head = machine.getDefaultHead();
+            boolean nozzle = "nozzle".equalsIgnoreCase(req.tool);
+            HeadMountable hm = nozzle ? head.getDefaultNozzle() : head.getDefaultCamera();
+            Location cur = hm.getLocation().convertToUnits(LengthUnit.Millimeters);
+            Location prior = bl.getLocation() != null
+                    ? bl.getLocation().convertToUnits(LengthUnit.Millimeters)
+                    : cur;
+            double z = nozzle ? cur.getZ() : prior.getZ();
+            bl.setLocation(new Location(LengthUnit.Millimeters, cur.getX(), cur.getY(), z,
+                    prior.getRotation()));
+            j.setDirty(true);
+            ctx.result(GSON.toJson(describeJobBoards(j)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for job board-location endpoints. */
+    private static class JobBoardRequest {
+        String file;
+        String boardFile;
+        String uid;
+        String tool;
+        String side;
+        Double x;
+        Double y;
+        Double z;
+        Double rotation;
+        Boolean enabled;
+        Boolean checkFids;
     }
 
     /** Marks the config as having unsaved changes and notifies clients. */

@@ -147,6 +147,20 @@ interface JobLibInfo {
   dirty: boolean;
 }
 
+interface JobBoardLoc {
+  uid: string;
+  boardFile: string | null;
+  boardName: string;
+  side: string;
+  enabled: boolean;
+  checkFids: boolean;
+  x: number;
+  y: number;
+  z: number;
+  rotation: number;
+  placements: number;
+}
+
 interface PartInfo {
   id: string;
   name: string;
@@ -528,6 +542,13 @@ function App() {
     null,
   );
   const [jobErr, setJobErr] = useState("");
+  const [jobEditFile, setJobEditFile] = useState<string | null>(null);
+  const [jobEditName, setJobEditName] = useState("");
+  const [jobBoards, setJobBoards] = useState<JobBoardLoc[]>([]);
+  const [jobBoardLib, setJobBoardLib] = useState<{ file: string; name: string }[]>(
+    [],
+  );
+  const [addBoardSel, setAddBoardSel] = useState("");
   const [editPlacement, setEditPlacement] = useState<Placement | null>(null);
   const [partsDetail, setPartsDetail] = useState<PartInfo[]>([]);
   const [packages, setPackages] = useState<PackageInfo[]>([]);
@@ -673,6 +694,88 @@ function App() {
     if (await postJob("/api/jobs/remove", { file: removeJobTarget.file })) {
       setRemoveJobTarget(null);
     }
+  };
+
+  const applyJobBoards = (d: {
+    boards?: JobBoardLoc[];
+    library?: { file: string; name: string }[];
+    name?: string;
+  }) => {
+    if (d.boards) setJobBoards(d.boards);
+    if (d.library) setJobBoardLib(d.library);
+    if (d.name) setJobEditName(d.name);
+  };
+
+  const openJobEditor = async (file: string | null) => {
+    if (!file) return;
+    setJobErr("");
+    try {
+      const d = await (
+        await fetch("/api/job/boards", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file }),
+        })
+      ).json();
+      applyJobBoards(d);
+      setAddBoardSel(d.library?.[0]?.file ?? "");
+      setJobEditFile(file);
+    } catch (e) {
+      setJobErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const postJobBoard = async (url: string, body: object) => {
+    setJobErr("");
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const d = await res.json();
+      if (!res.ok) {
+        setJobErr(d.error ?? "Request failed.");
+        return;
+      }
+      applyJobBoards(d);
+      loadJobs();
+    } catch (e) {
+      setJobErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const addBoardToJob = () => {
+    if (!jobEditFile || !addBoardSel) return;
+    postJobBoard("/api/job/board/add", {
+      file: jobEditFile,
+      boardFile: addBoardSel,
+    });
+  };
+
+  const updateJobBoard = (uid: string, patch: object) => {
+    if (!jobEditFile) return;
+    postJobBoard("/api/job/board", { file: jobEditFile, uid, ...patch });
+  };
+
+  const removeBoardFromJob = (uid: string) => {
+    if (!jobEditFile) return;
+    postJobBoard("/api/job/board/remove", { file: jobEditFile, uid });
+  };
+
+  const teachJobBoard = (uid: string, capture: boolean) => {
+    if (!jobEditFile) return;
+    const url = capture ? "/api/job/board/capture" : "/api/job/board/move";
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file: jobEditFile, uid, tool: "camera" }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.boards) applyJobBoards(d);
+      })
+      .catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
   };
 
   const loadParts = useCallback(async () => {
@@ -2248,6 +2351,14 @@ function App() {
                           <td className="mono">{j.boardCount}</td>
                           <td className="mono">{j.placementCount}</td>
                           <td className="row-actions">
+                            <button
+                              className="btn btn-sm btn-icon"
+                              onClick={() => openJobEditor(j.file)}
+                              title="Edit boards & positions"
+                              aria-label="Edit job boards"
+                            >
+                              <EyeIcon size={15} />
+                            </button>
                             <button
                               className="btn btn-sm btn-icon"
                               onClick={() => {
@@ -4957,6 +5068,181 @@ function App() {
               </button>
               <button className="btn btn-danger" onClick={doRemoveJob}>
                 Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {jobEditFile && (
+        <div className="modal-backdrop" onClick={() => setJobEditFile(null)}>
+          <div
+            className="modal modal-wide"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3>
+                Job — <span className="mono">{jobEditName}</span>
+              </h3>
+              <button
+                className="icon-btn"
+                onClick={() => setJobEditFile(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body plc-body">
+              <div className="import-row">
+                <select
+                  className="type-select"
+                  value={addBoardSel}
+                  onChange={(e) => setAddBoardSel(e.currentTarget.value)}
+                >
+                  {jobBoardLib.length === 0 && (
+                    <option value="">no boards in library</option>
+                  )}
+                  {jobBoardLib.map((b) => (
+                    <option key={b.file} value={b.file}>
+                      {b.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn btn-primary"
+                  onClick={addBoardToJob}
+                  disabled={!addBoardSel}
+                >
+                  + Add board
+                </button>
+              </div>
+              {jobErr && <div className="banner banner-warn">{jobErr}</div>}
+              {jobBoards.length === 0 ? (
+                <div className="muted">
+                  No boards in this job yet. Add one above, then position it on
+                  the machine bed.
+                </div>
+              ) : (
+                jobBoards.map((b) => (
+                  <div key={b.uid} className="teach-block">
+                    <div className="teach-head">
+                      <span className="mono">{b.boardName}</span> ·{" "}
+                      {b.placements} placements
+                      <button
+                        className="btn btn-sm btn-icon btn-trash jb-remove"
+                        onClick={() => removeBoardFromJob(b.uid)}
+                        title="Remove from job"
+                        aria-label="Remove board from job"
+                      >
+                        <TrashIcon size={14} />
+                      </button>
+                    </div>
+                    <div className="field-grid">
+                      <label className="loc-field">
+                        <span>X (mm)</span>
+                        <NumberInput
+                          step={1}
+                          value={b.x}
+                          onChange={(v) => updateJobBoard(b.uid, { x: v })}
+                        />
+                      </label>
+                      <label className="loc-field">
+                        <span>Y (mm)</span>
+                        <NumberInput
+                          step={1}
+                          value={b.y}
+                          onChange={(v) => updateJobBoard(b.uid, { y: v })}
+                        />
+                      </label>
+                      <label className="loc-field">
+                        <span>Z (mm)</span>
+                        <NumberInput
+                          step={0.1}
+                          value={b.z}
+                          onChange={(v) => updateJobBoard(b.uid, { z: v })}
+                        />
+                      </label>
+                      <label className="loc-field">
+                        <span>Rotation°</span>
+                        <NumberInput
+                          step={1}
+                          value={b.rotation}
+                          onChange={(v) =>
+                            updateJobBoard(b.uid, { rotation: v })
+                          }
+                        />
+                      </label>
+                      <label className="loc-field">
+                        <span>Side</span>
+                        <select
+                          className="type-select"
+                          value={b.side}
+                          onChange={(e) =>
+                            updateJobBoard(b.uid, { side: e.currentTarget.value })
+                          }
+                        >
+                          <option value="Top">Top</option>
+                          <option value="Bottom">Bottom</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div className="teach-actions">
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => teachJobBoard(b.uid, false)}
+                        title="Jog the camera to this board origin"
+                      >
+                        <CrosshairIcon size={13} /> Go
+                      </button>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => teachJobBoard(b.uid, true)}
+                        title="Set origin from the current camera position"
+                      >
+                        <CameraIcon size={13} /> Grab
+                      </button>
+                      <label className="run-toggle">
+                        <input
+                          type="checkbox"
+                          checked={b.enabled}
+                          onChange={(e) =>
+                            updateJobBoard(b.uid, {
+                              enabled: e.currentTarget.checked,
+                            })
+                          }
+                        />
+                        Enabled
+                      </label>
+                      <label
+                        className="run-toggle"
+                        title="Locate this board by its fiducials before placing."
+                      >
+                        <input
+                          type="checkbox"
+                          checked={b.checkFids}
+                          onChange={(e) =>
+                            updateJobBoard(b.uid, {
+                              checkFids: e.currentTarget.checked,
+                            })
+                          }
+                        />
+                        Check fiducials
+                      </label>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+            <div className="modal-foot">
+              <span className="muted job-save-note">
+                Edits mark the job unsaved — use Save in the header to write the
+                .job.xml.
+              </span>
+              <button
+                className="btn btn-primary"
+                onClick={() => setJobEditFile(null)}
+              >
+                Done
               </button>
             </div>
           </div>
