@@ -1040,6 +1040,18 @@ body {
   font-family: inherit;
 }
 
+.drag-handle {
+  cursor: grab;
+  color: var(--muted);
+  text-align: center;
+  width: 22px;
+  user-select: none;
+}
+
+.drag-handle:active {
+  cursor: grabbing;
+}
+
 @media (max-width: 760px) {
   .grid {
     grid-template-columns: repeat(2, 1fr);

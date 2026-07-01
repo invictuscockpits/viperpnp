@@ -208,6 +208,7 @@ public class ViperServer {
         });
         app.post("/api/feeder", ViperServer::updateFeeder);
         app.post("/api/feeders/add", ViperServer::addFeeder);
+        app.post("/api/feeders/reorder", ViperServer::reorderFeeders);
 
         app.ws("/ws/events", ws -> {
             ws.onConnect(sctx -> {
@@ -514,6 +515,51 @@ public class ViperServer {
         String type;
         String name;
         String partId;
+    }
+
+    /**
+     * Reorders the machine feeder list to the given id order. The feeder list is
+     * an unmodifiable view, so we rebuild it via remove/add. Body: {order:[ids]}.
+     */
+    private static void reorderFeeders(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            ReorderRequest req = GSON.fromJson(ctx.body(), ReorderRequest.class);
+            if (req == null || req.order == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"missing order\"}");
+                return;
+            }
+            List<Feeder> current = new ArrayList<>(machine.getFeeders());
+            List<Feeder> target = new ArrayList<>();
+            for (String id : req.order) {
+                Feeder f = machine.getFeeder(id);
+                if (f != null && !target.contains(f)) {
+                    target.add(f);
+                }
+            }
+            for (Feeder f : current) {
+                if (!target.contains(f)) {
+                    target.add(f);
+                }
+            }
+            for (Feeder f : current) {
+                machine.removeFeeder(f);
+            }
+            for (Feeder f : target) {
+                machine.addFeeder(f);
+            }
+            ctx.result(GSON.toJson(describeFeeders()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/feeders/reorder. */
+    private static class ReorderRequest {
+        List<String> order;
     }
 
     /** JSON summary of the current job: boards, placements and distinct parts. */

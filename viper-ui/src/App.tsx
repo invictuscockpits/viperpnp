@@ -95,6 +95,7 @@ function App() {
   const [feederType, setFeederType] = useState("photon");
   const [feederName, setFeederName] = useState("");
   const wsRef = useRef<WebSocket | null>(null);
+  const dragIndex = useRef<number | null>(null);
 
   const loadInventory = useCallback(async () => {
     try {
@@ -293,6 +294,25 @@ function App() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
+  };
+
+  const onFeederDrop = (targetIdx: number) => {
+    const from = dragIndex.current;
+    dragIndex.current = null;
+    if (from === null || from === targetIdx) {
+      return;
+    }
+    const next = [...feeders];
+    const [moved] = next.splice(from, 1);
+    next.splice(targetIdx, 0, moved);
+    setFeeders(next);
+    fetch("/api/feeders/reorder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order: next.map((f) => f.id) }),
+    }).catch(() => {
+      /* ignore */
+    });
   };
 
   const placements = (job?.boards ?? []).flatMap((b) => b.placements);
@@ -761,6 +781,7 @@ function App() {
                   <table className="ptable">
                     <thead>
                       <tr>
+                        <th></th>
                         <th>On</th>
                         <th>Name</th>
                         <th>Type</th>
@@ -768,8 +789,23 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {feeders.map((f) => (
-                        <tr key={f.id} className={f.enabled ? "" : "row-off"}>
+                      {feeders.map((f, i) => (
+                        <tr
+                          key={f.id}
+                          className={f.enabled ? "" : "row-off"}
+                          onDragOver={(e) => e.preventDefault()}
+                          onDrop={() => onFeederDrop(i)}
+                        >
+                          <td
+                            className="drag-handle"
+                            draggable
+                            onDragStart={() => {
+                              dragIndex.current = i;
+                            }}
+                            title="Drag to reorder"
+                          >
+                            ⠿
+                          </td>
                           <td>
                             <input
                               type="checkbox"
