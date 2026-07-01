@@ -11,6 +11,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import org.openpnp.gui.importer.KicadPosImporter;
 import org.openpnp.machine.photon.PhotonFeeder;
+import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
 import org.openpnp.machine.reference.feeder.ReferenceStripFeeder;
 import org.openpnp.model.Abstract2DLocatable.Side;
@@ -209,6 +210,10 @@ public class ViperServer {
         app.post("/api/feeder", ViperServer::updateFeeder);
         app.post("/api/feeders/add", ViperServer::addFeeder);
         app.post("/api/feeders/reorder", ViperServer::reorderFeeders);
+        app.get("/api/feeder/{id}", ViperServer::getFeederConfig);
+        app.post("/api/feeder/location", ViperServer::setFeederLocation);
+        app.post("/api/feeder/move", ViperServer::moveToFeeder);
+        app.post("/api/feeder/capture", ViperServer::captureFeeder);
 
         app.ws("/ws/events", ws -> {
             ws.onConnect(sctx -> {
@@ -560,6 +565,146 @@ public class ViperServer {
     /** JSON body for POST /api/feeders/reorder. */
     private static class ReorderRequest {
         List<String> order;
+    }
+
+    /**
+     * Full config for one feeder, including its editable pick location. Every
+     * feeder type extends {@link ReferenceFeeder}, which carries a settable
+     * X/Y/Z + rotation {@code location}; that is the universal editable field
+     * the edit dialog binds to. Type-specific geometry (Photon slot/offset,
+     * strip reference holes) is layered on later.
+     */
+    private static Map<String, Object> feederConfig(Feeder f) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", f.getId());
+        m.put("name", f.getName());
+        m.put("type", f.getClass().getSimpleName());
+        m.put("part", f.getPart() != null ? f.getPart().getId() : null);
+        m.put("enabled", f.isEnabled());
+        if (f instanceof ReferenceFeeder) {
+            Location l = ((ReferenceFeeder) f).getLocation().convertToUnits(LengthUnit.Millimeters);
+            Map<String, Object> loc = new LinkedHashMap<>();
+            loc.put("x", round(l.getX()));
+            loc.put("y", round(l.getY()));
+            loc.put("z", round(l.getZ()));
+            loc.put("rotation", round(l.getRotation()));
+            m.put("location", loc);
+            m.put("editableLocation", true);
+        }
+        else {
+            m.put("editableLocation", false);
+        }
+        return m;
+    }
+
+    /** GET /api/feeder/{id} — full config for the edit dialog. */
+    private static void getFeederConfig(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        Feeder f = machine.getFeeder(ctx.pathParam("id"));
+        if (f == null) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"feeder not found\"}");
+            return;
+        }
+        ctx.result(GSON.toJson(feederConfig(f)));
+    }
+
+    /** POST /api/feeder/location — sets the feeder pick location. Body: {id, x, y, z, rotation}. */
+    private static void setFeederLocation(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            FeederLocation req = GSON.fromJson(ctx.body(), FeederLocation.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (f == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"feeder not found\"}");
+                return;
+            }
+            if (!(f instanceof ReferenceFeeder)) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"feeder has no editable location\"}");
+                return;
+            }
+            ((ReferenceFeeder) f).setLocation(
+                    new Location(LengthUnit.Millimeters, req.x, req.y, req.z, req.rotation));
+            ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/feeder/move — jogs a tool to the feeder pick location at safe Z.
+     * Body: {id, tool: "camera"|"nozzle"}. Runs on the machine task thread.
+     */
+    private static void moveToFeeder(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        FeederAction req = GSON.fromJson(ctx.body(), FeederAction.class);
+        Feeder f = req != null ? machine.getFeeder(req.id) : null;
+        if (!(f instanceof ReferenceFeeder)) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"feeder not found or has no location\"}");
+            return;
+        }
+        final Location target = ((ReferenceFeeder) f).getLocation();
+        final boolean nozzle = req != null && "nozzle".equalsIgnoreCase(req.tool);
+        machine.submit(() -> {
+            Head head = machine.getDefaultHead();
+            HeadMountable hm = nozzle ? head.getDefaultNozzle() : head.getDefaultCamera();
+            MovableUtils.moveToLocationAtSafeZ(hm, target);
+            return null;
+        }, broadcastCallback());
+        ctx.result("{\"submitted\":true}");
+    }
+
+    /**
+     * POST /api/feeder/capture — writes the current tool position into the
+     * feeder location. Camera capture sets X/Y (keeps Z, since the camera can't
+     * reach pick depth); nozzle capture sets X/Y/Z. Rotation is left as-is.
+     * Body: {id, tool: "camera"|"nozzle"}. Reads position only — no motion.
+     */
+    private static void captureFeeder(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            FeederAction req = GSON.fromJson(ctx.body(), FeederAction.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (!(f instanceof ReferenceFeeder)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"feeder not found or has no location\"}");
+                return;
+            }
+            Head head = machine.getDefaultHead();
+            boolean nozzle = "nozzle".equalsIgnoreCase(req.tool);
+            HeadMountable hm = nozzle ? head.getDefaultNozzle() : head.getDefaultCamera();
+            Location cur = hm.getLocation().convertToUnits(LengthUnit.Millimeters);
+            ReferenceFeeder rf = (ReferenceFeeder) f;
+            Location existing = rf.getLocation().convertToUnits(LengthUnit.Millimeters);
+            double z = nozzle ? cur.getZ() : existing.getZ();
+            rf.setLocation(new Location(LengthUnit.Millimeters, cur.getX(), cur.getY(), z,
+                    existing.getRotation()));
+            ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/feeder/location. */
+    private static class FeederLocation {
+        String id;
+        double x;
+        double y;
+        double z;
+        double rotation;
+    }
+
+    /** JSON body for the feeder move/capture teach actions. */
+    private static class FeederAction {
+        String id;
+        String tool;
     }
 
     /** JSON summary of the current job: boards, placements and distinct parts. */

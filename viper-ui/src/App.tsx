@@ -63,6 +63,18 @@ interface FeederInfo {
   enabled: boolean;
 }
 
+interface FeederLoc {
+  x: number;
+  y: number;
+  z: number;
+  rotation: number;
+}
+
+interface FeederConfig extends FeederInfo {
+  editableLocation: boolean;
+  location?: FeederLoc;
+}
+
 type Tab = "machine" | "board" | "feeders";
 
 const STEPS = [0.01, 0.1, 1, 10, 100];
@@ -94,6 +106,13 @@ function App() {
   const [parts, setParts] = useState<string[]>([]);
   const [feederType, setFeederType] = useState("photon");
   const [feederName, setFeederName] = useState("");
+  const [editFeeder, setEditFeeder] = useState<FeederConfig | null>(null);
+  const [locForm, setLocForm] = useState<FeederLoc>({
+    x: 0,
+    y: 0,
+    z: 0,
+    rotation: 0,
+  });
   const wsRef = useRef<WebSocket | null>(null);
   const dragIndex = useRef<number | null>(null);
 
@@ -310,6 +329,86 @@ function App() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ order: next.map((f) => f.id) }),
+    }).catch(() => {
+      /* ignore */
+    });
+  };
+
+  const applyFeederConfig = (d: FeederConfig) => {
+    setEditFeeder(d);
+    if (d.location) {
+      setLocForm(d.location);
+    }
+    setFeeders((fs) =>
+      fs.map((f) =>
+        f.id === d.id
+          ? { ...f, name: d.name, part: d.part, enabled: d.enabled }
+          : f,
+      ),
+    );
+  };
+
+  const openEditFeeder = async (id: string) => {
+    try {
+      const res = await fetch(`/api/feeder/${id}`);
+      const d: FeederConfig = await res.json();
+      setEditFeeder(d);
+      setLocForm(d.location ?? { x: 0, y: 0, z: 0, rotation: 0 });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const saveFeederLocation = async () => {
+    if (!editFeeder) {
+      return;
+    }
+    try {
+      const res = await fetch("/api/feeder/location", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: editFeeder.id, ...locForm }),
+      });
+      const d = await res.json();
+      if (d.error || d.event === "error") {
+        setError(String(d.message ?? d.error));
+        return;
+      }
+      applyFeederConfig(d);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const captureFeederLoc = async (tool: "camera" | "nozzle") => {
+    if (!editFeeder) {
+      return;
+    }
+    try {
+      const res = await fetch("/api/feeder/capture", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: editFeeder.id, tool }),
+      });
+      const d = await res.json();
+      if (d.error || d.event === "error") {
+        setError(String(d.message ?? d.error));
+        return;
+      }
+      applyFeederConfig(d);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const moveToFeederLoc = (tool: "camera" | "nozzle") => {
+    if (!editFeeder) {
+      return;
+    }
+    fetch("/api/feeder/move", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: editFeeder.id, tool }),
     }).catch(() => {
       /* ignore */
     });
@@ -786,6 +885,7 @@ function App() {
                         <th>Name</th>
                         <th>Type</th>
                         <th>Part</th>
+                        <th></th>
                       </tr>
                     </thead>
                     <tbody>
@@ -837,6 +937,14 @@ function App() {
                               ))}
                             </select>
                           </td>
+                          <td>
+                            <button
+                              className="btn btn-sm"
+                              onClick={() => openEditFeeder(f.id)}
+                            >
+                              Edit
+                            </button>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -847,6 +955,128 @@ function App() {
           )}
         </div>
       </main>
+
+      {editFeeder && (
+        <div className="modal-backdrop" onClick={() => setEditFeeder(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>
+                Edit feeder — <span className="mono">{editFeeder.name}</span>
+              </h3>
+              <button
+                className="icon-btn"
+                onClick={() => setEditFeeder(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="field-row">
+                <label>Type</label>
+                <span className="muted">{editFeeder.type}</span>
+              </div>
+              <div className="field-row">
+                <label>Part</label>
+                <select
+                  className="type-select"
+                  value={editFeeder.part ?? ""}
+                  onChange={async (e) => {
+                    await updateFeeder(editFeeder.id, {
+                      partId: e.currentTarget.value,
+                    });
+                    openEditFeeder(editFeeder.id);
+                  }}
+                >
+                  <option value="">—</option>
+                  {parts.map((p) => (
+                    <option key={p} value={p}>
+                      {p}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {editFeeder.editableLocation ? (
+                <>
+                  <div className="loc-grid">
+                    {(["x", "y", "z", "rotation"] as const).map((k) => (
+                      <label key={k} className="loc-field">
+                        <span>{k === "rotation" ? "Rot°" : k.toUpperCase()}</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={locForm[k]}
+                          onChange={(e) =>
+                            setLocForm({
+                              ...locForm,
+                              [k]: parseFloat(e.currentTarget.value) || 0,
+                            })
+                          }
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  <div className="teach-block">
+                    <div className="teach-row">
+                      <span className="teach-tool">
+                        <CameraIcon size={15} /> Camera
+                      </span>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => moveToFeederLoc("camera")}
+                        title="Move camera over this location"
+                      >
+                        Go to
+                      </button>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => captureFeederLoc("camera")}
+                        title="Set X/Y from current camera position"
+                      >
+                        Capture X/Y
+                      </button>
+                    </div>
+                    <div className="teach-row">
+                      <span className="teach-tool">
+                        <NozzleIcon size={15} /> Nozzle
+                      </span>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => moveToFeederLoc("nozzle")}
+                        title="Move nozzle over this location"
+                      >
+                        Go to
+                      </button>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => captureFeederLoc("nozzle")}
+                        title="Set X/Y/Z from current nozzle position"
+                      >
+                        Capture X/Y/Z
+                      </button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="muted">
+                  This feeder type has no directly editable pick location.
+                </div>
+              )}
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setEditFeeder(null)}>
+                Close
+              </button>
+              {editFeeder.editableLocation && (
+                <button className="btn btn-primary" onClick={saveFeederLocation}>
+                  Save location
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
