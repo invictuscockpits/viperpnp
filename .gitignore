@@ -19,3 +19,4 @@ hs_err*
 
 # ViperPNP: generated dependency classpath for running the dev server
 viper-cp.txt
+.last-launch.txt
