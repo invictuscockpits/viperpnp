@@ -658,6 +658,13 @@ body {
   font-size: 0.8rem;
 }
 
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.3rem 0.45rem;
+}
+
 .row-actions {
   display: flex;
   gap: 0.35rem;

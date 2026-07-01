@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { BoardMap, type Placement } from "./BoardMap";
-import { CameraIcon, NozzleIcon } from "./Icons";
+import { CameraIcon, GearIcon, NozzleIcon } from "./Icons";
 import "./App.css";
 
 interface DriverInfo {
@@ -1215,7 +1215,7 @@ function App() {
                     <thead>
                       <tr>
                         <th></th>
-                        <th>On</th>
+                        <th>Active</th>
                         <th>Name</th>
                         <th>Type</th>
                         <th>Part</th>
@@ -1291,10 +1291,12 @@ function App() {
                               </>
                             )}
                             <button
-                              className="btn btn-sm"
+                              className="btn btn-sm btn-icon"
                               onClick={() => openEditFeeder(f.id)}
+                              title="Edit feeder"
+                              aria-label="Edit feeder"
                             >
-                              Edit
+                              <GearIcon size={15} />
                             </button>
                           </td>
                         </tr>
