@@ -12,6 +12,7 @@ import {
   UndoIcon,
   WarnIcon,
 } from "./Icons";
+import viperLogo from "./assets/viperpnp-logo.png";
 import "./App.css";
 
 interface DriverInfo {
@@ -1585,8 +1586,12 @@ function App() {
     <div className="app">
       <aside className="control-panel">
         <div className="brand">
-          <span className="brand-viper">VIPER</span>
-          <span className="brand-pnp">PNP</span>
+          <img
+            className="brand-logo"
+            src={viperLogo}
+            alt="ViperPNP"
+            draggable={false}
+          />
         </div>
 
         <div className="camera-panel">

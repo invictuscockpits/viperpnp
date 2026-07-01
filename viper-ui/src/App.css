@@ -428,17 +428,18 @@ body {
 }
 
 .brand {
-  font-weight: 800;
-  letter-spacing: 0.12em;
-  font-size: 1.35rem;
+  display: flex;
+  align-items: center;
 }
 
-.brand-viper {
-  color: var(--text);
-}
-
-.brand-pnp {
-  color: var(--green);
+.brand-logo {
+  display: block;
+  height: 58px;
+  width: auto;
+  /* Logo art sits on solid black; lighten drops the black into the dark panel
+     while keeping the metallic + green pixels. */
+  mix-blend-mode: lighten;
+  user-select: none;
 }
 
 .status {
