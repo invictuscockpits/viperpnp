@@ -16,3 +16,6 @@ hs_err*
 .vscode/
 /src/main/resources/org/openpnp/translations.properties.bak
 .DS_Store
+
+# ViperPNP: generated dependency classpath for running the dev server
+viper-cp.txt
