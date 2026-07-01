@@ -664,6 +664,29 @@ body {
   justify-content: flex-end;
 }
 
+.name-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  flex: 1;
+}
+
+.name-field .import-input {
+  width: 100%;
+}
+
+.hw-id {
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+}
+
+.save-btn.dirty {
+  border-color: var(--green);
+  color: var(--green);
+  background: var(--green-dim);
+}
+
 .io-panel {
   display: grid;
   grid-template-columns: 1fr 1fr;

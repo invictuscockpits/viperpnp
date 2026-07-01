@@ -84,6 +84,7 @@ public class ViperServer {
     private static volatile boolean jobRunning = false;
     private static volatile boolean jobAbortRequested = false;
     private static PnpJobProcessor jobProcessor;
+    private static volatile boolean configDirty = false;
 
     public static void main(String[] args) throws Exception {
         File configDir;
@@ -216,6 +217,30 @@ public class ViperServer {
             ctx.contentType("application/json");
             ctx.result(GSON.toJson(s));
         });
+        app.get("/api/config/state", ctx -> {
+            ctx.contentType("application/json");
+            ctx.result(GSON.toJson(configEvent()));
+        });
+        app.post("/api/config/save", ctx -> {
+            ctx.contentType("application/json");
+            try {
+                // A null partId can't be serialized; normalize to "" for any
+                // part-less feeder (matches setPart(null)'s behavior).
+                for (Feeder f : machine.getFeeders()) {
+                    if (f.getPart() == null) {
+                        f.setPart(null);
+                    }
+                }
+                Configuration.get().save();
+                configDirty = false;
+                broadcast(GSON.toJson(configEvent()));
+                ctx.result(GSON.toJson(configEvent()));
+            }
+            catch (Exception e) {
+                ctx.status(500);
+                ctx.result(GSON.toJson(errorMap(e)));
+            }
+        });
         app.get("/api/feeders", ctx -> {
             ctx.contentType("application/json");
             ctx.result(GSON.toJson(describeFeeders()));
@@ -248,6 +273,7 @@ public class ViperServer {
             }, new FutureCallback<Object>() {
                 @Override
                 public void onSuccess(Object result) {
+                    markDirty();
                     broadcast(GSON.toJson(feedersEvent()));
                 }
 
@@ -261,6 +287,23 @@ public class ViperServer {
         });
         app.post("/api/feeder/move", ViperServer::moveToFeeder);
         app.post("/api/feeder/capture", ViperServer::captureFeeder);
+
+        // Any successful POST that edits persistent config marks it dirty.
+        app.after(ctx -> {
+            if (!"POST".equalsIgnoreCase(ctx.req().getMethod())) {
+                return;
+            }
+            if (ctx.statusCode() >= 300) {
+                return;
+            }
+            String p = ctx.path();
+            boolean configPath = (p.startsWith("/api/feeder") && !p.equals("/api/feeders/scan"))
+                    || p.equals("/api/job/placement")
+                    || p.equals("/api/import/kicad");
+            if (configPath) {
+                markDirty();
+            }
+        });
 
         app.ws("/ws/events", ws -> {
             ws.onConnect(sctx -> {
@@ -700,6 +743,22 @@ public class ViperServer {
         Integer maxPlacementRetries;
     }
 
+    /** Marks the config as having unsaved changes and notifies clients. */
+    private static void markDirty() {
+        if (!configDirty) {
+            configDirty = true;
+            broadcast(GSON.toJson(configEvent()));
+        }
+    }
+
+    /** WebSocket/REST payload describing the unsaved-changes state. */
+    private static Map<String, Object> configEvent() {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("event", "config");
+        m.put("dirty", configDirty);
+        return m;
+    }
+
     /** Feeder list wrapped as a WebSocket event so clients can refresh live. */
     private static Map<String, Object> feedersEvent() {
         Map<String, Object> e = describeFeeders();
@@ -716,11 +775,16 @@ public class ViperServer {
      * "name (Slot: N)" form takes over again.
      */
     private static String feederName(Feeder f) {
-        if (f instanceof PhotonFeeder && ((PhotonFeeder) f).getHardwareId() == null) {
+        if (f instanceof PhotonFeeder) {
             String raw = rawFeederName(f);
-            if (raw != null && !raw.isEmpty()
-                    && !raw.equals(PhotonFeeder.class.getSimpleName())) {
+            boolean hasUserName = raw != null && !raw.isEmpty()
+                    && !raw.equals(PhotonFeeder.class.getSimpleName());
+            if (hasUserName) {
                 return raw;
+            }
+            String hw = ((PhotonFeeder) f).getHardwareId();
+            if (hw != null && !hw.isEmpty()) {
+                return hw;
             }
         }
         return f.getName();
@@ -811,9 +875,10 @@ public class ViperServer {
             if (req != null && req.name != null && !req.name.isEmpty()) {
                 f.setName(req.name);
             }
-            if (req != null && req.partId != null && !req.partId.isEmpty()) {
-                f.setPart(Configuration.get().getPart(req.partId));
-            }
+            // Always call setPart so partId is "" (not null) when no part is
+            // assigned — a null partId can't be serialized to machine.xml.
+            f.setPart(req != null && req.partId != null && !req.partId.isEmpty()
+                    ? Configuration.get().getPart(req.partId) : null);
             machine.addFeeder(f);
             ctx.result(GSON.toJson(describeFeeders()));
         }

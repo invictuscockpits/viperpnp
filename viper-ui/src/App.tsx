@@ -241,6 +241,8 @@ function App() {
   const [editFeeder, setEditFeeder] = useState<FeederConfig | null>(null);
   const [scanning, setScanning] = useState(false);
   const [jobRunning, setJobRunning] = useState(false);
+  const [configDirty, setConfigDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [jobStatus, setJobStatus] = useState("");
   const [keepGoing, setKeepGoing] = useState(true);
   const [skipReport, setSkipReport] = useState<{
@@ -308,6 +310,12 @@ function App() {
       ws.addEventListener("open", () => {
         setOnline(true);
         loadInventory();
+        fetch("/api/config/state")
+          .then((r) => r.json())
+          .then((d) => setConfigDirty(!!d.dirty))
+          .catch(() => {
+            /* ignore */
+          });
       });
       ws.addEventListener("message", (ev) => {
         const data = JSON.parse(ev.data as string);
@@ -317,6 +325,8 @@ function App() {
         } else if (data && data.event === "feeders") {
           setFeeders(data.feeders ?? []);
           setScanning(false);
+        } else if (data && data.event === "config") {
+          setConfigDirty(!!data.dirty);
         } else if (data && data.event === "jobStarted") {
           setJobRunning(true);
           setJobStatus(String(data.text ?? ""));
@@ -616,6 +626,18 @@ function App() {
     });
   };
 
+  const saveConfig = () => {
+    setSaving(true);
+    fetch("/api/config/save", { method: "POST" })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.error) setError(String(d.message ?? d.error));
+        else setConfigDirty(!!d.dirty);
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setSaving(false));
+  };
+
   const scanBus = () => {
     setScanning(true);
     fetch("/api/feeders/scan", { method: "POST" })
@@ -908,6 +930,18 @@ function App() {
             ))}
           </nav>
           <div className="head-right">
+            <button
+              className={`btn btn-sm save-btn ${configDirty ? "dirty" : ""}`}
+              onClick={saveConfig}
+              disabled={!configDirty || saving}
+              title={
+                configDirty
+                  ? "Save all changes to the machine config"
+                  : "No unsaved changes"
+              }
+            >
+              {saving ? "Saving…" : configDirty ? "Save •" : "Saved"}
+            </button>
             {online && status && (
               <div className="badges">
                 <span className={`badge ${enabled ? "on" : ""}`}>
@@ -1292,17 +1326,26 @@ function App() {
             <div className="modal-body">
               <div className="field-row">
                 <label>Name</label>
-                <input
-                  className="import-input"
-                  value={editFeeder.name}
-                  onChange={(e) => setEF({ name: e.currentTarget.value })}
-                  onBlur={() => {
-                    if (editFeeder.name.trim()) {
-                      updateFeeder(editFeeder.id, { name: editFeeder.name.trim() });
-                    }
-                  }}
-                  placeholder="feeder name"
-                />
+                <div className="name-field">
+                  <input
+                    className="import-input"
+                    value={editFeeder.name}
+                    onChange={(e) => setEF({ name: e.currentTarget.value })}
+                    onBlur={() => {
+                      if (editFeeder.name.trim()) {
+                        updateFeeder(editFeeder.id, {
+                          name: editFeeder.name.trim(),
+                        });
+                      }
+                    }}
+                    placeholder="feeder name"
+                  />
+                  {editFeeder.photon && (
+                    <span className="hw-id">
+                      Hardware ID: {editFeeder.photon.hardwareId ?? "— (not on bus)"}
+                    </span>
+                  )}
+                </div>
               </div>
               <div className="field-row">
                 <label>Type</label>
@@ -1408,11 +1451,6 @@ function App() {
                         })
                       }
                     />
-                    {editFeeder.photon.hardwareId && (
-                      <span className="muted">
-                        HW {editFeeder.photon.hardwareId}
-                      </span>
-                    )}
                   </div>
                   <TeachLoc
                     label="Slot location (shared by all feeders in this slot)"
