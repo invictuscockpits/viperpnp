@@ -795,6 +795,28 @@ public class ViperServer {
 
     /** All parts with the fields the Parts page needs; hasHeight flags the issue. */
     private static Map<String, Object> describePartsDetail() {
+        // A part used only as a fiducial (never a real placement or a feeder) is
+        // never picked, so it doesn't need a height.
+        Set<String> placedParts = new java.util.HashSet<>();
+        Set<String> fiducialParts = new java.util.HashSet<>();
+        for (Board b : Configuration.get().getBoards()) {
+            for (Placement p : b.getPlacements()) {
+                if (p.getPart() == null) {
+                    continue;
+                }
+                if (p.getType() == Placement.Type.Fiducial) {
+                    fiducialParts.add(p.getPart().getId());
+                }
+                else {
+                    placedParts.add(p.getPart().getId());
+                }
+            }
+        }
+        for (Feeder f : machine.getFeeders()) {
+            if (f.getPart() != null) {
+                placedParts.add(f.getPart().getId());
+            }
+        }
         List<Map<String, Object>> parts = new ArrayList<>();
         for (Part p : Configuration.get().getParts()) {
             Map<String, Object> m = new LinkedHashMap<>();
@@ -802,8 +824,15 @@ public class ViperServer {
             m.put("name", p.getName());
             double h = p.getHeight() != null
                     ? p.getHeight().convertToUnits(LengthUnit.Millimeters).getValue() : 0;
+            boolean usedFiducialOnly = fiducialParts.contains(p.getId())
+                    && !placedParts.contains(p.getId());
+            String pkgId = p.getPackage() != null ? p.getPackage().getId() : "";
+            boolean namedFiducial = p.getId().toUpperCase().startsWith("FID")
+                    || pkgId.toUpperCase().startsWith("FID");
+            boolean fiducial = usedFiducialOnly || namedFiducial;
             m.put("height", round(h));
-            m.put("hasHeight", h > 0);
+            m.put("fiducial", fiducial);
+            m.put("hasHeight", h > 0 || fiducial);
             m.put("package", p.getPackage() != null ? p.getPackage().getId() : null);
             m.put("speed", round(p.getSpeed()));
             parts.add(m);

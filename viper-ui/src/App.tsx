@@ -141,6 +141,7 @@ interface PartInfo {
   name: string;
   height: number;
   hasHeight: boolean;
+  fiducial?: boolean;
   package: string | null;
   speed: number;
 }
@@ -2034,8 +2035,16 @@ function App() {
                           <td className="mono">{p.id}</td>
                           <td className="muted">{p.name}</td>
                           <td className="muted">{p.package ?? "—"}</td>
-                          <td className={p.hasHeight ? "mono" : "mono left-empty"}>
-                            {p.height}
+                          <td
+                            className={
+                              p.fiducial
+                                ? "muted"
+                                : p.hasHeight
+                                  ? "mono"
+                                  : "mono left-empty"
+                            }
+                          >
+                            {p.fiducial ? "n/a" : p.height}
                           </td>
                           <td className="row-actions">
                             <button
