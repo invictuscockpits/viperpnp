@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "viper-ui",
+  "productName": "ViperPNP",
   "version": "0.1.0",
   "identifier": "com.invictuscockpits.viperpnp",
   "build": {
@@ -12,9 +12,9 @@
   "app": {
     "windows": [
       {
-        "title": "viper-ui",
-        "width": 800,
-        "height": 600
+        "title": "ViperPNP",
+        "width": 1100,
+        "height": 760
       }
     ],
     "security": {
