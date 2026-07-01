@@ -842,6 +842,51 @@ body {
   margin-bottom: 0.6rem;
 }
 
+.warn-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: #e6b800;
+  border-color: #6b5b1a;
+}
+
+.warn-btn:hover:not(:disabled) {
+  color: #ffd23f;
+  border-color: #e6b800;
+}
+
+.warn-text {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: #e6b800;
+}
+
+.warn-tri {
+  cursor: pointer;
+}
+
+.nt-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.wizard-table td {
+  padding: 0.35rem 0.5rem;
+}
+
+.wizard-fix {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.wizard-fix .num-input {
+  width: 6rem;
+}
+
 .plc-body {
   max-height: 68vh;
 }

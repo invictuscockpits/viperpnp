@@ -136,6 +136,27 @@ interface BoardInfo {
   dirty: boolean;
 }
 
+interface PartInfo {
+  id: string;
+  name: string;
+  height: number;
+  hasHeight: boolean;
+  package: string | null;
+  speed: number;
+}
+
+interface PackageInfo {
+  id: string;
+  description: string | null;
+  nozzleTips: string[];
+  hasNozzle: boolean;
+}
+
+interface NtInfo {
+  id: string;
+  name: string;
+}
+
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
 const TAPE_TYPES = ["WhitePaper", "BlackPlastic", "ClearPlastic"];
 const IMPORT_FORMATS = [
@@ -144,6 +165,20 @@ const IMPORT_FORMATS = [
   { id: "eagle", label: "Eagle .mnt" },
 ];
 const ERROR_HANDLING = ["Default", "Alert", "Defer"];
+const NEW_PART: PartInfo = {
+  id: "",
+  name: "",
+  height: 0,
+  hasHeight: false,
+  package: null,
+  speed: 1,
+};
+const NEW_PACKAGE: PackageInfo = {
+  id: "",
+  description: "",
+  nozzleTips: [],
+  hasNozzle: false,
+};
 
 type TeachTool = "camera" | "nozzle";
 type TeachTarget =
@@ -155,7 +190,7 @@ type TeachTarget =
   | "firstRowLast"
   | "lastComponent";
 
-type Tab = "machine" | "board" | "feeders";
+type Tab = "machine" | "board" | "feeders" | "parts" | "packages";
 
 const STEPS = [0.01, 0.1, 1, 10, 100];
 
@@ -163,6 +198,8 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "machine", label: "Machine" },
   { id: "board", label: "Board" },
   { id: "feeders", label: "Feeders" },
+  { id: "parts", label: "Parts" },
+  { id: "packages", label: "Packages" },
 ];
 
 const SOON = ["Vision", "Log"];
@@ -327,6 +364,14 @@ function App() {
   const [newBoardOpen, setNewBoardOpen] = useState(false);
   const [newBoardName, setNewBoardName] = useState("");
   const [editPlacement, setEditPlacement] = useState<Placement | null>(null);
+  const [partsDetail, setPartsDetail] = useState<PartInfo[]>([]);
+  const [packages, setPackages] = useState<PackageInfo[]>([]);
+  const [nozzleTips, setNozzleTips] = useState<NtInfo[]>([]);
+  const [editPart, setEditPart] = useState<PartInfo | null>(null);
+  const [partIsNew, setPartIsNew] = useState(false);
+  const [editPackage, setEditPackage] = useState<PackageInfo | null>(null);
+  const [pkgIsNew, setPkgIsNew] = useState(false);
+  const [wizardOpen, setWizardOpen] = useState(false);
   const [reference, setReference] = useState("camera");
   const [tab, setTab] = useState<Tab>("board");
   const [feeders, setFeeders] = useState<FeederInfo[]>([]);
@@ -382,6 +427,25 @@ function App() {
     }
   }, []);
 
+  const loadParts = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/parts/detail")).json();
+      setPartsDetail(d.parts ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const loadPackages = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/packages")).json();
+      setPackages(d.packages ?? []);
+      setNozzleTips(d.nozzleTips ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   useEffect(() => {
     if (tab === "feeders") {
       loadFeeders();
@@ -389,7 +453,14 @@ function App() {
     if (tab === "board") {
       loadBoards();
     }
-  }, [tab, loadFeeders, loadBoards]);
+    if (tab === "parts") {
+      loadParts();
+      loadPackages();
+    }
+    if (tab === "packages") {
+      loadPackages();
+    }
+  }, [tab, loadFeeders, loadBoards, loadParts, loadPackages]);
 
   useEffect(() => {
     let closed = false;
@@ -638,6 +709,101 @@ function App() {
     });
   const setBoardSize = (width: number, height: number) =>
     postPlacement("/api/board/dimensions", { width, height });
+
+  const postParts = async (url: string, body: object) => {
+    try {
+      const d = await (
+        await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        })
+      ).json();
+      if (d.error || d.event === "error")
+        setError(String(d.message ?? d.error));
+      else setPartsDetail(d.parts ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  const updatePart = (id: string, patch: object) =>
+    postParts("/api/part", { id, ...patch });
+  const deletePart = (id: string) => postParts("/api/part/delete", { id });
+
+  const postPackages = async (url: string, body: object) => {
+    try {
+      const d = await (
+        await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        })
+      ).json();
+      if (d.error || d.event === "error")
+        setError(String(d.message ?? d.error));
+      else {
+        setPackages(d.packages ?? []);
+        setNozzleTips(d.nozzleTips ?? []);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  const updatePackage = (id: string, patch: object) =>
+    postPackages("/api/package", { id, ...patch });
+  const deletePackage = (id: string) =>
+    postPackages("/api/package/delete", { id });
+
+  const savePart = () => {
+    if (!editPart) return;
+    const id = editPart.id.trim();
+    if (!id) return;
+    if (partIsNew)
+      postParts("/api/part/add", {
+        id,
+        name: editPart.name,
+        height: editPart.height,
+        packageId: editPart.package ?? "",
+      });
+    else
+      updatePart(id, {
+        name: editPart.name,
+        height: editPart.height,
+        packageId: editPart.package ?? "",
+        speed: editPart.speed,
+      });
+    setEditPart(null);
+  };
+
+  const savePackage = async () => {
+    if (!editPackage) return;
+    const id = editPackage.id.trim();
+    if (!id) return;
+    if (pkgIsNew) {
+      await postPackages("/api/package/add", {
+        id,
+        description: editPackage.description,
+      });
+      if (editPackage.nozzleTips.length)
+        await postPackages("/api/package", {
+          id,
+          nozzleTips: editPackage.nozzleTips,
+        });
+    } else {
+      await postPackages("/api/package", {
+        id,
+        description: editPackage.description,
+        nozzleTips: editPackage.nozzleTips,
+      });
+    }
+    setEditPackage(null);
+  };
+
+  const openWizard = () => {
+    loadParts();
+    loadPackages();
+    setWizardOpen(true);
+  };
 
   const createNewBoard = async () => {
     if (!newBoardName.trim()) return;
@@ -1730,6 +1896,207 @@ function App() {
               )}
             </section>
           )}
+
+          {tab === "parts" && (
+            <section className="card">
+              <div className="board-head">
+                <h2>Parts</h2>
+                <div className="import-row">
+                  {partsDetail.some((p) => !p.hasHeight) && (
+                    <button
+                      className="btn btn-sm warn-btn"
+                      onClick={openWizard}
+                    >
+                      <WarnIcon size={14} />{" "}
+                      {partsDetail.filter((p) => !p.hasHeight).length} issues
+                    </button>
+                  )}
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => {
+                      setEditPart({ ...NEW_PART });
+                      setPartIsNew(true);
+                    }}
+                  >
+                    + Add part
+                  </button>
+                </div>
+              </div>
+              {partsDetail.length === 0 ? (
+                <div className="muted">
+                  No parts yet. Import a board with “Create missing parts”, or
+                  add one.
+                </div>
+              ) : (
+                <div className="ptable-wrap">
+                  <table className="ptable">
+                    <thead>
+                      <tr>
+                        <th className="chk-col"></th>
+                        <th>ID</th>
+                        <th>Name</th>
+                        <th>Package</th>
+                        <th>Height mm</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {partsDetail.map((p) => (
+                        <tr key={p.id}>
+                          <td className="chk-col">
+                            {!p.hasHeight && (
+                              <span
+                                className="warn-tri"
+                                onClick={openWizard}
+                                onMouseEnter={(e) => {
+                                  const r =
+                                    e.currentTarget.getBoundingClientRect();
+                                  setTip({
+                                    text: "No part height set — needed to pick/place. Click to resolve.",
+                                    x: r.left,
+                                    y: r.top,
+                                  });
+                                }}
+                                onMouseLeave={() => setTip(null)}
+                              >
+                                <WarnIcon size={14} />
+                              </span>
+                            )}
+                          </td>
+                          <td className="mono">{p.id}</td>
+                          <td className="muted">{p.name}</td>
+                          <td className="muted">{p.package ?? "—"}</td>
+                          <td className={p.hasHeight ? "mono" : "mono left-empty"}>
+                            {p.height}
+                          </td>
+                          <td className="row-actions">
+                            <button
+                              className="btn btn-sm btn-icon"
+                              onClick={() => {
+                                setEditPart(p);
+                                setPartIsNew(false);
+                              }}
+                              title="Edit part"
+                              aria-label="Edit part"
+                            >
+                              <GearIcon size={15} />
+                            </button>
+                            <button
+                              className="btn btn-sm btn-icon btn-trash"
+                              onClick={() => deletePart(p.id)}
+                              title="Delete part"
+                              aria-label="Delete part"
+                            >
+                              <TrashIcon size={15} />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+          )}
+
+          {tab === "packages" && (
+            <section className="card">
+              <div className="board-head">
+                <h2>Packages</h2>
+                <div className="import-row">
+                  {packages.some((p) => !p.hasNozzle) && (
+                    <button
+                      className="btn btn-sm warn-btn"
+                      onClick={openWizard}
+                    >
+                      <WarnIcon size={14} />{" "}
+                      {packages.filter((p) => !p.hasNozzle).length} issues
+                    </button>
+                  )}
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => {
+                      setEditPackage({ ...NEW_PACKAGE });
+                      setPkgIsNew(true);
+                    }}
+                  >
+                    + Add package
+                  </button>
+                </div>
+              </div>
+              {packages.length === 0 ? (
+                <div className="muted">No packages yet.</div>
+              ) : (
+                <div className="ptable-wrap">
+                  <table className="ptable">
+                    <thead>
+                      <tr>
+                        <th className="chk-col"></th>
+                        <th>ID</th>
+                        <th>Description</th>
+                        <th>Nozzle tips</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {packages.map((p) => (
+                        <tr key={p.id}>
+                          <td className="chk-col">
+                            {!p.hasNozzle && (
+                              <span
+                                className="warn-tri"
+                                onClick={openWizard}
+                                onMouseEnter={(e) => {
+                                  const r =
+                                    e.currentTarget.getBoundingClientRect();
+                                  setTip({
+                                    text: "No approved nozzle tip — can't be picked. Click to resolve.",
+                                    x: r.left,
+                                    y: r.top,
+                                  });
+                                }}
+                                onMouseLeave={() => setTip(null)}
+                              >
+                                <WarnIcon size={14} />
+                              </span>
+                            )}
+                          </td>
+                          <td className="mono">{p.id}</td>
+                          <td className="muted">{p.description ?? "—"}</td>
+                          <td className="muted">
+                            {p.nozzleTips.length > 0
+                              ? p.nozzleTips.join(", ")
+                              : "—"}
+                          </td>
+                          <td className="row-actions">
+                            <button
+                              className="btn btn-sm btn-icon"
+                              onClick={() => {
+                                setEditPackage(p);
+                                setPkgIsNew(false);
+                              }}
+                              title="Edit package"
+                              aria-label="Edit package"
+                            >
+                              <GearIcon size={15} />
+                            </button>
+                            <button
+                              className="btn btn-sm btn-icon btn-trash"
+                              onClick={() => deletePackage(p.id)}
+                              title="Delete package"
+                              aria-label="Delete package"
+                            >
+                              <TrashIcon size={15} />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+          )}
         </div>
       </main>
 
@@ -2391,6 +2758,321 @@ function App() {
                   />
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {editPart && (
+        <div className="modal-backdrop" onClick={() => setEditPart(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>
+                {partIsNew ? "New part" : "Edit part"}
+                {!partIsNew && <span className="mono"> — {editPart.id}</span>}
+              </h3>
+              <button
+                className="icon-btn"
+                onClick={() => setEditPart(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              {partIsNew && (
+                <div className="field-row">
+                  <label>ID</label>
+                  <input
+                    className="import-input"
+                    autoFocus
+                    value={editPart.id}
+                    onChange={(e) =>
+                      setEditPart({ ...editPart, id: e.currentTarget.value })
+                    }
+                    placeholder="e.g. R-0402-10K"
+                  />
+                </div>
+              )}
+              <div className="field-row">
+                <label>Name</label>
+                <input
+                  className="import-input"
+                  value={editPart.name}
+                  onChange={(e) =>
+                    setEditPart({ ...editPart, name: e.currentTarget.value })
+                  }
+                />
+              </div>
+              <div className="field-grid">
+                <label className="loc-field">
+                  <span>Height mm</span>
+                  <NumberInput
+                    step={0.01}
+                    min={0}
+                    value={editPart.height}
+                    onChange={(v) => setEditPart({ ...editPart, height: v })}
+                  />
+                </label>
+                <label className="loc-field">
+                  <span>Speed</span>
+                  <NumberInput
+                    step={0.05}
+                    min={0}
+                    value={editPart.speed}
+                    onChange={(v) => setEditPart({ ...editPart, speed: v })}
+                  />
+                </label>
+                <label className="loc-field">
+                  <span>Package</span>
+                  <select
+                    className="type-select"
+                    value={editPart.package ?? ""}
+                    onChange={(e) =>
+                      setEditPart({
+                        ...editPart,
+                        package: e.currentTarget.value || null,
+                      })
+                    }
+                  >
+                    <option value="">—</option>
+                    {packages.map((pk) => (
+                      <option key={pk.id} value={pk.id}>
+                        {pk.id}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              {editPart.height === 0 && (
+                <div className="teach-head warn-text">
+                  <WarnIcon size={13} /> Height is 0 — set it so this part can be
+                  picked and placed.
+                </div>
+              )}
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setEditPart(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={!editPart.id.trim()}
+                onClick={savePart}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {editPackage && (
+        <div className="modal-backdrop" onClick={() => setEditPackage(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>
+                {pkgIsNew ? "New package" : "Edit package"}
+                {!pkgIsNew && <span className="mono"> — {editPackage.id}</span>}
+              </h3>
+              <button
+                className="icon-btn"
+                onClick={() => setEditPackage(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              {pkgIsNew && (
+                <div className="field-row">
+                  <label>ID</label>
+                  <input
+                    className="import-input"
+                    autoFocus
+                    value={editPackage.id}
+                    onChange={(e) =>
+                      setEditPackage({
+                        ...editPackage,
+                        id: e.currentTarget.value,
+                      })
+                    }
+                    placeholder="e.g. 0402"
+                  />
+                </div>
+              )}
+              <div className="field-row">
+                <label>Description</label>
+                <input
+                  className="import-input"
+                  value={editPackage.description ?? ""}
+                  onChange={(e) =>
+                    setEditPackage({
+                      ...editPackage,
+                      description: e.currentTarget.value,
+                    })
+                  }
+                />
+              </div>
+              <div className="teach-block">
+                <div className="teach-head">
+                  Approved nozzle tips (at least one is needed to pick this
+                  package)
+                </div>
+                {nozzleTips.length === 0 ? (
+                  <div className="muted">
+                    No nozzle tips defined on the machine.
+                  </div>
+                ) : (
+                  <div className="nt-list">
+                    {nozzleTips.map((nt) => (
+                      <label key={nt.id} className="run-toggle">
+                        <input
+                          type="checkbox"
+                          checked={editPackage.nozzleTips.includes(nt.id)}
+                          onChange={(e) =>
+                            setEditPackage({
+                              ...editPackage,
+                              nozzleTips: e.currentTarget.checked
+                                ? [...editPackage.nozzleTips, nt.id]
+                                : editPackage.nozzleTips.filter(
+                                    (x) => x !== nt.id,
+                                  ),
+                            })
+                          }
+                        />
+                        {nt.name}
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setEditPackage(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={!editPackage.id.trim()}
+                onClick={savePackage}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {wizardOpen && (
+        <div className="modal-backdrop" onClick={() => setWizardOpen(false)}>
+          <div
+            className="modal modal-wide"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3>Resolve issues</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setWizardOpen(false)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body plc-body">
+              {partsDetail.filter((p) => !p.hasHeight).length === 0 &&
+              packages.filter((p) => !p.hasNozzle).length === 0 ? (
+                <div className="muted">
+                  All good — every part has a height and every package has an
+                  approved nozzle tip.
+                </div>
+              ) : (
+                <>
+                  {partsDetail.filter((p) => !p.hasHeight).length > 0 && (
+                    <>
+                      <div className="teach-head">
+                        Parts missing a height (needed to pick/place)
+                      </div>
+                      <table className="ptable wizard-table">
+                        <tbody>
+                          {partsDetail
+                            .filter((p) => !p.hasHeight)
+                            .map((p) => (
+                              <tr key={p.id}>
+                                <td className="mono">{p.id}</td>
+                                <td className="muted">{p.package ?? "—"}</td>
+                                <td className="wizard-fix">
+                                  <span className="muted">Height mm</span>
+                                  <NumberInput
+                                    step={0.01}
+                                    min={0}
+                                    value={p.height}
+                                    onChange={(v) =>
+                                      updatePart(p.id, { height: v })
+                                    }
+                                  />
+                                </td>
+                              </tr>
+                            ))}
+                        </tbody>
+                      </table>
+                    </>
+                  )}
+                  {packages.filter((p) => !p.hasNozzle).length > 0 && (
+                    <>
+                      <div className="teach-head">
+                        Packages with no approved nozzle tip
+                      </div>
+                      <table className="ptable wizard-table">
+                        <tbody>
+                          {packages
+                            .filter((p) => !p.hasNozzle)
+                            .map((p) => (
+                              <tr key={p.id}>
+                                <td className="mono">{p.id}</td>
+                                <td className="wizard-fix">
+                                  {nozzleTips.length === 0 ? (
+                                    <span className="muted">
+                                      no nozzle tips on machine
+                                    </span>
+                                  ) : (
+                                    nozzleTips.map((nt) => (
+                                      <label key={nt.id} className="run-toggle">
+                                        <input
+                                          type="checkbox"
+                                          checked={p.nozzleTips.includes(nt.id)}
+                                          onChange={(e) =>
+                                            updatePackage(p.id, {
+                                              nozzleTips: e.currentTarget.checked
+                                                ? [...p.nozzleTips, nt.id]
+                                                : p.nozzleTips.filter(
+                                                    (x) => x !== nt.id,
+                                                  ),
+                                            })
+                                          }
+                                        />
+                                        {nt.name}
+                                      </label>
+                                    ))
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                        </tbody>
+                      </table>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+            <div className="modal-foot">
+              <button
+                className="btn btn-primary"
+                onClick={() => setWizardOpen(false)}
+              >
+                Done
+              </button>
             </div>
           </div>
         </div>

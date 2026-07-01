@@ -30,6 +30,7 @@ import org.openpnp.model.Length;
 import org.openpnp.model.LengthUnit;
 import org.openpnp.model.Location;
 import org.openpnp.model.Motion.MotionOption;
+import org.openpnp.model.Package;
 import org.openpnp.model.Part;
 import org.openpnp.model.Placement;
 import org.openpnp.spi.Actuator;
@@ -42,6 +43,7 @@ import org.openpnp.spi.JobProcessor;
 import org.openpnp.spi.Machine;
 import org.openpnp.spi.MachineListener;
 import org.openpnp.spi.Nozzle;
+import org.openpnp.spi.NozzleTip;
 import org.openpnp.spi.PnpJobProcessor;
 import org.openpnp.spi.base.AbstractFeeder;
 import org.openpnp.util.MovableUtils;
@@ -218,6 +220,14 @@ public class ViperServer {
         app.post("/api/job/placement/delete", ViperServer::deletePlacement);
         app.post("/api/job/placement/batch", ViperServer::batchPlacements);
         app.post("/api/job/board-origin", ViperServer::setBoardOriginFromPlacement);
+        app.get("/api/parts/detail", ViperServer::listPartsDetail);
+        app.post("/api/part", ViperServer::updatePart);
+        app.post("/api/part/add", ViperServer::addPart);
+        app.post("/api/part/delete", ViperServer::deletePart);
+        app.get("/api/packages", ViperServer::listPackages);
+        app.post("/api/package", ViperServer::updatePackage);
+        app.post("/api/package/add", ViperServer::addPackage);
+        app.post("/api/package/delete", ViperServer::deletePackage);
         app.get("/api/boards", ViperServer::listBoards);
         app.post("/api/board", ViperServer::getBoardPlacements);
         app.post("/api/board/dimensions", ViperServer::setBoardDimensions);
@@ -769,6 +779,266 @@ public class ViperServer {
             }
         }
         return null;
+    }
+
+    // ---------------------------------------------------------------- Parts
+
+    /** All parts with the fields the Parts page needs; hasHeight flags the issue. */
+    private static Map<String, Object> describePartsDetail() {
+        List<Map<String, Object>> parts = new ArrayList<>();
+        for (Part p : Configuration.get().getParts()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", p.getId());
+            m.put("name", p.getName());
+            double h = p.getHeight() != null
+                    ? p.getHeight().convertToUnits(LengthUnit.Millimeters).getValue() : 0;
+            m.put("height", round(h));
+            m.put("hasHeight", h > 0);
+            m.put("package", p.getPackage() != null ? p.getPackage().getId() : null);
+            m.put("speed", round(p.getSpeed()));
+            parts.add(m);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("parts", parts);
+        return root;
+    }
+
+    private static void listPartsDetail(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        ctx.result(GSON.toJson(describePartsDetail()));
+    }
+
+    /** POST /api/part — update. Body: {id, name?, height?, packageId?, speed?}. */
+    private static void updatePart(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PartUpdate req = GSON.fromJson(ctx.body(), PartUpdate.class);
+            Part p = req != null ? Configuration.get().getPart(req.id) : null;
+            if (p == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"part not found\"}");
+                return;
+            }
+            if (req.name != null) {
+                p.setName(req.name);
+            }
+            if (req.height != null) {
+                p.setHeight(new Length(Math.max(0, req.height), LengthUnit.Millimeters));
+            }
+            if (req.packageId != null) {
+                p.setPackage(req.packageId.isEmpty() ? null
+                        : Configuration.get().getPackage(req.packageId));
+            }
+            if (req.speed != null) {
+                p.setSpeed(req.speed);
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describePartsDetail()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/part/add — create. Body: {id, name?, height?, packageId?}. */
+    private static void addPart(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PartUpdate req = GSON.fromJson(ctx.body(), PartUpdate.class);
+            if (req == null || req.id == null || req.id.trim().isEmpty()) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"id is required\"}");
+                return;
+            }
+            String id = req.id.trim();
+            if (Configuration.get().getPart(id) != null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"a part with that id already exists\"}");
+                return;
+            }
+            Part p = new Part(id);
+            p.setName(req.name != null ? req.name : id);
+            if (req.height != null) {
+                p.setHeight(new Length(Math.max(0, req.height), LengthUnit.Millimeters));
+            }
+            if (req.packageId != null && !req.packageId.isEmpty()) {
+                p.setPackage(Configuration.get().getPackage(req.packageId));
+            }
+            Configuration.get().addPart(p);
+            markDirty();
+            ctx.result(GSON.toJson(describePartsDetail()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/part/delete — Body: {id}. */
+    private static void deletePart(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PartUpdate req = GSON.fromJson(ctx.body(), PartUpdate.class);
+            Part p = req != null ? Configuration.get().getPart(req.id) : null;
+            if (p == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"part not found\"}");
+                return;
+            }
+            Configuration.get().removePart(p);
+            markDirty();
+            ctx.result(GSON.toJson(describePartsDetail()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    // ------------------------------------------------------------- Packages
+
+    /** All packages + the machine's nozzle tips; hasNozzle flags the issue. */
+    private static Map<String, Object> describePackages() {
+        List<Map<String, Object>> pkgs = new ArrayList<>();
+        for (Package pk : Configuration.get().getPackages()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", pk.getId());
+            m.put("description", pk.getDescription());
+            List<String> nts = new ArrayList<>();
+            for (NozzleTip nt : pk.getCompatibleNozzleTips()) {
+                nts.add(nt.getId());
+            }
+            m.put("nozzleTips", nts);
+            m.put("hasNozzle", !nts.isEmpty());
+            pkgs.add(m);
+        }
+        List<Map<String, Object>> allNts = new ArrayList<>();
+        for (NozzleTip nt : machine.getNozzleTips()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", nt.getId());
+            m.put("name", nt.getName());
+            allNts.add(m);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("packages", pkgs);
+        root.put("nozzleTips", allNts);
+        return root;
+    }
+
+    private static void listPackages(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        ctx.result(GSON.toJson(describePackages()));
+    }
+
+    private static NozzleTip findNozzleTip(String id) {
+        for (NozzleTip nt : machine.getNozzleTips()) {
+            if (nt.getId().equals(id)) {
+                return nt;
+            }
+        }
+        return null;
+    }
+
+    /** POST /api/package — Body: {id, description?, nozzleTips?:[ids]}. */
+    private static void updatePackage(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PackageUpdate req = GSON.fromJson(ctx.body(), PackageUpdate.class);
+            Package pk = req != null ? Configuration.get().getPackage(req.id) : null;
+            if (pk == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"package not found\"}");
+                return;
+            }
+            if (req.description != null) {
+                pk.setDescription(req.description);
+            }
+            if (req.nozzleTips != null) {
+                for (NozzleTip nt : new ArrayList<>(pk.getCompatibleNozzleTips())) {
+                    pk.removeCompatibleNozzleTip(nt);
+                }
+                for (String ntId : req.nozzleTips) {
+                    NozzleTip nt = findNozzleTip(ntId);
+                    if (nt != null) {
+                        pk.addCompatibleNozzleTip(nt);
+                    }
+                }
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describePackages()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/package/add — Body: {id, description?}. */
+    private static void addPackage(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PackageUpdate req = GSON.fromJson(ctx.body(), PackageUpdate.class);
+            if (req == null || req.id == null || req.id.trim().isEmpty()) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"id is required\"}");
+                return;
+            }
+            String id = req.id.trim();
+            if (Configuration.get().getPackage(id) != null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"a package with that id already exists\"}");
+                return;
+            }
+            Package pk = new Package(id);
+            if (req.description != null) {
+                pk.setDescription(req.description);
+            }
+            Configuration.get().addPackage(pk);
+            markDirty();
+            ctx.result(GSON.toJson(describePackages()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/package/delete — Body: {id}. */
+    private static void deletePackage(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PackageUpdate req = GSON.fromJson(ctx.body(), PackageUpdate.class);
+            Package pk = req != null ? Configuration.get().getPackage(req.id) : null;
+            if (pk == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"package not found\"}");
+                return;
+            }
+            Configuration.get().removePackage(pk);
+            markDirty();
+            ctx.result(GSON.toJson(describePackages()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for part endpoints. */
+    private static class PartUpdate {
+        String id;
+        String name;
+        Double height;
+        String packageId;
+        Double speed;
+    }
+
+    /** JSON body for package endpoints. */
+    private static class PackageUpdate {
+        String id;
+        String description;
+        List<String> nozzleTips;
     }
 
     /** GET /api/boards — the board library. */
