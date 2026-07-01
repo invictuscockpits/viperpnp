@@ -236,6 +236,153 @@ body {
   font-size: 0.78rem;
 }
 
+.badges {
+  display: flex;
+  gap: 6px;
+}
+
+.badge {
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  background: var(--panel-2);
+}
+
+.badge.on {
+  color: var(--green);
+  border-color: var(--green-dim);
+}
+
+.badge.busy {
+  color: #d8a000;
+  border-color: #d8a00044;
+}
+
+.banner-warn {
+  border-color: #5a4a2a;
+  background: #2a2417;
+  color: #f0dca8;
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  padding: 1.4rem 1.4rem 0;
+}
+
+.btn {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--green);
+  color: #04220f;
+  border-color: var(--green);
+  font-weight: 500;
+}
+
+.btn-primary:hover:not(:disabled) {
+  color: #04220f;
+}
+
+.btn-danger {
+  border-color: #d2413a;
+  color: #e06a6a;
+}
+
+.btn-danger:hover:not(:disabled) {
+  border-color: #d2413a;
+  color: #e06a6a;
+}
+
+.btn-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 0.9rem;
+}
+
+.step-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 0.9rem;
+}
+
+.chip-btn {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 3px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.chip-btn.active {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.jog {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.jog-axis {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.jog-btn {
+  text-align: center;
+  font-weight: 500;
+  padding: 0.5rem 0;
+}
+
+.pos-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.pos-cell {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.8rem;
+}
+
+.pos-val {
+  font-size: 1.3rem;
+  font-weight: 500;
+  color: var(--green);
+  font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 760px) {
   .grid {
     grid-template-columns: repeat(2, 1fr);
@@ -243,5 +390,9 @@ body {
 
   .span-4 {
     grid-column: span 2;
+  }
+
+  .controls {
+    grid-template-columns: 1fr;
   }
 }

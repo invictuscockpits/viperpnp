@@ -35,6 +35,11 @@ export default defineConfig(async () => ({
         target: "http://localhost:8077",
         changeOrigin: true,
       },
+      "/ws": {
+        target: "http://localhost:8077",
+        ws: true,
+        changeOrigin: true,
+      },
     },
   },
 }));
