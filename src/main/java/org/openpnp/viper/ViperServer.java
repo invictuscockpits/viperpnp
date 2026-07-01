@@ -95,6 +95,10 @@ public class ViperServer {
 
     private static Machine machine;
     private static Job currentJob;
+    /** Loaded *.job.xml files (OpenPnP has no job registry; we keep our own). */
+    private static final List<Job> jobLibrary = new ArrayList<>();
+    /** The job selected as the run/edit target; null = the auto all-boards job. */
+    private static File activeJobFile = null;
     private static volatile boolean jobRunning = false;
     private static volatile boolean jobAbortRequested = false;
     private static PnpJobProcessor jobProcessor;
@@ -120,6 +124,7 @@ public class ViperServer {
                 + (System.currentTimeMillis() - t0) + " ms");
 
         loadBoardsFolder();
+        loadJobsFolder();
         loadAliases();
         machine.addListener(new StatusBroadcastListener());
 
@@ -263,6 +268,12 @@ public class ViperServer {
         app.post("/api/boards/remove", ViperServer::removeBoard);
         app.post("/api/job/run", ViperServer::runJob);
         app.post("/api/job/abort", ViperServer::abortJob);
+        app.get("/api/jobs", ViperServer::listJobs);
+        app.post("/api/job/select", ViperServer::selectJob);
+        app.post("/api/jobs/new", ViperServer::newJob);
+        app.post("/api/jobs/save", ViperServer::saveJob);
+        app.post("/api/jobs/remove", ViperServer::removeJob);
+        app.post("/api/jobs/rename", ViperServer::renameJob);
         app.get("/api/job/state", ctx -> {
             Map<String, Object> s = new LinkedHashMap<>();
             s.put("running", jobRunning);
@@ -288,6 +299,13 @@ public class ViperServer {
                 for (Board b : Configuration.get().getBoards()) {
                     if (b.isDirty() && b.getFile() != null) {
                         Configuration.get().saveBoard(b);
+                    }
+                }
+                // Persist edited jobs to their .job.xml files.
+                for (Job j : jobLibrary) {
+                    if (j.isDirty() && j.getFile() != null) {
+                        Configuration.get().saveJob(j, j.getFile());
+                        j.setDirty(false);
                     }
                 }
                 Configuration.get().save();
@@ -707,6 +725,100 @@ public class ViperServer {
         syncJob();
     }
 
+    // --------------------------------------------------------- Job library
+
+    private static File jobsDir() {
+        return new File(Configuration.get().getConfigurationDirectory(), "jobs");
+    }
+
+    /** A job name from its file (basename without the .job.xml extension). */
+    private static String jobName(File f) {
+        if (f == null) {
+            return "untitled";
+        }
+        String base = f.getName();
+        int dot = base.indexOf('.');
+        return dot > 0 ? base.substring(0, dot) : base;
+    }
+
+    /** Resolves where a job's .job.xml is written, honoring a custom path. */
+    private static File resolveJobFile(String savePath, String name) {
+        String fileName = name.replaceAll("[^a-zA-Z0-9._-]", "_") + ".job.xml";
+        if (savePath != null && !savePath.trim().isEmpty()) {
+            String sp = savePath.trim();
+            if (sp.toLowerCase().endsWith(".job.xml")) {
+                return new File(sp);
+            }
+            return new File(sp, fileName);
+        }
+        return new File(jobsDir(), fileName);
+    }
+
+    /** Loads every *.job.xml under the jobs folder into the library at startup. */
+    private static void loadJobsFolder() {
+        File dir = jobsDir();
+        dir.mkdirs();
+        File[] files = dir.listFiles((d, n) -> n.toLowerCase().endsWith(".job.xml"));
+        if (files == null) {
+            return;
+        }
+        for (File f : files) {
+            try {
+                Job job = Configuration.get().loadJob(f);
+                job.setFile(f);
+                job.setDirty(false);
+                jobLibrary.add(job);
+            }
+            catch (Exception e) {
+                System.out.println("[viper] failed to load job " + f + ": " + e.getMessage());
+            }
+        }
+    }
+
+    /** The job in the library backed by the given file (by absolute path). */
+    private static Job findJob(String path) {
+        if (path == null) {
+            return null;
+        }
+        File want = new File(path);
+        for (Job j : jobLibrary) {
+            if (j.getFile() != null && j.getFile().getAbsolutePath().equals(want.getAbsolutePath())) {
+                return j;
+            }
+        }
+        return null;
+    }
+
+    /** The currently-active job file's Job, or null if none is active. */
+    private static Job activeJob() {
+        return activeJobFile == null ? null : findJob(activeJobFile.getAbsolutePath());
+    }
+
+    /** The job library: every loaded job with board/placement counts + state. */
+    private static Map<String, Object> describeJobs() {
+        List<Map<String, Object>> jobs = new ArrayList<>();
+        for (Job j : jobLibrary) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            String path = j.getFile() != null ? j.getFile().getAbsolutePath() : null;
+            m.put("file", path);
+            m.put("name", jobName(j.getFile()));
+            m.put("boardCount", j.getBoardLocations().size());
+            int placements = 0;
+            for (BoardLocation bl : j.getBoardLocations()) {
+                placements += bl.getBoard().getPlacements().size();
+            }
+            m.put("placementCount", placements);
+            m.put("active", activeJobFile != null && path != null
+                    && activeJobFile.getAbsolutePath().equals(path));
+            m.put("dirty", j.isDirty());
+            jobs.add(m);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("jobs", jobs);
+        root.put("activeFile", activeJobFile != null ? activeJobFile.getAbsolutePath() : null);
+        return root;
+    }
+
     /** Board width (mm) or height (mm) from its dimensions, 0 if unset. */
     private static double boardDim(Board b, boolean width) {
         Location d = b.getDimensions();
@@ -764,6 +876,17 @@ public class ViperServer {
      * placement teach/origin/run all work while boards live as reusable files.
      */
     private static void syncJob() {
+        // When a *.job.xml is selected as active, that job IS the current job;
+        // board/placement edits reflect through the shared Board objects, so we
+        // must not clobber it with the all-boards rebuild.
+        if (activeJobFile != null) {
+            Job aj = activeJob();
+            if (aj != null) {
+                currentJob = aj;
+                return;
+            }
+            activeJobFile = null; // active job left the library; fall back
+        }
         // Rebuild the job from the library (only adds locations — never removes,
         // because BoardLocation.dispose() pokes the Swing GUI, which is null
         // headless). Origins/side of surviving boards are carried over by object.
@@ -2561,6 +2684,170 @@ public class ViperServer {
         String errorHandling;
         Integer feederFaultLimit;
         Integer maxPlacementRetries;
+    }
+
+    /** GET /api/jobs — the job-file library. */
+    private static void listJobs(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        ctx.result(GSON.toJson(describeJobs()));
+    }
+
+    /** POST /api/job/select — set the active job. Body: {file} ("" clears to all-boards). */
+    private static void selectJob(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobFileRequest req = GSON.fromJson(ctx.body(), JobFileRequest.class);
+            if (req == null || req.file == null || req.file.trim().isEmpty()) {
+                activeJobFile = null;
+            }
+            else {
+                Job j = findJob(req.file);
+                if (j == null) {
+                    ctx.status(404);
+                    ctx.result("{\"error\":\"job not found\"}");
+                    return;
+                }
+                activeJobFile = j.getFile();
+            }
+            syncJob();
+            ctx.result(GSON.toJson(describeJobs()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/jobs/new — create an empty job file. Body: {name, savePath?}. */
+    private static void newJob(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobFileRequest req = GSON.fromJson(ctx.body(), JobFileRequest.class);
+            String name = req != null && req.name != null ? req.name.trim() : "";
+            if (name.isEmpty()) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"name required\"}");
+                return;
+            }
+            File file = resolveJobFile(req != null ? req.savePath : null, name);
+            if (findJob(file.getAbsolutePath()) != null || file.exists()) {
+                ctx.status(409);
+                ctx.result(GSON.toJson(java.util.Map.of("conflict", true,
+                        "name", name, "file", file.getAbsolutePath())));
+                return;
+            }
+            Job job = new Job();
+            job.setFile(file);
+            file.getParentFile().mkdirs();
+            Configuration.get().saveJob(job, file);
+            job.setDirty(false);
+            jobLibrary.add(job);
+            ctx.result(GSON.toJson(describeJobs()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/jobs/save — persist a job to its file. Body: {file?} (default active). */
+    private static void saveJob(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobFileRequest req = GSON.fromJson(ctx.body(), JobFileRequest.class);
+            Job j = req != null && req.file != null && !req.file.isEmpty()
+                    ? findJob(req.file) : activeJob();
+            if (j == null || j.getFile() == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"job not found\"}");
+                return;
+            }
+            Configuration.get().saveJob(j, j.getFile());
+            j.setDirty(false);
+            ctx.result(GSON.toJson(describeJobs()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/jobs/remove — delete a job (from library + disk). Body: {file}. */
+    private static void removeJob(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobFileRequest req = GSON.fromJson(ctx.body(), JobFileRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            if (j == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"job not found\"}");
+                return;
+            }
+            if (jobRunning && j == activeJob()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"job is running\"}");
+                return;
+            }
+            File f = j.getFile();
+            jobLibrary.remove(j);
+            if (activeJobFile != null && f != null
+                    && activeJobFile.getAbsolutePath().equals(f.getAbsolutePath())) {
+                activeJobFile = null;
+                syncJob();
+            }
+            if (f != null) {
+                f.delete();
+            }
+            ctx.result(GSON.toJson(describeJobs()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/jobs/rename — rename a job file. Body: {file, name}. */
+    private static void renameJob(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobFileRequest req = GSON.fromJson(ctx.body(), JobFileRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            if (j == null || req.name == null || req.name.trim().isEmpty()) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"job not found or name missing\"}");
+                return;
+            }
+            File old = j.getFile();
+            File dest = new File(old.getParentFile(),
+                    req.name.trim().replaceAll("[^a-zA-Z0-9._-]", "_") + ".job.xml");
+            if (dest.exists() && !dest.getAbsolutePath().equals(old.getAbsolutePath())) {
+                ctx.status(409);
+                ctx.result(GSON.toJson(java.util.Map.of("conflict", true, "name", req.name.trim())));
+                return;
+            }
+            Configuration.get().saveJob(j, dest);
+            if (!dest.getAbsolutePath().equals(old.getAbsolutePath())) {
+                old.delete();
+            }
+            j.setFile(dest);
+            j.setDirty(false);
+            if (activeJobFile != null && old != null
+                    && activeJobFile.getAbsolutePath().equals(old.getAbsolutePath())) {
+                activeJobFile = dest;
+            }
+            ctx.result(GSON.toJson(describeJobs()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for the job-library endpoints. */
+    private static class JobFileRequest {
+        String file;
+        String name;
+        String savePath;
     }
 
     /** Marks the config as having unsaved changes and notifies clients. */

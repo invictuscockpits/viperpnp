@@ -138,6 +138,15 @@ interface BoardInfo {
   dirty: boolean;
 }
 
+interface JobLibInfo {
+  file: string | null;
+  name: string;
+  boardCount: number;
+  placementCount: number;
+  active: boolean;
+  dirty: boolean;
+}
+
 interface PartInfo {
   id: string;
   name: string;
@@ -286,13 +295,14 @@ type TeachTarget =
   | "firstRowLast"
   | "lastComponent";
 
-type Tab = "machine" | "board" | "feeders" | "parts" | "packages";
+type Tab = "machine" | "board" | "jobs" | "feeders" | "parts" | "packages";
 
 const STEPS = [0.01, 0.1, 1, 10, 100];
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "machine", label: "Machine" },
   { id: "board", label: "Board" },
+  { id: "jobs", label: "Jobs" },
   { id: "feeders", label: "Feeders" },
   { id: "parts", label: "Parts" },
   { id: "packages", label: "Packages" },
@@ -507,6 +517,17 @@ function App() {
   const [sortDir, setSortDir] = useState<1 | -1>(1);
   const [newBoardOpen, setNewBoardOpen] = useState(false);
   const [newBoardName, setNewBoardName] = useState("");
+  const [jobs, setJobs] = useState<JobLibInfo[]>([]);
+  const [newJobOpen, setNewJobOpen] = useState(false);
+  const [newJobName, setNewJobName] = useState("");
+  const [renameJobTarget, setRenameJobTarget] = useState<JobLibInfo | null>(
+    null,
+  );
+  const [renameJobName, setRenameJobName] = useState("");
+  const [removeJobTarget, setRemoveJobTarget] = useState<JobLibInfo | null>(
+    null,
+  );
+  const [jobErr, setJobErr] = useState("");
   const [editPlacement, setEditPlacement] = useState<Placement | null>(null);
   const [partsDetail, setPartsDetail] = useState<PartInfo[]>([]);
   const [packages, setPackages] = useState<PackageInfo[]>([]);
@@ -587,6 +608,72 @@ function App() {
       /* ignore */
     }
   }, []);
+
+  const loadJobs = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/jobs")).json();
+      setJobs(d.jobs ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const postJob = async (url: string, body: object): Promise<boolean> => {
+    setJobErr("");
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const d = await res.json();
+      if (res.status === 409 && d.conflict) {
+        setJobErr(`A job named "${d.name}" already exists.`);
+        return false;
+      }
+      if (!res.ok) {
+        setJobErr(d.error ?? "Request failed.");
+        return false;
+      }
+      if (d.jobs) setJobs(d.jobs);
+      return true;
+    } catch (e) {
+      setJobErr(e instanceof Error ? e.message : String(e));
+      return false;
+    }
+  };
+
+  const createJob = async () => {
+    const name = newJobName.trim();
+    if (!name) return;
+    if (await postJob("/api/jobs/new", { name })) {
+      setNewJobOpen(false);
+      setNewJobName("");
+    }
+  };
+
+  const selectJob = (file: string | null) => {
+    postJob("/api/job/select", { file: file ?? "" });
+  };
+
+  const doRenameJob = async () => {
+    if (!renameJobTarget?.file) return;
+    if (
+      await postJob("/api/jobs/rename", {
+        file: renameJobTarget.file,
+        name: renameJobName.trim(),
+      })
+    ) {
+      setRenameJobTarget(null);
+    }
+  };
+
+  const doRemoveJob = async () => {
+    if (!removeJobTarget?.file) return;
+    if (await postJob("/api/jobs/remove", { file: removeJobTarget.file })) {
+      setRemoveJobTarget(null);
+    }
+  };
 
   const loadParts = useCallback(async () => {
     try {
@@ -784,6 +871,10 @@ function App() {
     if (tab === "board") {
       loadBoards();
     }
+    if (tab === "jobs") {
+      loadJobs();
+      loadBoards();
+    }
     if (tab === "parts") {
       loadParts();
       loadPackages();
@@ -791,7 +882,7 @@ function App() {
     if (tab === "packages") {
       loadPackages();
     }
-  }, [tab, loadFeeders, loadBoards, loadParts, loadPackages]);
+  }, [tab, loadFeeders, loadBoards, loadJobs, loadParts, loadPackages]);
 
   useEffect(() => {
     let closed = false;
@@ -2077,6 +2168,103 @@ function App() {
                               onClick={() => setRemoveBoardTarget(b)}
                               title="Remove board from library"
                               aria-label="Remove board"
+                            >
+                              <TrashIcon size={15} />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+          )}
+
+          {tab === "jobs" && (
+            <section className="board card">
+              <div className="board-head">
+                <h2>Jobs</h2>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => {
+                    setNewJobName("");
+                    setJobErr("");
+                    setNewJobOpen(true);
+                  }}
+                >
+                  + New job
+                </button>
+              </div>
+              <p className="muted job-hint">
+                A job is a <span className="mono">.job.xml</span> file that
+                places one or more boards on the machine. Set one active to edit
+                or run it. Cross-compatible with OpenPnP.
+              </p>
+              {jobErr && <div className="banner banner-warn">{jobErr}</div>}
+              {jobs.length === 0 ? (
+                <div className="muted">
+                  No jobs yet. Create one, then add boards to it.
+                </div>
+              ) : (
+                <div className="ptable-wrap">
+                  <table className="ptable">
+                    <thead>
+                      <tr>
+                        <th></th>
+                        <th>Job</th>
+                        <th>Boards</th>
+                        <th>Placements</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {jobs.map((j) => (
+                        <tr
+                          key={j.file ?? j.name}
+                          className={j.active ? "job-active-row" : ""}
+                        >
+                          <td>
+                            <input
+                              type="radio"
+                              name="active-job"
+                              checked={j.active}
+                              onChange={() => selectJob(j.file)}
+                              title="Set as the active job"
+                            />
+                          </td>
+                          <td className="mono">
+                            {j.name}
+                            {j.active && (
+                              <span className="job-active-tag">active</span>
+                            )}
+                            {j.dirty && (
+                              <span className="dirty-dot" title="Unsaved edits">
+                                {" "}
+                                •
+                              </span>
+                            )}
+                          </td>
+                          <td className="mono">{j.boardCount}</td>
+                          <td className="mono">{j.placementCount}</td>
+                          <td className="row-actions">
+                            <button
+                              className="btn btn-sm btn-icon"
+                              onClick={() => {
+                                setRenameJobName(j.name);
+                                setJobErr("");
+                                setRenameJobTarget(j);
+                              }}
+                              title="Rename job"
+                              aria-label="Rename job"
+                            >
+                              <GearIcon size={15} />
+                            </button>
+                            <button
+                              className="btn btn-sm btn-icon btn-trash"
+                              onClick={() => setRemoveJobTarget(j)}
+                              title="Delete job"
+                              aria-label="Delete job"
                             >
                               <TrashIcon size={15} />
                             </button>
@@ -4642,6 +4830,133 @@ function App() {
               </button>
               <button className="btn btn-danger" onClick={confirmRemoveBoard}>
                 Remove
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {newJobOpen && (
+        <div className="modal-backdrop" onClick={() => setNewJobOpen(false)}>
+          <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>New job</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setNewJobOpen(false)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="field-row">
+                <label>Name</label>
+                <input
+                  className="import-input"
+                  autoFocus
+                  value={newJobName}
+                  onChange={(e) => setNewJobName(e.currentTarget.value)}
+                  onKeyDown={(e) => e.key === "Enter" && createJob()}
+                  placeholder="e.g. Panel1"
+                />
+              </div>
+              <p className="muted">
+                Saved to <span className="mono">config/jobs/</span> as a{" "}
+                <span className="mono">.job.xml</span> file.
+              </p>
+              {jobErr && <div className="banner banner-warn">{jobErr}</div>}
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setNewJobOpen(false)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={createJob}
+                disabled={!newJobName.trim()}
+              >
+                Create
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {renameJobTarget && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setRenameJobTarget(null)}
+        >
+          <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>Rename job</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setRenameJobTarget(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="field-row">
+                <label>Name</label>
+                <input
+                  className="import-input"
+                  autoFocus
+                  value={renameJobName}
+                  onChange={(e) => setRenameJobName(e.currentTarget.value)}
+                  onKeyDown={(e) => e.key === "Enter" && doRenameJob()}
+                />
+              </div>
+              {jobErr && <div className="banner banner-warn">{jobErr}</div>}
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setRenameJobTarget(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={doRenameJob}
+                disabled={
+                  !renameJobName.trim() ||
+                  renameJobName.trim() === renameJobTarget.name
+                }
+              >
+                Rename
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {removeJobTarget && (
+        <div className="modal-backdrop" onClick={() => setRemoveJobTarget(null)}>
+          <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>Delete job?</h3>
+              <button
+                className="icon-btn"
+                onClick={() => setRemoveJobTarget(null)}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p className="confirm-text">
+                Delete <span className="mono">{removeJobTarget.name}</span>? This
+                removes the <span className="mono">.job.xml</span> file from
+                disk. The boards it referenced are not affected.
+              </p>
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={() => setRemoveJobTarget(null)}>
+                Cancel
+              </button>
+              <button className="btn btn-danger" onClick={doRemoveJob}>
+                Delete
               </button>
             </div>
           </div>

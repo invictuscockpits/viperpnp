@@ -1326,6 +1326,27 @@ input[type="number"] {
   flex: none;
 }
 
+.job-hint {
+  font-size: 0.82rem;
+  margin: 0.2rem 0 0.6rem;
+}
+
+.job-active-row {
+  background: var(--green-dim);
+}
+
+.job-active-tag {
+  margin-left: 0.5rem;
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--green);
+  border: 1px solid var(--green);
+  border-radius: 3px;
+  padding: 0.05rem 0.3rem;
+  vertical-align: middle;
+}
+
 .detect-grp {
   border-left: 2px solid var(--border);
   padding-left: 0.7rem;
