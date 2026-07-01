@@ -91,6 +91,8 @@ public class ViperServer {
     private static volatile boolean jobAbortRequested = false;
     private static PnpJobProcessor jobProcessor;
     private static volatile boolean configDirty = false;
+    /** file-part-id → canonical-part-id remap rules (persisted alongside config). */
+    private static final Map<String, String> partAliases = new LinkedHashMap<>();
 
     public static void main(String[] args) throws Exception {
         File configDir;
@@ -110,6 +112,7 @@ public class ViperServer {
                 + (System.currentTimeMillis() - t0) + " ms");
 
         loadBoardsFolder();
+        loadAliases();
         machine.addListener(new StatusBroadcastListener());
 
         int port = Integer.getInteger("viper.port", 8077);
@@ -224,6 +227,10 @@ public class ViperServer {
         app.post("/api/part", ViperServer::updatePart);
         app.post("/api/part/add", ViperServer::addPart);
         app.post("/api/part/delete", ViperServer::deletePart);
+        app.post("/api/parts/merge", ViperServer::mergeParts);
+        app.post("/api/parts/apply-remaps", ViperServer::applyRemaps);
+        app.get("/api/aliases", ViperServer::listAliases);
+        app.post("/api/aliases/remove", ViperServer::removeAlias);
         app.get("/api/packages", ViperServer::listPackages);
         app.post("/api/package", ViperServer::updatePackage);
         app.post("/api/package/add", ViperServer::addPackage);
@@ -606,7 +613,10 @@ public class ViperServer {
             Configuration.get().saveBoard(board);
             Configuration.get().addBoard(board);
             syncJob();
-            ctx.result(GSON.toJson(describeBoards()));
+            Map<String, Object> resp = describeBoards();
+            resp.put("pendingRemaps", pendingRemaps(board));
+            resp.put("importedBoard", file.getAbsolutePath());
+            ctx.result(GSON.toJson(resp));
         }
         catch (Exception e) {
             ctx.status(500);
@@ -894,6 +904,215 @@ public class ViperServer {
             ctx.status(500);
             ctx.result(GSON.toJson(errorMap(e)));
         }
+    }
+
+    // --------------------------------------------------------- Part aliases
+
+    /** The alias-rules file, &lt;configDir&gt;/viper-part-aliases.json. */
+    private static File aliasesFile() {
+        return new File(Configuration.get().getConfigurationDirectory(),
+                "viper-part-aliases.json");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void loadAliases() {
+        File f = aliasesFile();
+        if (!f.exists()) {
+            return;
+        }
+        try (java.io.Reader r = new java.io.FileReader(f)) {
+            Map<String, String> m = GSON.fromJson(r, Map.class);
+            if (m != null) {
+                partAliases.putAll(m);
+            }
+        }
+        catch (Exception e) {
+            System.out.println("[viper] failed to load part aliases: " + e.getMessage());
+        }
+    }
+
+    private static void saveAliases() {
+        try (java.io.Writer w = new java.io.FileWriter(aliasesFile())) {
+            GSON.toJson(partAliases, w);
+        }
+        catch (Exception e) {
+            System.out.println("[viper] failed to save part aliases: " + e.getMessage());
+        }
+    }
+
+    /** True if the part id is used by any board placement or any feeder. */
+    private static boolean partInUse(String partId) {
+        for (Board b : Configuration.get().getBoards()) {
+            for (Placement p : b.getPlacements()) {
+                if (p.getPart() != null && p.getPart().getId().equals(partId)) {
+                    return true;
+                }
+            }
+        }
+        for (Feeder f : machine.getFeeders()) {
+            if (f.getPart() != null && f.getPart().getId().equals(partId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Reassigns every placement/feeder using {@code from} to {@code to}. */
+    private static void reassignPart(String from, Part to) {
+        for (Board b : Configuration.get().getBoards()) {
+            boolean changed = false;
+            for (Placement p : b.getPlacements()) {
+                if (p.getPart() != null && p.getPart().getId().equals(from)) {
+                    p.setPart(to);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                b.setDirty(true);
+            }
+        }
+        for (Feeder f : machine.getFeeders()) {
+            if (f.getPart() != null && f.getPart().getId().equals(from)) {
+                f.setPart(to);
+            }
+        }
+    }
+
+    /**
+     * POST /api/parts/merge — merges {from} into {to}: reassigns all placements
+     * and feeders, records an alias so future imports of {from} remap to {to},
+     * then deletes {from}. Body: {from, to}.
+     */
+    private static void mergeParts(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            MergeRequest req = GSON.fromJson(ctx.body(), MergeRequest.class);
+            Part fromP = req != null ? Configuration.get().getPart(req.from) : null;
+            Part toP = req != null ? Configuration.get().getPart(req.to) : null;
+            if (fromP == null || toP == null || req.from.equals(req.to)) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"need distinct existing from and to parts\"}");
+                return;
+            }
+            reassignPart(req.from, toP);
+            partAliases.put(req.from, req.to);
+            saveAliases();
+            Configuration.get().removePart(fromP);
+            markDirty();
+            ctx.result(GSON.toJson(describePartsDetail()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** Alias rules a just-imported board triggers: {from, to, count} per matched part. */
+    private static List<Map<String, Object>> pendingRemaps(Board board) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (Placement p : board.getPlacements()) {
+            if (p.getPart() == null) {
+                continue;
+            }
+            String id = p.getPart().getId();
+            String to = partAliases.get(id);
+            if (to != null && Configuration.get().getPart(to) != null) {
+                counts.merge(id, 1, Integer::sum);
+            }
+        }
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Map.Entry<String, Integer> e : counts.entrySet()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("from", e.getKey());
+            m.put("to", partAliases.get(e.getKey()));
+            m.put("count", e.getValue());
+            out.add(m);
+        }
+        return out;
+    }
+
+    /**
+     * POST /api/parts/apply-remaps — applies confirmed alias remaps to a board:
+     * reassigns placements from→to and deletes any now-orphaned from-part. Body:
+     * {board, remaps:[{from,to}]}.
+     */
+    private static void applyRemaps(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            RemapRequest req = GSON.fromJson(ctx.body(), RemapRequest.class);
+            Board board = req != null ? resolveBoard(req.board) : null;
+            if (board == null || req.remaps == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"board and remaps are required\"}");
+                return;
+            }
+            for (Remap r : req.remaps) {
+                Part to = Configuration.get().getPart(r.to);
+                if (to == null) {
+                    continue;
+                }
+                for (Placement p : board.getPlacements()) {
+                    if (p.getPart() != null && p.getPart().getId().equals(r.from)) {
+                        p.setPart(to);
+                    }
+                }
+                if (!partInUse(r.from)) {
+                    Part fromP = Configuration.get().getPart(r.from);
+                    if (fromP != null) {
+                        Configuration.get().removePart(fromP);
+                    }
+                }
+            }
+            board.setDirty(true);
+            markDirty();
+            ctx.result(GSON.toJson(describeBoards()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** GET /api/aliases — the alias rules. POST /api/aliases/remove {from} drops one. */
+    private static void listAliases(io.javalin.http.Context ctx) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Map.Entry<String, String> e : partAliases.entrySet()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("from", e.getKey());
+            m.put("to", e.getValue());
+            out.add(m);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("aliases", out);
+        ctx.contentType("application/json");
+        ctx.result(GSON.toJson(root));
+    }
+
+    private static void removeAlias(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        MergeRequest req = GSON.fromJson(ctx.body(), MergeRequest.class);
+        if (req != null && req.from != null) {
+            partAliases.remove(req.from);
+            saveAliases();
+        }
+        listAliases(ctx);
+    }
+
+    /** JSON body for POST /api/parts/merge and /api/aliases/remove. */
+    private static class MergeRequest {
+        String from;
+        String to;
+    }
+
+    /** JSON body for POST /api/parts/apply-remaps. */
+    private static class RemapRequest {
+        String board;
+        List<Remap> remaps;
+    }
+
+    private static class Remap {
+        String from;
+        String to;
     }
 
     // ------------------------------------------------------------- Packages

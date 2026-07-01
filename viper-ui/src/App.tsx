@@ -369,6 +369,13 @@ function App() {
   const [nozzleTips, setNozzleTips] = useState<NtInfo[]>([]);
   const [editPart, setEditPart] = useState<PartInfo | null>(null);
   const [partIsNew, setPartIsNew] = useState(false);
+  const [mergeTarget, setMergeTarget] = useState("");
+  const [aliases, setAliases] = useState<{ from: string; to: string }[]>([]);
+  const [pendingRemaps, setPendingRemaps] = useState<
+    { from: string; to: string; count: number }[]
+  >([]);
+  const [remapBoard, setRemapBoard] = useState<string | null>(null);
+  const [remapSel, setRemapSel] = useState<Set<string>>(new Set());
   const [editPackage, setEditPackage] = useState<PackageInfo | null>(null);
   const [pkgIsNew, setPkgIsNew] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
@@ -612,6 +619,14 @@ function App() {
       } else {
         setBoards(data.boards ?? []);
         setImportConflict(null);
+        const pr = data.pendingRemaps ?? [];
+        if (pr.length > 0) {
+          setPendingRemaps(pr);
+          setRemapBoard(data.importedBoard ?? null);
+          setRemapSel(
+            new Set(pr.map((r: { from: string }) => r.from)),
+          );
+        }
       }
     } catch (e) {
       setImportErr(e instanceof Error ? e.message : String(e));
@@ -621,6 +636,58 @@ function App() {
   };
 
   const doImport = () => runImport({});
+
+  const loadAliases = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/aliases")).json();
+      setAliases(d.aliases ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const doMerge = () => {
+    if (!editPart || !mergeTarget) return;
+    postParts("/api/parts/merge", { from: editPart.id, to: mergeTarget });
+    setEditPart(null);
+    setMergeTarget("");
+    loadAliases();
+  };
+
+  const applyRemaps = async () => {
+    if (!remapBoard) return;
+    const remaps = pendingRemaps
+      .filter((r) => remapSel.has(r.from))
+      .map((r) => ({ from: r.from, to: r.to }));
+    try {
+      if (remaps.length > 0) {
+        const d = await (
+          await fetch("/api/parts/apply-remaps", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ board: remapBoard, remaps }),
+          })
+        ).json();
+        if (d.boards) setBoards(d.boards);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPendingRemaps([]);
+      setRemapBoard(null);
+    }
+  };
+
+  const removeAlias = (from: string) => {
+    fetch("/api/aliases/remove", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from }),
+    })
+      .then((r) => r.json())
+      .then((d) => setAliases(d.aliases ?? []))
+      .catch(() => {});
+  };
 
   const openBoard = async (file: string | null) => {
     if (!file) return;
@@ -802,6 +869,7 @@ function App() {
   const openWizard = () => {
     loadParts();
     loadPackages();
+    loadAliases();
     setWizardOpen(true);
   };
 
@@ -2850,6 +2918,37 @@ function App() {
                   picked and placed.
                 </div>
               )}
+              {!partIsNew && (
+                <div className="teach-block">
+                  <div className="teach-head">
+                    Merge into another part — reassigns placements &amp; feeders,
+                    deletes this one, and remembers the rename for future imports.
+                  </div>
+                  <div className="teach-row">
+                    <select
+                      className="type-select"
+                      value={mergeTarget}
+                      onChange={(e) => setMergeTarget(e.currentTarget.value)}
+                    >
+                      <option value="">merge into…</option>
+                      {partsDetail
+                        .filter((x) => x.id !== editPart.id)
+                        .map((x) => (
+                          <option key={x.id} value={x.id}>
+                            {x.id}
+                          </option>
+                        ))}
+                    </select>
+                    <button
+                      className="btn btn-sm btn-danger"
+                      disabled={!mergeTarget}
+                      onClick={doMerge}
+                    >
+                      Merge
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="modal-foot">
               <button className="btn" onClick={() => setEditPart(null)}>
@@ -3065,6 +3164,35 @@ function App() {
                   )}
                 </>
               )}
+              {aliases.length > 0 && (
+                <>
+                  <div className="teach-head">
+                    Part rename rules (applied — with confirmation — on future
+                    imports)
+                  </div>
+                  <table className="ptable wizard-table">
+                    <tbody>
+                      {aliases.map((a) => (
+                        <tr key={a.from}>
+                          <td className="mono">{a.from}</td>
+                          <td>→</td>
+                          <td className="mono">{a.to}</td>
+                          <td>
+                            <button
+                              className="btn btn-sm btn-icon btn-trash"
+                              onClick={() => removeAlias(a.from)}
+                              title="Remove rule"
+                              aria-label="Remove rule"
+                            >
+                              <TrashIcon size={14} />
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </>
+              )}
             </div>
             <div className="modal-foot">
               <button
@@ -3119,6 +3247,68 @@ function App() {
                 onClick={createNewBoard}
               >
                 Create
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingRemaps.length > 0 && (
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            setPendingRemaps([]);
+            setRemapBoard(null);
+          }}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>Known part renames</h3>
+            </div>
+            <div className="modal-body">
+              <p className="confirm-text">
+                This board uses parts you previously merged. Remap them to the
+                established parts?
+              </p>
+              <table className="ptable wizard-table">
+                <tbody>
+                  {pendingRemaps.map((r) => (
+                    <tr key={r.from}>
+                      <td className="chk-col">
+                        <input
+                          type="checkbox"
+                          checked={remapSel.has(r.from)}
+                          onChange={() =>
+                            setRemapSel((prev) => {
+                              const n = new Set(prev);
+                              if (n.has(r.from)) n.delete(r.from);
+                              else n.add(r.from);
+                              return n;
+                            })
+                          }
+                        />
+                      </td>
+                      <td className="mono">{r.from}</td>
+                      <td>→</td>
+                      <td className="mono">{r.to}</td>
+                      <td className="muted">{r.count}×</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="modal-foot">
+              <button
+                className="btn"
+                onClick={() => {
+                  setPendingRemaps([]);
+                  setRemapBoard(null);
+                }}
+              >
+                Skip
+              </button>
+              <button className="btn btn-primary" onClick={applyRemaps}>
+                Apply selected
               </button>
             </div>
           </div>
