@@ -2134,7 +2134,7 @@ function App() {
                       <img
                         key={`${cam.id}-${streamEpoch}`}
                         className="camera-live"
-                        src={`/api/camera/mjpeg?id=${cam.id}&e=${streamEpoch}`}
+                        src={`/api/camera/mjpeg?id=${cam.id}&w=480&e=${streamEpoch}`}
                         alt={c.name}
                         draggable={false}
                         onError={() =>
@@ -4939,7 +4939,7 @@ function App() {
                       <img
                         key={`${c.id}-${streamEpoch}`}
                         className="cam-preview"
-                        src={`/api/camera/mjpeg?id=${c.id}&e=${streamEpoch}`}
+                        src={`/api/camera/mjpeg?id=${c.id}&w=640&e=${streamEpoch}`}
                         alt={c.name}
                         draggable={false}
                       />

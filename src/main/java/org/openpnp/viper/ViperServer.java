@@ -1889,10 +1889,26 @@ public class ViperServer {
         }
     }
 
+    /** Scales a frame down to the requested width (never up), preserving aspect. */
+    private static BufferedImage scaleFrame(BufferedImage img, Integer maxW) {
+        if (maxW == null || maxW <= 0 || img.getWidth() <= maxW) {
+            return img;
+        }
+        int h = (int) Math.round((double) img.getHeight() * maxW / img.getWidth());
+        BufferedImage out = new BufferedImage(maxW, h, BufferedImage.TYPE_INT_RGB);
+        java.awt.Graphics2D g = out.createGraphics();
+        g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
+                java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        g.drawImage(img, 0, 0, maxW, h, null);
+        g.dispose();
+        return out;
+    }
+
     /**
-     * GET /api/camera/mjpeg?id=... — live MJPEG stream (multipart/x-mixed-replace),
-     * usable directly as an &lt;img&gt; src. Runs on the request thread until the
-     * client disconnects; ~10 fps.
+     * GET /api/camera/mjpeg?id=...&w=480 — live MJPEG stream (multipart/x-mixed-
+     * replace), usable directly as an &lt;img&gt; src. Runs on the request thread
+     * until the client disconnects. w downscales server-side (webviews choke on
+     * sustained full-res multipart streams); ~7 fps.
      */
     private static void cameraMjpeg(io.javalin.http.Context ctx) {
         Camera c = findCamera(ctx.queryParam("id"));
@@ -1901,6 +1917,16 @@ public class ViperServer {
             ctx.contentType("application/json");
             ctx.result("{\"error\":\"camera not found\"}");
             return;
+        }
+        Integer maxW = null;
+        try {
+            String w = ctx.queryParam("w");
+            if (w != null) {
+                maxW = Integer.parseInt(w);
+            }
+        }
+        catch (NumberFormatException ignore) {
+            // full size
         }
         try {
             ctx.res().setContentType("multipart/x-mixed-replace; boundary=viperframe");
@@ -1911,6 +1937,7 @@ public class ViperServer {
                     Thread.sleep(250);
                     continue;
                 }
+                img = scaleFrame(img, maxW);
                 ByteArrayOutputStream buf = new ByteArrayOutputStream();
                 ImageIO.write(img, "jpg", buf);
                 out.write(("--viperframe\r\nContent-Type: image/jpeg\r\nContent-Length: "
@@ -1918,7 +1945,7 @@ public class ViperServer {
                 buf.writeTo(out);
                 out.write("\r\n".getBytes());
                 out.flush();
-                Thread.sleep(100);
+                Thread.sleep(140);
             }
         }
         catch (Exception e) {
