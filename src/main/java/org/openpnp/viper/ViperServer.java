@@ -3951,11 +3951,24 @@ public class ViperServer {
             }
             FiducialLocator locator = machine.getFiducialLocator();
             final BoardLocation target = bl;
+            final Job job = j;
             machine.submit(() -> {
-                locator.locatePlacementsHolder(target);
+                // The locator sets the placement transform and RETURNS the
+                // compensated board location — writing it back is the caller's
+                // job (like OpenPnP's JobPanel fiducial check does).
+                Location located = locator.locatePlacementsHolder(target);
+                AffineTransform tx = target.getLocalToGlobalTransform();
+                target.setLocation(located);
+                target.setLocalToGlobalTransform(tx); // setLocation cleared it
+                job.setDirty(true);
+                Utils2D.AffineInfo ai = Utils2D.affineInfo(target.getPlacementTransform());
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "alignDone");
+                ev.put("uid", target.getUniqueId());
+                ev.put("angle", round(ai.rotationAngleDeg));
+                broadcast(GSON.toJson(ev));
                 return null;
             }, broadcastCallback());
-            j.setDirty(true);
             ctx.result("{\"submitted\":true}");
         }
         catch (Exception e) {

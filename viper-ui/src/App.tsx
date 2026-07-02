@@ -708,9 +708,10 @@ function App() {
   >({});
   const [alignResult, setAlignResult] = useState<{
     angle: number;
-    residual: number;
-    points: number;
+    residual?: number;
+    points?: number;
   } | null>(null);
+  const [jobBoardsRefresh, setJobBoardsRefresh] = useState(0);
   const [selectedBoardUid, setSelectedBoardUid] = useState<string | null>(null);
   const [jobBoardPlc, setJobBoardPlc] = useState<JobPlacement[]>([]);
   const [plcSearch, setPlcSearch] = useState("");
@@ -947,12 +948,17 @@ function App() {
     [],
   );
 
-  // Load the active job's board-locations whenever the active job changes.
+  // Load the active job's board-locations whenever the active job changes
+  // (or something external — e.g. a finished vision align — bumps the counter).
   useEffect(() => {
     setJobEditFile(activeJobFile);
-    setSelectedBoardUid(null);
     loadJobBoards(activeJobFile);
-  }, [activeJobFile, loadJobBoards]);
+  }, [activeJobFile, jobBoardsRefresh, loadJobBoards]);
+
+  // Only reset the board selection when the job itself changes.
+  useEffect(() => {
+    setSelectedBoardUid(null);
+  }, [activeJobFile]);
 
   // Auto-select the first board once boards load (if nothing selected).
   useEffect(() => {
@@ -1516,6 +1522,10 @@ function App() {
           syncJobState();
         } else if (data && data.event === "jobStatus") {
           setJobStatus(String(data.text ?? ""));
+        } else if (data && data.event === "alignDone") {
+          setJobBoardsRefresh((n) => n + 1);
+          setAlignResult({ angle: Number(data.angle) });
+          loadJobs();
         } else if (data && data.event === "jobComplete") {
           setJobStatus(data.aborted ? "Job aborted" : "Job complete");
           setJobSkipped(data.skipped ?? []);
@@ -3235,14 +3245,14 @@ function App() {
                           {alignResult && (
                             <div
                               className={`banner ${
-                                alignResult.residual > 0.5
+                                (alignResult.residual ?? 0) > 0.5
                                   ? "banner-warn"
                                   : "banner-ok"
                               }`}
                             >
-                              Aligned from {alignResult.points} fiducials —
-                              rotation {alignResult.angle}°, residual{" "}
-                              {alignResult.residual} mm
+                              {alignResult.residual != null
+                                ? `Aligned from ${alignResult.points} fiducials — rotation ${alignResult.angle}°, residual ${alignResult.residual} mm`
+                                : `Vision alignment applied — board rotation ${alignResult.angle}°`}
                             </div>
                           )}
                         </>
