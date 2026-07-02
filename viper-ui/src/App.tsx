@@ -1560,6 +1560,14 @@ function App() {
   }, []);
 
   const enabled = status?.enabled ?? false;
+  const homed = status?.homed ?? false;
+  // Teach actions read or drive real coordinates — meaningless until homed.
+  const teachReady = enabled && homed;
+  const teachHint = !enabled
+    ? "Connect the machine first"
+    : !homed
+      ? "Home the machine first"
+      : "";
   const toggleConnect = () =>
     post(enabled ? "/api/machine/disconnect" : "/api/machine/connect");
   const home = () => post("/api/machine/home");
@@ -3097,11 +3105,11 @@ function App() {
                               <button
                                 className="btn btn-sm btn-icon"
                                 onClick={() => teachJobBoard(b.uid, false)}
-                                disabled={!enabled}
+                                disabled={!teachReady}
                                 title={
-                                  enabled
+                                  teachReady
                                     ? "Jog camera to board origin"
-                                    : "Connect the machine first"
+                                    : teachHint
                                 }
                               >
                                 <CrosshairIcon size={14} />
@@ -3109,11 +3117,11 @@ function App() {
                               <button
                                 className="btn btn-sm btn-icon"
                                 onClick={() => teachJobBoard(b.uid, true)}
-                                disabled={!enabled}
+                                disabled={!teachReady}
                                 title={
-                                  enabled
+                                  teachReady
                                     ? "Set origin from camera"
-                                    : "Connect the machine first"
+                                    : teachHint
                                 }
                               >
                                 <CameraIcon size={14} />
@@ -3138,10 +3146,12 @@ function App() {
                         Fiducial alignment —{" "}
                         {jobBoards.find((b) => b.uid === alignUid)?.boardName} —
                         capture ≥2 fiducials, then compute
-                        {!enabled && (
+                        {!teachReady && (
                           <span className="cam-unbound-tag">
                             {" "}
-                            · machine offline — connect to move
+                            · {!enabled
+                              ? "machine offline — connect to move"
+                              : "not homed — home first"}
                           </span>
                         )}
                       </div>
@@ -3163,11 +3173,11 @@ function App() {
                                 <button
                                   className="btn btn-sm"
                                   onClick={() => alignGo(f.id)}
-                                  disabled={!enabled}
+                                  disabled={!teachReady}
                                   title={
-                                    enabled
+                                    teachReady
                                       ? "Jog the camera to this fiducial's expected location"
-                                      : "Connect the machine first"
+                                      : teachHint
                                   }
                                 >
                                   <CrosshairIcon size={12} /> Go
@@ -3175,11 +3185,11 @@ function App() {
                                 <button
                                   className="btn btn-sm"
                                   onClick={() => alignCapture(f.id)}
-                                  disabled={!enabled}
+                                  disabled={!teachReady}
                                   title={
-                                    enabled
+                                    teachReady
                                       ? "Capture the current camera position for this fiducial"
-                                      : "Connect the machine first"
+                                      : teachHint
                                   }
                                 >
                                   <CameraIcon size={12} /> Capture
@@ -3206,8 +3216,12 @@ function App() {
                             <button
                               className="btn btn-sm"
                               onClick={() => autoAlign(alignUid)}
-                              disabled={!enabled}
-                              title="Auto-locate fiducials by camera vision"
+                              disabled={!teachReady}
+                              title={
+                                teachReady
+                                  ? "Auto-locate fiducials by camera vision"
+                                  : teachHint
+                              }
                             >
                               Auto (vision)
                             </button>
@@ -6069,18 +6083,23 @@ function App() {
             <button
               className="ctx-item"
               onClick={() => setOriginFromPlacement(plcMenu.id)}
-              title="Shift the board origin so this placement lands exactly under the current camera position"
+              disabled={!teachReady}
+              title={
+                teachReady
+                  ? "Shift the board origin so this placement lands exactly under the current camera position"
+                  : teachHint
+              }
             >
               <CrosshairIcon size={13} /> Set board origin from this placement
             </button>
             <button
               className="ctx-item"
               onClick={() => cameraToPlacement(plcMenu.id)}
-              disabled={!enabled}
+              disabled={!teachReady}
               title={
-                enabled
+                teachReady
                   ? "Jog the camera to this placement's expected location"
-                  : "Connect the machine first"
+                  : teachHint
               }
             >
               <CameraIcon size={13} /> Camera to this placement

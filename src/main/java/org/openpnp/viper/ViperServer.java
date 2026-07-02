@@ -143,6 +143,7 @@ public class ViperServer {
         loadJobsFolder();
         loadAliases();
         warmCameras();
+        autoConnect();
         machine.addListener(new StatusBroadcastListener());
 
         int port = Integer.getInteger("viper.port", 8077);
@@ -1706,6 +1707,30 @@ public class ViperServer {
         catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * With -Dviper.autoconnect=true, enables the machine shortly after startup so a
+     * backend restart doesn't cost a manual reconnect (dev convenience). Deliberately
+     * does NOT home: a background restart must never move the gantry on its own.
+     */
+    private static void autoConnect() {
+        if (!Boolean.getBoolean("viper.autoconnect")) {
+            return;
+        }
+        Thread t = new Thread(() -> {
+            try {
+                Thread.sleep(1500);
+                machine.setEnabled(true);
+                broadcast(GSON.toJson(statusSnapshot()));
+                System.out.println("[viper] autoconnect: machine enabled");
+            }
+            catch (Exception e) {
+                System.out.println("[viper] autoconnect failed: " + e.getMessage());
+            }
+        }, "viper-autoconnect");
+        t.setDaemon(true);
+        t.start();
     }
 
     /**
