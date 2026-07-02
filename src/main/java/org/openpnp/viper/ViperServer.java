@@ -142,6 +142,7 @@ public class ViperServer {
         loadBoardsFolder();
         loadJobsFolder();
         loadAliases();
+        warmCameras();
         machine.addListener(new StatusBroadcastListener());
 
         int port = Integer.getInteger("viper.port", 8077);
@@ -1703,6 +1704,37 @@ public class ViperServer {
         catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * Opens capture cameras in the background at startup. OpenPnpCaptureCamera binds
+     * its stored device lazily on first capture; without this, the UI panes see
+     * bound=false and never request the stream that would have triggered the open.
+     */
+    private static void warmCameras() {
+        Thread t = new Thread(() -> {
+            List<Camera> all = new ArrayList<>(machine.getCameras());
+            try {
+                for (Head h : machine.getHeads()) {
+                    all.addAll(h.getCameras());
+                }
+            }
+            catch (Exception e) {
+                // ignore
+            }
+            for (Camera c : all) {
+                if (c instanceof OpenPnpCaptureCamera) {
+                    try {
+                        c.capture();
+                    }
+                    catch (Exception e) {
+                        // camera absent/unbound — fine
+                    }
+                }
+            }
+        }, "viper-camera-warmup");
+        t.setDaemon(true);
+        t.start();
     }
 
     /** First OpenPnpCaptureCamera anywhere on the machine (owns a capture context). */
