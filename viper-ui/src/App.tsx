@@ -3097,14 +3097,24 @@ function App() {
                               <button
                                 className="btn btn-sm btn-icon"
                                 onClick={() => teachJobBoard(b.uid, false)}
-                                title="Jog camera to board origin"
+                                disabled={!enabled}
+                                title={
+                                  enabled
+                                    ? "Jog camera to board origin"
+                                    : "Connect the machine first"
+                                }
                               >
                                 <CrosshairIcon size={14} />
                               </button>
                               <button
                                 className="btn btn-sm btn-icon"
                                 onClick={() => teachJobBoard(b.uid, true)}
-                                title="Set origin from camera"
+                                disabled={!enabled}
+                                title={
+                                  enabled
+                                    ? "Set origin from camera"
+                                    : "Connect the machine first"
+                                }
                               >
                                 <CameraIcon size={14} />
                               </button>
@@ -3128,6 +3138,12 @@ function App() {
                         Fiducial alignment —{" "}
                         {jobBoards.find((b) => b.uid === alignUid)?.boardName} —
                         capture ≥2 fiducials, then compute
+                        {!enabled && (
+                          <span className="cam-unbound-tag">
+                            {" "}
+                            · machine offline — connect to move
+                          </span>
+                        )}
                       </div>
                       {alignFids.length === 0 ? (
                         <div className="muted">
@@ -3147,12 +3163,24 @@ function App() {
                                 <button
                                   className="btn btn-sm"
                                   onClick={() => alignGo(f.id)}
+                                  disabled={!enabled}
+                                  title={
+                                    enabled
+                                      ? "Jog the camera to this fiducial's expected location"
+                                      : "Connect the machine first"
+                                  }
                                 >
                                   <CrosshairIcon size={12} /> Go
                                 </button>
                                 <button
                                   className="btn btn-sm"
                                   onClick={() => alignCapture(f.id)}
+                                  disabled={!enabled}
+                                  title={
+                                    enabled
+                                      ? "Capture the current camera position for this fiducial"
+                                      : "Connect the machine first"
+                                  }
                                 >
                                   <CameraIcon size={12} /> Capture
                                 </button>
