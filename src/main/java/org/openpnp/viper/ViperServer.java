@@ -262,6 +262,8 @@ public class ViperServer {
         app.post("/api/camera/bind", ViperServer::bindCamera);
         app.get("/api/camera/frame", ViperServer::cameraFrame);
         app.get("/api/camera/mjpeg", ViperServer::cameraMjpeg);
+        app.get("/api/camera/props", ViperServer::cameraProps);
+        app.post("/api/camera/property", ViperServer::setCameraProperty);
         app.get("/api/nozzles/detail", ViperServer::listNozzles);
         app.post("/api/nozzle", ViperServer::updateNozzle);
         app.post("/api/nozzletip", ViperServer::updateNozzleTip);
@@ -1897,6 +1899,104 @@ public class ViperServer {
         String id;
         String uniqueId;
         Integer formatId;
+    }
+
+    /** The named capture-property holder on a camera, or null. */
+    private static OpenPnpCaptureCamera.CapturePropertyHolder captureProp(
+            OpenPnpCaptureCamera c, String name) {
+        switch (name == null ? "" : name.toLowerCase()) {
+            case "exposure": return c.getExposure();
+            case "brightness": return c.getBrightness();
+            case "contrast": return c.getContrast();
+            case "gain": return c.getGain();
+            case "gamma": return c.getGamma();
+            case "focus": return c.getFocus();
+            case "whitebalance": return c.getWhiteBalance();
+            case "saturation": return c.getSaturation();
+            case "sharpness": return c.getSharpness();
+            case "backlightcompensation": return c.getBackLightCompensation();
+            case "hue": return c.getHue();
+            case "powerlinefrequency": return c.getPowerLineFrequency();
+            case "zoom": return c.getZoom();
+            default: return null;
+        }
+    }
+
+    private static final String[] CAPTURE_PROPS = {
+        "exposure", "brightness", "contrast", "gain", "gamma", "focus",
+        "whiteBalance", "saturation", "sharpness", "backLightCompensation",
+    };
+
+    /** GET /api/camera/props?id= — driver capture properties with live limits. */
+    private static void cameraProps(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        Camera c = findCamera(ctx.queryParam("id"));
+        if (!(c instanceof OpenPnpCaptureCamera)) {
+            ctx.status(404);
+            ctx.result("{\"error\":\"capture camera not found\"}");
+            return;
+        }
+        OpenPnpCaptureCamera cam = (OpenPnpCaptureCamera) c;
+        List<Map<String, Object>> props = new ArrayList<>();
+        for (String name : CAPTURE_PROPS) {
+            OpenPnpCaptureCamera.CapturePropertyHolder h = captureProp(cam, name);
+            if (h == null || !h.isSupported()) {
+                continue;
+            }
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("name", name);
+            m.put("value", h.getValue());
+            m.put("min", h.getMin());
+            m.put("max", h.getMax());
+            m.put("default", h.getDefault());
+            m.put("autoSupported", h.isAutoSupported());
+            m.put("auto", h.isAuto());
+            props.add(m);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("id", cam.getId());
+        root.put("props", props);
+        ctx.result(GSON.toJson(root));
+    }
+
+    /** POST /api/camera/property — Body: {id, property, auto?, value?}. */
+    private static void setCameraProperty(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            CameraPropRequest req = GSON.fromJson(ctx.body(), CameraPropRequest.class);
+            Camera c = req != null ? findCamera(req.id) : null;
+            OpenPnpCaptureCamera.CapturePropertyHolder h = c instanceof OpenPnpCaptureCamera
+                    ? captureProp((OpenPnpCaptureCamera) c, req.property) : null;
+            if (h == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"camera or property not found\"}");
+                return;
+            }
+            if (req.auto != null) {
+                h.setAuto(req.auto);
+            }
+            if (req.value != null) {
+                h.setValue(req.value);
+            }
+            markDirty();
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("name", req.property);
+            m.put("value", h.getValue());
+            m.put("auto", h.isAuto());
+            ctx.result(GSON.toJson(m));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/camera/property. */
+    private static class CameraPropRequest {
+        String id;
+        String property;
+        Boolean auto;
+        Integer value;
     }
 
     private static Map<String, Object> describeCameras() {
