@@ -315,6 +315,59 @@ body {
   padding: 0 0.35rem;
 }
 
+/* ---- Placement context menu ---- */
+.ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+}
+
+.ctx-menu {
+  position: fixed;
+  z-index: 91;
+  min-width: 240px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+  padding: 0.3rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.ctx-title {
+  font-size: 0.72rem;
+  color: var(--muted);
+  padding: 0.25rem 0.55rem 0.35rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.25rem;
+}
+
+.ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 0.82rem;
+  text-align: left;
+  padding: 0.45rem 0.55rem;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.ctx-item:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--green);
+}
+
+.ctx-item:disabled {
+  color: var(--muted);
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .reticle {
   position: absolute;
   inset: 0;

@@ -715,6 +715,11 @@ function App() {
   const [jobBoardPlc, setJobBoardPlc] = useState<JobPlacement[]>([]);
   const [plcSearch, setPlcSearch] = useState("");
   const [plcRefresh, setPlcRefresh] = useState(0);
+  const [plcMenu, setPlcMenu] = useState<{
+    x: number;
+    y: number;
+    id: string;
+  } | null>(null);
   const [jobRunning, setJobRunning] = useState(false);
   const [jobStepping, setJobStepping] = useState(false);
   const [jobStatus, setJobStatus] = useState("");
@@ -1143,6 +1148,46 @@ function App() {
     })
       .then(() => loadJobPlacements(activeJobFile, selectedBoardUid))
       .catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
+  };
+
+  const setOriginFromPlacement = async (placementId: string) => {
+    setPlcMenu(null);
+    if (!jobEditFile || !selectedBoardUid) return;
+    setJobErr("");
+    try {
+      const res = await fetch("/api/job/board/origin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file: jobEditFile,
+          uid: selectedBoardUid,
+          placementId,
+        }),
+      });
+      const d = await res.json();
+      if (!res.ok) {
+        setJobErr(d.error ?? "Could not set the origin.");
+        return;
+      }
+      applyJobBoards(d);
+      loadJobs();
+    } catch (e) {
+      setJobErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const cameraToPlacement = (placementId: string) => {
+    setPlcMenu(null);
+    if (!jobEditFile || !selectedBoardUid) return;
+    fetch("/api/job/board/align/go", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        file: jobEditFile,
+        uid: selectedBoardUid,
+        placementId,
+      }),
+    }).catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
   };
 
   const stepJob = () => {
@@ -3222,7 +3267,17 @@ function App() {
                             );
                           })
                           .map((p) => (
-                            <tr key={p.id}>
+                            <tr
+                              key={p.id}
+                              onContextMenu={(e) => {
+                                e.preventDefault();
+                                setPlcMenu({
+                                  x: e.clientX,
+                                  y: e.clientY,
+                                  id: p.id,
+                                });
+                              }}
+                            >
                               <td>
                                 <input
                                   type="checkbox"
@@ -5972,6 +6027,38 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {plcMenu && (
+        <>
+          <div className="ctx-backdrop" onClick={() => setPlcMenu(null)} />
+          <div
+            className="ctx-menu"
+            style={{ left: plcMenu.x, top: plcMenu.y }}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            <div className="ctx-title mono">{plcMenu.id}</div>
+            <button
+              className="ctx-item"
+              onClick={() => setOriginFromPlacement(plcMenu.id)}
+              title="Shift the board origin so this placement lands exactly under the current camera position"
+            >
+              <CrosshairIcon size={13} /> Set board origin from this placement
+            </button>
+            <button
+              className="ctx-item"
+              onClick={() => cameraToPlacement(plcMenu.id)}
+              disabled={!enabled}
+              title={
+                enabled
+                  ? "Jog the camera to this placement's expected location"
+                  : "Connect the machine first"
+              }
+            >
+              <CameraIcon size={13} /> Camera to this placement
+            </button>
+          </div>
+        </>
       )}
 
       {newJobOpen && (

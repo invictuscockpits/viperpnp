@@ -305,6 +305,7 @@ public class ViperServer {
         app.post("/api/job/board", ViperServer::updateJobBoard);
         app.post("/api/job/board/move", ViperServer::moveToJobBoard);
         app.post("/api/job/board/capture", ViperServer::captureJobBoard);
+        app.post("/api/job/board/origin", ViperServer::jobBoardOriginFromPlacement);
         app.post("/api/job/board/fiducials", ViperServer::jobBoardFiducials);
         app.post("/api/job/board/align/go", ViperServer::alignGo);
         app.post("/api/job/board/align/capture", ViperServer::alignCapture);
@@ -3564,6 +3565,46 @@ public class ViperServer {
             return null;
         }, broadcastCallback());
         ctx.result("{\"submitted\":true}");
+    }
+
+    /**
+     * POST /api/job/board/origin — sets the board-location origin so the given
+     * placement lands exactly under the current camera position. Body: {file, uid,
+     * placementId}. Clears any fiducial transform, then shifts the origin by
+     * (camera − placement's computed machine location); Z and rotation are kept.
+     */
+    private static void jobBoardOriginFromPlacement(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+            Placement p = bl != null ? bl.getBoard().getPlacements().get(req.placementId) : null;
+            if (bl == null || p == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"board location or placement not found\"}");
+                return;
+            }
+            Camera camera = machine.getDefaultHead().getDefaultCamera();
+            Location cam = camera.getLocation().convertToUnits(LengthUnit.Millimeters);
+            bl.setPlacementTransform(null);
+            Location current = Utils2D.calculateBoardPlacementLocation(bl, p)
+                    .convertToUnits(LengthUnit.Millimeters);
+            Location origin = bl.getLocation() != null
+                    ? bl.getLocation().convertToUnits(LengthUnit.Millimeters)
+                    : new Location(LengthUnit.Millimeters);
+            bl.setLocation(new Location(LengthUnit.Millimeters,
+                    origin.getX() + (cam.getX() - current.getX()),
+                    origin.getY() + (cam.getY() - current.getY()),
+                    origin.getZ(),
+                    origin.getRotation()));
+            j.setDirty(true);
+            ctx.result(GSON.toJson(describeJobBoards(j)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
     }
 
     /** POST /api/job/board/capture — set a board-location origin from the current tool position. */
