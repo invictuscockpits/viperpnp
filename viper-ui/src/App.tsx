@@ -70,6 +70,7 @@ interface FeederInfo {
   needs?: string[];
   capacity?: number;
   remaining?: number;
+  slot?: number | null;
 }
 
 interface FeederLoc {
@@ -3668,6 +3669,7 @@ function App() {
                         <th>Active</th>
                         <th>Name</th>
                         <th>Type</th>
+                        <th>Slot</th>
                         <th>Part</th>
                         <th>Left</th>
                         <th></th>
@@ -3724,6 +3726,22 @@ function App() {
                           </td>
                           <td className="mono">{f.name}</td>
                           <td className="muted">{f.type}</td>
+                          <td className="mono cell-center">
+                            {f.type === "PhotonFeeder" ? (
+                              f.slot != null ? (
+                                f.slot
+                              ) : (
+                                <span
+                                  className="muted"
+                                  title="Not addressed on the bus — run Find/Scan"
+                                >
+                                  —
+                                </span>
+                              )
+                            ) : (
+                              ""
+                            )}
+                          </td>
                           <td>
                             <select
                               className="type-select"

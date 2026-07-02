@@ -4337,6 +4337,9 @@ public class ViperServer {
             fm.put("type", f.getClass().getSimpleName());
             fm.put("part", f.getPart() != null ? f.getPart().getId() : null);
             fm.put("enabled", f.isEnabled());
+            if (f instanceof PhotonFeeder) {
+                fm.put("slot", ((PhotonFeeder) f).getSlotAddress());
+            }
             List<String> needs = feederNeeds(f);
             fm.put("canEnable", needs.isEmpty());
             fm.put("needs", needs);
