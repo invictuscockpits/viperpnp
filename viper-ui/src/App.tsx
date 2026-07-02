@@ -1317,6 +1317,37 @@ function App() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
 
+  const [camReconnecting, setCamReconnecting] = useState(false);
+  const reconnectCameras = async () => {
+    setCamReconnecting(true);
+    try {
+      const d = await (
+        await fetch("/api/cameras/reconnect", { method: "POST" })
+      ).json();
+      if (d.cameras) setCameras(d.cameras);
+      await loadCaptureDevices();
+      const report = (d.reconnect ?? []) as {
+        camera: string;
+        bound: boolean;
+        note: string;
+      }[];
+      const failed = report.filter((r) => !r.bound);
+      if (failed.length) {
+        setError(
+          `Camera reconnect: ${failed
+            .map((r) => `${r.camera} — ${r.note}`)
+            .join("; ")}`,
+        );
+      } else {
+        setError(null);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCamReconnecting(false);
+    }
+  };
+
   const bindCamera = (id: string, uniqueId: string) => {
     fetch("/api/camera/bind", {
       method: "POST",
@@ -5309,13 +5340,23 @@ function App() {
           >
             <div className="modal-head">
               <h3>Cameras</h3>
-              <button
-                className="icon-btn"
-                onClick={() => setMachineCard(null)}
-                title="Close"
-              >
-                ✕
-              </button>
+              <div className="modal-head-actions">
+                <button
+                  className="btn btn-sm"
+                  onClick={reconnectCameras}
+                  disabled={camReconnecting}
+                  title="Re-scan host devices and re-bind cameras (fixes dropped feeds after a USB re-plug or power-cycle)"
+                >
+                  {camReconnecting ? "Reconnecting…" : "↻ Reconnect cameras"}
+                </button>
+                <button
+                  className="icon-btn"
+                  onClick={() => setMachineCard(null)}
+                  title="Close"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
             <div className="modal-body plc-body">
               {cameras.map((c) => (

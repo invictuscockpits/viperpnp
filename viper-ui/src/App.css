@@ -401,6 +401,12 @@ body {
   font-family: ui-monospace, monospace;
 }
 
+.modal-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .reticle {
   position: absolute;
   inset: 0;

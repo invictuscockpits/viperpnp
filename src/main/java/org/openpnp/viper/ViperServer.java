@@ -272,6 +272,7 @@ public class ViperServer {
         app.post("/api/camera", ViperServer::updateCamera);
         app.get("/api/cameras/devices", ViperServer::listCaptureDevices);
         app.post("/api/camera/bind", ViperServer::bindCamera);
+        app.post("/api/cameras/reconnect", ViperServer::reconnectCameras);
         app.get("/api/camera/frame", ViperServer::cameraFrame);
         app.get("/api/camera/mjpeg", ViperServer::cameraMjpeg);
         app.get("/api/camera/props", ViperServer::cameraProps);
@@ -1891,41 +1892,10 @@ public class ViperServer {
                 cam.setDevice(null);
                 cam.setFormat(null);
             }
-            else {
-                CaptureDevice dev = null;
-                for (CaptureDevice d : cam.getCaptureDevices()) {
-                    if (d.getUniqueId().equals(req.uniqueId)) {
-                        dev = d;
-                        break;
-                    }
-                }
-                if (dev == null) {
-                    ctx.status(404);
-                    ctx.result("{\"error\":\"capture device not found\"}");
-                    return;
-                }
-                CaptureFormat pick = null;
-                for (CaptureFormat f : dev.getFormats()) {
-                    if (req.formatId != null) {
-                        if (f.getFormatId() == req.formatId) {
-                            pick = f;
-                            break;
-                        }
-                    }
-                    else if (pick == null
-                            || (long) f.getFormatInfo().width * f.getFormatInfo().height
-                             > (long) pick.getFormatInfo().width * pick.getFormatInfo().height) {
-                        pick = f;
-                    }
-                }
-                if (pick == null) {
-                    ctx.status(400);
-                    ctx.result("{\"error\":\"device has no capture formats\"}");
-                    return;
-                }
-                cam.setDevice(dev);
-                cam.setFormat(pick);
-                cam.open();
+            else if (!bindCaptureDevice(cam, req.uniqueId, req.formatId)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"capture device not found\"}");
+                return;
             }
             markDirty();
             ctx.result(GSON.toJson(describeCameras()));
@@ -1934,6 +1904,164 @@ public class ViperServer {
             ctx.status(500);
             ctx.result(GSON.toJson(errorMap(e)));
         }
+    }
+
+    /**
+     * Binds one capture camera to the device with the given uniqueId, choosing the
+     * highest-resolution format (format ids are per-OS). Returns false if the device
+     * isn't present. Enumerates against the camera's current context.
+     */
+    private static boolean bindCaptureDevice(OpenPnpCaptureCamera cam, String uniqueId,
+            Integer formatId) throws Exception {
+        CaptureDevice dev = null;
+        for (CaptureDevice d : cam.getCaptureDevices()) {
+            if (d.getUniqueId().equals(uniqueId)) {
+                dev = d;
+                break;
+            }
+        }
+        if (dev == null) {
+            return false;
+        }
+        CaptureFormat pick = null;
+        for (CaptureFormat f : dev.getFormats()) {
+            if (formatId != null && f.getFormatId() == formatId) {
+                pick = f;
+                break;
+            }
+            if (formatId == null && (pick == null
+                    || (long) f.getFormatInfo().width * f.getFormatInfo().height
+                     > (long) pick.getFormatInfo().width * pick.getFormatInfo().height)) {
+                pick = f;
+            }
+        }
+        if (pick == null) {
+            return false;
+        }
+        cam.setDevice(dev);
+        cam.setFormat(pick);
+        cam.open();
+        return true;
+    }
+
+    /**
+     * POST /api/cameras/reconnect — re-binds every capture camera to its stored
+     * device against a fresh device enumeration (getCaptureDevices() re-scans the
+     * existing native context). Recovers dropped feeds. NOTE: a truly new USB path
+     * that the native context never saw needs a backend restart — recreating the
+     * native context in-process segfaults the capture library. Reports each result.
+     */
+    private static void reconnectCameras(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            reconnectCamerasImpl(ctx);
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    private static void reconnectCamerasImpl(io.javalin.http.Context ctx) {
+        List<Camera> all = new ArrayList<>(machine.getCameras());
+        try {
+            for (Head h : machine.getHeads()) {
+                all.addAll(h.getCameras());
+            }
+        }
+        catch (Exception e) {
+            // ignore
+        }
+        List<OpenPnpCaptureCamera> cams = new ArrayList<>();
+        for (Camera c : all) {
+            if (c instanceof OpenPnpCaptureCamera) {
+                cams.add((OpenPnpCaptureCamera) c);
+            }
+        }
+        // Devices present right now (fresh scan of the existing native context).
+        List<CaptureDevice> present = new ArrayList<>();
+        if (!cams.isEmpty()) {
+            present.addAll(cams.get(0).getCaptureDevices());
+        }
+        java.util.Set<String> claimed = new java.util.HashSet<>();
+        Map<OpenPnpCaptureCamera, Map<String, Object>> byCam = new java.util.LinkedHashMap<>();
+
+        // Pass 1: re-bind each camera to its exact stored device if still present.
+        for (OpenPnpCaptureCamera cam : cams) {
+            String want = cam.getDevice() != null ? cam.getDevice().getUniqueId()
+                    : storedUniqueId(cam);
+            Map<String, Object> r = new LinkedHashMap<>();
+            r.put("camera", cam.getName());
+            boolean bound = false;
+            String note = "no stored device";
+            if (want != null && !want.isEmpty()) {
+                try {
+                    bound = bindCaptureDevice(cam, want, null);
+                    if (bound) {
+                        claimed.add(want);
+                        note = "reconnected";
+                    }
+                    else {
+                        note = "stored device gone";
+                    }
+                }
+                catch (Exception e) {
+                    note = e.getMessage() != null ? e.getMessage() : e.toString();
+                }
+            }
+            r.put("bound", bound);
+            r.put("note", note);
+            byCam.put(cam, r);
+        }
+        // Pass 2: assign any still-unbound camera to a present, unclaimed LumenPnP
+        // device (VID 32e4). These cameras share a product name and their USB paths
+        // shuffle across power-cycles, so exact-path rebinding fails — grabbing an
+        // unclaimed sibling gets both feeds live; the user verifies top/bottom.
+        for (OpenPnpCaptureCamera cam : cams) {
+            Map<String, Object> r = byCam.get(cam);
+            if (Boolean.TRUE.equals(r.get("bound"))) {
+                continue;
+            }
+            // Prefer a device whose product name matches the camera's role
+            // (e.g. the "Top" camera → a device named "…Top…"), since these
+            // cameras' names distinguish them even when USB paths don't.
+            String role = cam.getName() != null ? cam.getName().toLowerCase() : "";
+            List<CaptureDevice> ordered = new ArrayList<>(present);
+            ordered.sort((a, b) -> {
+                boolean am = a.getName() != null && a.getName().toLowerCase().contains(role);
+                boolean bm = b.getName() != null && b.getName().toLowerCase().contains(role);
+                return Boolean.compare(bm, am);
+            });
+            for (CaptureDevice d : ordered) {
+                String uid = d.getUniqueId();
+                if (claimed.contains(uid)) {
+                    continue;
+                }
+                if (uid == null || !uid.toLowerCase().contains("32e4")) {
+                    continue; // only auto-grab LumenPnP-family cameras
+                }
+                try {
+                    if (bindCaptureDevice(cam, uid, null)) {
+                        claimed.add(uid);
+                        r.put("bound", true);
+                        r.put("note", "auto-assigned to " + d.getName()
+                                + " (verify top/bottom)");
+                        break;
+                    }
+                }
+                catch (Exception e) {
+                    // try the next device
+                }
+            }
+            if (!Boolean.TRUE.equals(r.get("bound"))) {
+                r.put("note", "no device available — check USB, or rebind here");
+            }
+        }
+        List<Map<String, Object>> report = new ArrayList<>(byCam.values());
+        markDirty();
+        Map<String, Object> root = describeCameras();
+        root.put("reconnect", report);
+        ctx.result(GSON.toJson(root));
     }
 
     /** GET /api/camera/frame?id=...&w=480 — one JPEG frame (transformed, optionally downscaled). */
