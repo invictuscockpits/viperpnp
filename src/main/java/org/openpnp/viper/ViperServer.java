@@ -1784,30 +1784,18 @@ public class ViperServer {
     }
 
     /**
-     * Opens capture cameras in the background at startup. OpenPnpCaptureCamera binds
-     * its stored device lazily on first capture; without this, the UI panes see
-     * bound=false and never request the stream that would have triggered the open.
+     * At startup, binds capture cameras (name-role preferred, so top/bottom stay
+     * correct even if the saved USB paths shuffled since last run) and opens them —
+     * OpenPnpCaptureCamera would otherwise only bind lazily on first capture, leaving
+     * the UI panes seeing bound=false with nothing to trigger the open.
      */
     private static void warmCameras() {
         Thread t = new Thread(() -> {
-            List<Camera> all = new ArrayList<>(machine.getCameras());
             try {
-                for (Head h : machine.getHeads()) {
-                    all.addAll(h.getCameras());
-                }
+                autoBindCameras();
             }
             catch (Exception e) {
-                // ignore
-            }
-            for (Camera c : all) {
-                if (c instanceof OpenPnpCaptureCamera) {
-                    try {
-                        c.capture();
-                    }
-                    catch (Exception e) {
-                        // camera absent/unbound — fine
-                    }
-                }
+                System.out.println("[viper] camera warmup bind failed: " + e.getMessage());
             }
         }, "viper-camera-warmup");
         t.setDaemon(true);
@@ -1962,7 +1950,16 @@ public class ViperServer {
         }
     }
 
-    private static void reconnectCamerasImpl(io.javalin.http.Context ctx) {
+    /**
+     * Binds every capture camera to a host device, in priority order:
+     *   A. a present device whose product NAME matches the camera role ("Top"/
+     *      "Bottom") — authoritative when the cameras' names distinguish them,
+     *      which fixes top/bottom crosses caused by shuffled USB paths;
+     *   B. the camera's exact stored device (uniqueId) if still present;
+     *   C. any present, unclaimed LumenPnP-family device (VID 32e4).
+     * Each device is claimed once. Returns a per-camera report.
+     */
+    private static List<Map<String, Object>> autoBindCameras() {
         List<Camera> all = new ArrayList<>(machine.getCameras());
         try {
             for (Head h : machine.getHeads()) {
@@ -1978,67 +1975,85 @@ public class ViperServer {
                 cams.add((OpenPnpCaptureCamera) c);
             }
         }
-        // Devices present right now (fresh scan of the existing native context).
         List<CaptureDevice> present = new ArrayList<>();
         if (!cams.isEmpty()) {
-            present.addAll(cams.get(0).getCaptureDevices());
+            try {
+                present.addAll(cams.get(0).getCaptureDevices());
+            }
+            catch (Exception e) {
+                // no devices
+            }
         }
         java.util.Set<String> claimed = new java.util.HashSet<>();
         Map<OpenPnpCaptureCamera, Map<String, Object>> byCam = new java.util.LinkedHashMap<>();
-
-        // Pass 1: re-bind each camera to its exact stored device if still present.
         for (OpenPnpCaptureCamera cam : cams) {
-            String want = cam.getDevice() != null ? cam.getDevice().getUniqueId()
-                    : storedUniqueId(cam);
             Map<String, Object> r = new LinkedHashMap<>();
             r.put("camera", cam.getName());
-            boolean bound = false;
-            String note = "no stored device";
-            if (want != null && !want.isEmpty()) {
-                try {
-                    bound = bindCaptureDevice(cam, want, null);
-                    if (bound) {
-                        claimed.add(want);
-                        note = "reconnected";
-                    }
-                    else {
-                        note = "stored device gone";
-                    }
-                }
-                catch (Exception e) {
-                    note = e.getMessage() != null ? e.getMessage() : e.toString();
-                }
-            }
-            r.put("bound", bound);
-            r.put("note", note);
+            r.put("bound", false);
+            r.put("note", "no device");
             byCam.put(cam, r);
         }
-        // Pass 2: assign any still-unbound camera to a present, unclaimed LumenPnP
-        // device (VID 32e4). These cameras share a product name and their USB paths
-        // shuffle across power-cycles, so exact-path rebinding fails — grabbing an
-        // unclaimed sibling gets both feeds live; the user verifies top/bottom.
+
+        // Pass A: name-role match (e.g. camera "Top" → device "PnP Top Camera").
+        for (OpenPnpCaptureCamera cam : cams) {
+            String role = cam.getName() != null ? cam.getName().toLowerCase() : "";
+            if (role.isEmpty()) {
+                continue;
+            }
+            for (CaptureDevice d : present) {
+                String uid = d.getUniqueId();
+                if (uid == null || claimed.contains(uid)
+                        || !uid.toLowerCase().contains("32e4")) {
+                    continue;
+                }
+                if (d.getName() != null && d.getName().toLowerCase().contains(role)) {
+                    try {
+                        if (bindCaptureDevice(cam, uid, null)) {
+                            claimed.add(uid);
+                            byCam.get(cam).put("bound", true);
+                            byCam.get(cam).put("note", "matched " + d.getName());
+                            break;
+                        }
+                    }
+                    catch (Exception e) {
+                        // try next
+                    }
+                }
+            }
+        }
+        // Pass B: exact stored device.
         for (OpenPnpCaptureCamera cam : cams) {
             Map<String, Object> r = byCam.get(cam);
             if (Boolean.TRUE.equals(r.get("bound"))) {
                 continue;
             }
-            // Prefer a device whose product name matches the camera's role
-            // (e.g. the "Top" camera → a device named "…Top…"), since these
-            // cameras' names distinguish them even when USB paths don't.
-            String role = cam.getName() != null ? cam.getName().toLowerCase() : "";
-            List<CaptureDevice> ordered = new ArrayList<>(present);
-            ordered.sort((a, b) -> {
-                boolean am = a.getName() != null && a.getName().toLowerCase().contains(role);
-                boolean bm = b.getName() != null && b.getName().toLowerCase().contains(role);
-                return Boolean.compare(bm, am);
-            });
-            for (CaptureDevice d : ordered) {
-                String uid = d.getUniqueId();
-                if (claimed.contains(uid)) {
-                    continue;
+            String want = cam.getDevice() != null ? cam.getDevice().getUniqueId()
+                    : storedUniqueId(cam);
+            if (want == null || want.isEmpty() || claimed.contains(want)) {
+                continue;
+            }
+            try {
+                if (bindCaptureDevice(cam, want, null)) {
+                    claimed.add(want);
+                    r.put("bound", true);
+                    r.put("note", "reconnected");
                 }
-                if (uid == null || !uid.toLowerCase().contains("32e4")) {
-                    continue; // only auto-grab LumenPnP-family cameras
+            }
+            catch (Exception e) {
+                r.put("note", e.getMessage() != null ? e.getMessage() : e.toString());
+            }
+        }
+        // Pass C: any unclaimed LumenPnP device.
+        for (OpenPnpCaptureCamera cam : cams) {
+            Map<String, Object> r = byCam.get(cam);
+            if (Boolean.TRUE.equals(r.get("bound"))) {
+                continue;
+            }
+            for (CaptureDevice d : present) {
+                String uid = d.getUniqueId();
+                if (uid == null || claimed.contains(uid)
+                        || !uid.toLowerCase().contains("32e4")) {
+                    continue;
                 }
                 try {
                     if (bindCaptureDevice(cam, uid, null)) {
@@ -2050,14 +2065,18 @@ public class ViperServer {
                     }
                 }
                 catch (Exception e) {
-                    // try the next device
+                    // try next
                 }
             }
             if (!Boolean.TRUE.equals(r.get("bound"))) {
                 r.put("note", "no device available — check USB, or rebind here");
             }
         }
-        List<Map<String, Object>> report = new ArrayList<>(byCam.values());
+        return new ArrayList<>(byCam.values());
+    }
+
+    private static void reconnectCamerasImpl(io.javalin.http.Context ctx) {
+        List<Map<String, Object>> report = autoBindCameras();
         markDirty();
         Map<String, Object> root = describeCameras();
         root.put("reconnect", report);
