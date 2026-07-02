@@ -226,6 +226,16 @@ interface CameraInfo {
   uppY: number;
   rotation: number;
   light: string | null;
+  bound?: boolean;
+  deviceName?: string | null;
+  deviceUniqueId?: string | null;
+  formatName?: string | null;
+}
+
+interface CaptureDeviceInfo {
+  name: string;
+  uniqueId: string;
+  formats: { formatId: number; width: number; height: number; fps: number; desc: string }[];
 }
 
 interface NozzleInfo {
@@ -604,6 +614,7 @@ function App() {
   const [driverPorts, setDriverPorts] = useState<string[]>([]);
   const [actuators, setActuators] = useState<ActuatorInfo[]>([]);
   const [cameras, setCameras] = useState<CameraInfo[]>([]);
+  const [captureDevices, setCaptureDevices] = useState<CaptureDeviceInfo[]>([]);
   const [nozzles, setNozzles] = useState<NozzleInfo[]>([]);
   const [nzTips, setNzTips] = useState<NozzleTipInfo[]>([]);
   const [nozzleActs, setNozzleActs] = useState<ActuatorOpt[]>([]);
@@ -1088,6 +1099,34 @@ function App() {
     }
   }, []);
 
+  const loadCaptureDevices = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/cameras/devices")).json();
+      setCaptureDevices(d.devices ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const bindCamera = (id: string, uniqueId: string) => {
+    fetch("/api/camera/bind", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, uniqueId }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.cameras) setCameras(d.cameras);
+        else if (d.error) setError(String(d.error));
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
+  // Live camera panes need ids on mount (not just when the Cameras card opens).
+  useEffect(() => {
+    loadCameras();
+  }, [loadCameras]);
+
   const updateCamera = (id: string, patch: object) => {
     fetch("/api/camera", {
       method: "POST",
@@ -1189,7 +1228,10 @@ function App() {
   const openCard = (id: string) => {
     if (id === "connection") loadDrivers();
     if (id === "actuators") loadActuators();
-    if (id === "cameras") loadCameras();
+    if (id === "cameras") {
+      loadCameras();
+      loadCaptureDevices();
+    }
     if (id === "nozzles") loadNozzles();
     if (id === "motion") loadAxes();
     if (id === "general") loadGeneral();
@@ -2076,23 +2118,35 @@ function App() {
             {[
               { key: "top", name: cameraName },
               { key: "bottom", name: bottomCamera },
-            ].map((c) => (
-              <div key={c.key} className="camera-cell">
-                <div className="camera-sublabel">{c.name}</div>
-                <div className="camera-view">
-                  <svg
-                    className="reticle"
-                    viewBox="0 0 200 150"
-                    preserveAspectRatio="xMidYMid meet"
-                  >
-                    <line x1="100" y1="6" x2="100" y2="144" />
-                    <line x1="6" y1="75" x2="194" y2="75" />
-                    <circle cx="100" cy="75" r="26" />
-                  </svg>
-                  <span className="camera-hint">no stream</span>
+            ].map((c) => {
+              const cam = cameras.find((x) => x.name === c.name);
+              const live = cam?.bound;
+              return (
+                <div key={c.key} className="camera-cell">
+                  <div className="camera-sublabel">{c.name}</div>
+                  <div className="camera-view">
+                    {live && cam && (
+                      <img
+                        className="camera-live"
+                        src={`/api/camera/mjpeg?id=${cam.id}`}
+                        alt={c.name}
+                        draggable={false}
+                      />
+                    )}
+                    <svg
+                      className="reticle"
+                      viewBox="0 0 200 150"
+                      preserveAspectRatio="xMidYMid meet"
+                    >
+                      <line x1="100" y1="6" x2="100" y2="144" />
+                      <line x1="6" y1="75" x2="194" y2="75" />
+                      <circle cx="100" cy="75" r="26" />
+                    </svg>
+                    {!live && <span className="camera-hint">no camera bound</span>}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 
@@ -4836,6 +4890,51 @@ function App() {
                     {c.looking === "Up" ? "Bottom (up)" : "Top (down)"} ·{" "}
                     {c.mount} · {c.width}×{c.height} · light: {c.light ?? "—"}
                   </div>
+                  <div className="field-grid">
+                    <label className="loc-field cam-device-field">
+                      <span>
+                        Device{" "}
+                        {c.bound ? (
+                          <span className="cam-bound-tag">
+                            ● live {c.formatName ? `· ${c.formatName}` : ""}
+                          </span>
+                        ) : (
+                          <span className="cam-unbound-tag">not bound</span>
+                        )}
+                      </span>
+                      <select
+                        className="type-select"
+                        value={c.bound ? (c.deviceUniqueId ?? "") : ""}
+                        onChange={(e) => bindCamera(c.id, e.currentTarget.value)}
+                      >
+                        <option value="">— none —</option>
+                        {!c.bound &&
+                          c.deviceUniqueId &&
+                          !captureDevices.some(
+                            (d) => d.uniqueId === c.deviceUniqueId,
+                          ) && (
+                            <option value={c.deviceUniqueId} disabled>
+                              (stored, absent) {c.deviceUniqueId}
+                            </option>
+                          )}
+                        {captureDevices.map((d) => (
+                          <option key={d.uniqueId} value={d.uniqueId}>
+                            {d.name} — {d.uniqueId.slice(-24)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  {c.bound && (
+                    <div className="cam-preview-wrap">
+                      <img
+                        className="cam-preview"
+                        src={`/api/camera/mjpeg?id=${c.id}`}
+                        alt={c.name}
+                        draggable={false}
+                      />
+                    </div>
+                  )}
                   <div className="field-grid">
                     <label className="loc-field">
                       <span>mm/px X</span>

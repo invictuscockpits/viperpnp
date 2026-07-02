@@ -3,7 +3,12 @@ package org.openpnp.viper;
 import java.awt.geom.AffineTransform;
 import java.awt.geom.NoninvertibleTransformException;
 import java.awt.geom.Point2D;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.OutputStream;
+
+import javax.imageio.ImageIO;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -19,11 +24,14 @@ import org.openpnp.machine.photon.PhotonFeeder;
 import org.openpnp.machine.photon.PhotonProperties;
 import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.machine.reference.ReferenceMachine;
+import org.openpnp.capture.CaptureDevice;
+import org.openpnp.capture.CaptureFormat;
 import org.openpnp.machine.reference.ReferenceNozzle;
 import org.openpnp.machine.reference.ReferenceNozzleTip;
 import org.openpnp.machine.reference.ReferenceNozzleTip.VacuumMeasurementMethod;
 import org.openpnp.machine.reference.ReferencePnpJobProcessor;
 import org.openpnp.machine.reference.axis.ReferenceControllerAxis;
+import org.openpnp.machine.reference.camera.OpenPnpCaptureCamera;
 import org.openpnp.machine.reference.camera.ReferenceCamera;
 import org.openpnp.machine.reference.driver.AbstractReferenceDriver;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
@@ -250,6 +258,10 @@ public class ViperServer {
         app.post("/api/actuator", ViperServer::actuateActuator);
         app.get("/api/cameras/detail", ViperServer::listCameras);
         app.post("/api/camera", ViperServer::updateCamera);
+        app.get("/api/cameras/devices", ViperServer::listCaptureDevices);
+        app.post("/api/camera/bind", ViperServer::bindCamera);
+        app.get("/api/camera/frame", ViperServer::cameraFrame);
+        app.get("/api/camera/mjpeg", ViperServer::cameraMjpeg);
         app.get("/api/nozzles/detail", ViperServer::listNozzles);
         app.post("/api/nozzle", ViperServer::updateNozzle);
         app.post("/api/nozzletip", ViperServer::updateNozzleTip);
@@ -1667,8 +1679,224 @@ public class ViperServer {
             m.put("rotation", c instanceof ReferenceCamera
                     ? round(((ReferenceCamera) c).getRotation()) : 0);
             m.put("light", c.getLightActuator() != null ? c.getLightActuator().getName() : null);
+            if (c instanceof OpenPnpCaptureCamera) {
+                OpenPnpCaptureCamera oc = (OpenPnpCaptureCamera) c;
+                boolean bound = oc.getDevice() != null;
+                m.put("bound", bound);
+                m.put("deviceName", bound ? oc.getDevice().getName() : null);
+                m.put("deviceUniqueId", bound ? oc.getDevice().getUniqueId() : storedUniqueId(oc));
+                m.put("formatName", oc.getFormatName());
+            }
             out.add(m);
         }
+    }
+
+    /** The camera's persisted device uniqueId (private field — shown when unbound). */
+    private static String storedUniqueId(OpenPnpCaptureCamera c) {
+        try {
+            java.lang.reflect.Field f = OpenPnpCaptureCamera.class.getDeclaredField("uniqueId");
+            f.setAccessible(true);
+            return (String) f.get(c);
+        }
+        catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** First OpenPnpCaptureCamera anywhere on the machine (owns a capture context). */
+    private static OpenPnpCaptureCamera anyCaptureCamera() {
+        for (Camera c : machine.getCameras()) {
+            if (c instanceof OpenPnpCaptureCamera) {
+                return (OpenPnpCaptureCamera) c;
+            }
+        }
+        try {
+            for (Head h : machine.getHeads()) {
+                for (Camera c : h.getCameras()) {
+                    if (c instanceof OpenPnpCaptureCamera) {
+                        return (OpenPnpCaptureCamera) c;
+                    }
+                }
+            }
+        }
+        catch (Exception e) {
+            // ignore
+        }
+        return null;
+    }
+
+    /** GET /api/cameras/devices — enumerate host capture devices (webcams). */
+    private static void listCaptureDevices(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            OpenPnpCaptureCamera any = anyCaptureCamera();
+            List<Map<String, Object>> devices = new ArrayList<>();
+            if (any != null) {
+                for (CaptureDevice d : any.getCaptureDevices()) {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("name", d.getName());
+                    m.put("uniqueId", d.getUniqueId());
+                    List<Map<String, Object>> formats = new ArrayList<>();
+                    for (CaptureFormat f : d.getFormats()) {
+                        Map<String, Object> fm = new LinkedHashMap<>();
+                        fm.put("formatId", f.getFormatId());
+                        fm.put("width", f.getFormatInfo().width);
+                        fm.put("height", f.getFormatInfo().height);
+                        fm.put("fps", f.getFormatInfo().fps);
+                        fm.put("desc", f.toString());
+                        formats.add(fm);
+                    }
+                    m.put("formats", formats);
+                    devices.add(m);
+                }
+            }
+            Map<String, Object> root = new LinkedHashMap<>();
+            root.put("devices", devices);
+            ctx.result(GSON.toJson(root));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/camera/bind — binds a camera to a host capture device. Body:
+     * {id, uniqueId, formatId?}. Without formatId the highest-resolution format
+     * is chosen (format ids are per-OS, so stored ids don't transfer between
+     * hosts). Empty uniqueId unbinds.
+     */
+    private static void bindCamera(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            CameraBindRequest req = GSON.fromJson(ctx.body(), CameraBindRequest.class);
+            Camera c = req != null ? findCamera(req.id) : null;
+            if (!(c instanceof OpenPnpCaptureCamera)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"capture camera not found\"}");
+                return;
+            }
+            OpenPnpCaptureCamera cam = (OpenPnpCaptureCamera) c;
+            if (req.uniqueId == null || req.uniqueId.isEmpty()) {
+                cam.setDevice(null);
+                cam.setFormat(null);
+            }
+            else {
+                CaptureDevice dev = null;
+                for (CaptureDevice d : cam.getCaptureDevices()) {
+                    if (d.getUniqueId().equals(req.uniqueId)) {
+                        dev = d;
+                        break;
+                    }
+                }
+                if (dev == null) {
+                    ctx.status(404);
+                    ctx.result("{\"error\":\"capture device not found\"}");
+                    return;
+                }
+                CaptureFormat pick = null;
+                for (CaptureFormat f : dev.getFormats()) {
+                    if (req.formatId != null) {
+                        if (f.getFormatId() == req.formatId) {
+                            pick = f;
+                            break;
+                        }
+                    }
+                    else if (pick == null
+                            || (long) f.getFormatInfo().width * f.getFormatInfo().height
+                             > (long) pick.getFormatInfo().width * pick.getFormatInfo().height) {
+                        pick = f;
+                    }
+                }
+                if (pick == null) {
+                    ctx.status(400);
+                    ctx.result("{\"error\":\"device has no capture formats\"}");
+                    return;
+                }
+                cam.setDevice(dev);
+                cam.setFormat(pick);
+                cam.open();
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describeCameras()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** GET /api/camera/frame?id=... — one JPEG frame from the camera (transformed). */
+    private static void cameraFrame(io.javalin.http.Context ctx) {
+        try {
+            Camera c = findCamera(ctx.queryParam("id"));
+            if (c == null) {
+                ctx.status(404);
+                ctx.contentType("application/json");
+                ctx.result("{\"error\":\"camera not found\"}");
+                return;
+            }
+            BufferedImage img = c.capture();
+            if (img == null) {
+                ctx.status(503);
+                ctx.contentType("application/json");
+                ctx.result("{\"error\":\"no frame (camera not bound or not delivering)\"}");
+                return;
+            }
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            ImageIO.write(img, "jpg", buf);
+            ctx.contentType("image/jpeg");
+            ctx.result(buf.toByteArray());
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.contentType("application/json");
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * GET /api/camera/mjpeg?id=... — live MJPEG stream (multipart/x-mixed-replace),
+     * usable directly as an &lt;img&gt; src. Runs on the request thread until the
+     * client disconnects; ~10 fps.
+     */
+    private static void cameraMjpeg(io.javalin.http.Context ctx) {
+        Camera c = findCamera(ctx.queryParam("id"));
+        if (c == null) {
+            ctx.status(404);
+            ctx.contentType("application/json");
+            ctx.result("{\"error\":\"camera not found\"}");
+            return;
+        }
+        try {
+            ctx.res().setContentType("multipart/x-mixed-replace; boundary=viperframe");
+            OutputStream out = ctx.res().getOutputStream();
+            while (true) {
+                BufferedImage img = c.capture();
+                if (img == null) {
+                    Thread.sleep(250);
+                    continue;
+                }
+                ByteArrayOutputStream buf = new ByteArrayOutputStream();
+                ImageIO.write(img, "jpg", buf);
+                out.write(("--viperframe\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                        + buf.size() + "\r\n\r\n").getBytes());
+                buf.writeTo(out);
+                out.write("\r\n".getBytes());
+                out.flush();
+                Thread.sleep(100);
+            }
+        }
+        catch (Exception e) {
+            // client disconnected (or capture failed) — end the stream quietly
+        }
+    }
+
+    /** JSON body for POST /api/camera/bind. */
+    private static class CameraBindRequest {
+        String id;
+        String uniqueId;
+        Integer formatId;
     }
 
     private static Map<String, Object> describeCameras() {
