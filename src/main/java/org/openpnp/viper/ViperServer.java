@@ -31,8 +31,13 @@ import org.openpnp.machine.reference.ReferenceNozzleTip;
 import org.openpnp.machine.reference.ReferenceNozzleTip.VacuumMeasurementMethod;
 import org.openpnp.machine.reference.ReferencePnpJobProcessor;
 import org.openpnp.machine.reference.axis.ReferenceControllerAxis;
+import org.opencv.core.KeyPoint;
 import org.openpnp.machine.reference.camera.OpenPnpCaptureCamera;
 import org.openpnp.machine.reference.camera.ReferenceCamera;
+import org.openpnp.machine.reference.vision.ReferenceFiducialLocator;
+import org.openpnp.model.AbstractVisionSettings;
+import org.openpnp.model.BottomVisionSettings;
+import org.openpnp.model.FiducialVisionSettings;
 import org.openpnp.machine.reference.driver.AbstractReferenceDriver;
 import org.openpnp.machine.reference.driver.SerialPortCommunications;
 import org.openpnp.machine.reference.feeder.ReferenceRotatedTrayFeeder;
@@ -69,7 +74,10 @@ import org.openpnp.spi.NozzleTip;
 import org.openpnp.spi.PnpJobProcessor;
 import org.openpnp.spi.base.AbstractFeeder;
 import org.openpnp.util.MovableUtils;
+import org.openpnp.util.OpenCvUtils;
 import org.openpnp.util.Utils2D;
+import org.openpnp.util.VisionUtils;
+import org.openpnp.vision.pipeline.CvPipeline;
 
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.gson.Gson;
@@ -143,6 +151,7 @@ public class ViperServer {
         loadJobsFolder();
         loadViperState();
         loadAliases();
+        hookVisionBridge();
         warmCameras();
         autoConnect();
         machine.addListener(new StatusBroadcastListener());
@@ -267,6 +276,9 @@ public class ViperServer {
         app.get("/api/camera/mjpeg", ViperServer::cameraMjpeg);
         app.get("/api/camera/props", ViperServer::cameraProps);
         app.post("/api/camera/property", ViperServer::setCameraProperty);
+        app.get("/api/vision/image", ViperServer::visionImage);
+        app.get("/api/vision/settings", ViperServer::listVisionSettings);
+        app.post("/api/vision/test/fiducial", ViperServer::testFiducialVision);
         app.get("/api/nozzles/detail", ViperServer::listNozzles);
         app.post("/api/nozzle", ViperServer::updateNozzle);
         app.post("/api/nozzletip", ViperServer::updateNozzleTip);
@@ -2134,6 +2146,174 @@ public class ViperServer {
         String property;
         Boolean auto;
         Integer value;
+    }
+
+    // -------------------------------------------------------------- Vision
+
+    /** Broadcasts each published vision frame as a WS event. */
+    private static void hookVisionBridge() {
+        VisionBridge.setListener(f -> {
+            Map<String, Object> ev = new LinkedHashMap<>();
+            ev.put("event", "visionImage");
+            ev.put("camera", f.cameraId);
+            ev.put("text", f.text);
+            ev.put("seq", f.seq);
+            ev.put("timestamp", f.timestamp);
+            broadcast(GSON.toJson(ev));
+        });
+    }
+
+    /** GET /api/vision/image?camera=ID — the camera's last vision working image (JPEG). */
+    private static void visionImage(io.javalin.http.Context ctx) {
+        VisionBridge.VisionFrame f = VisionBridge.get(ctx.queryParam("camera"));
+        if (f == null) {
+            ctx.status(404);
+            ctx.contentType("application/json");
+            ctx.result("{\"error\":\"no vision image yet for this camera\"}");
+            return;
+        }
+        ctx.header("Cache-Control", "no-store");
+        ctx.contentType("image/jpeg");
+        ctx.result(f.getJpeg());
+    }
+
+    /** GET /api/vision/settings — the configured vision settings (pipelines). */
+    private static void listVisionSettings(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (AbstractVisionSettings vs : Configuration.get().getVisionSettings()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", vs.getId());
+            m.put("name", vs.getName());
+            m.put("type", vs instanceof BottomVisionSettings ? "Bottom vision"
+                    : vs instanceof FiducialVisionSettings ? "Fiducial vision" : "Other");
+            m.put("enabled", vs.isEnabled());
+            int stages = 0;
+            try {
+                stages = vs.getPipeline() != null ? vs.getPipeline().getStages().size() : 0;
+            }
+            catch (Exception e) {
+                // no pipeline
+            }
+            m.put("stages", stages);
+            out.add(m);
+        }
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("settings", out);
+        ctx.result(GSON.toJson(root));
+    }
+
+    /**
+     * POST /api/vision/test/fiducial — runs the fiducial pipeline against the top
+     * camera's CURRENT view (no motion) and publishes the working image. Body:
+     * {partId?} (defaults to FIDUCIAL-HOME, else the first FID* part). Results
+     * arrive over WS as visionTest + visionImage events.
+     */
+    private static void testFiducialVision(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            CameraBindRequest req = GSON.fromJson(ctx.body(), CameraBindRequest.class);
+            final Camera camera = machine.getDefaultHead().getDefaultCamera();
+            Part part = null;
+            String wanted = req != null && req.id != null ? req.id : null;
+            if (wanted != null && !wanted.isEmpty()) {
+                part = Configuration.get().getPart(wanted);
+            }
+            if (part == null) {
+                part = Configuration.get().getPart("FIDUCIAL-HOME");
+            }
+            if (part == null) {
+                for (Part p : Configuration.get().getParts()) {
+                    if (p.getId().toUpperCase().contains("FID")) {
+                        part = p;
+                        break;
+                    }
+                }
+            }
+            if (part == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"no fiducial part found — pass {id: partId}\"}");
+                return;
+            }
+            FiducialLocator fl = machine.getFiducialLocator();
+            if (!(fl instanceof ReferenceFiducialLocator)) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"unsupported fiducial locator\"}");
+                return;
+            }
+            final ReferenceFiducialLocator rfl = (ReferenceFiducialLocator) fl;
+            final Part fidPart = part;
+            java.util.concurrent.Callable<Object> task = () -> {
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "visionTest");
+                ev.put("camera", camera.getId());
+                ev.put("part", fidPart.getId());
+                try {
+                    Location nominal = camera.getLocation();
+                    try (CvPipeline pipeline = rfl.getFiducialPipeline(camera, fidPart, nominal)) {
+                        pipeline.setProperty("fiducial.center", nominal);
+                        pipeline.setProperty("MaskCircle.center", nominal);
+                        pipeline.process();
+                        VisionBridge.publish(camera,
+                                OpenCvUtils.toBufferedImage(pipeline.getWorkingImage()),
+                                "test: " + fidPart.getId());
+                        List<KeyPoint> kps = pipeline
+                                .getExpectedResult(VisionUtils.PIPELINE_RESULTS_NAME)
+                                .getExpectedListModel(KeyPoint.class,
+                                        new Exception("no matches found"));
+                        Location best = null;
+                        double bd = Double.MAX_VALUE;
+                        for (KeyPoint kp : kps) {
+                            Location l = VisionUtils.getPixelLocation(camera, kp.pt.x, kp.pt.y);
+                            double d = l.convertToUnits(LengthUnit.Millimeters)
+                                    .getLinearDistanceTo(nominal.convertToUnits(LengthUnit.Millimeters));
+                            if (d < bd) {
+                                bd = d;
+                                best = l;
+                            }
+                        }
+                        Location bm = best.convertToUnits(LengthUnit.Millimeters);
+                        VisionBridge.publish(camera,
+                                OpenCvUtils.toBufferedImage(pipeline.getWorkingImage()),
+                                String.format("test %s: found at %.3f, %.3f (Δ %.3f mm from center)",
+                                        fidPart.getId(), bm.getX(), bm.getY(), bd));
+                        ev.put("found", true);
+                        ev.put("x", round(bm.getX()));
+                        ev.put("y", round(bm.getY()));
+                        ev.put("dist", round(bd));
+                        ev.put("matches", kps.size());
+                    }
+                }
+                catch (Exception e) {
+                    ev.put("found", false);
+                    ev.put("error", e.getMessage() != null ? e.getMessage() : e.toString());
+                }
+                broadcast(GSON.toJson(ev));
+                return null;
+            };
+            if (machine.isEnabled()) {
+                machine.submit(task, broadcastCallback());
+            }
+            else {
+                // No motion involved — a disabled machine can still process the
+                // current camera frame (the executor refuses tasks when off).
+                Thread t = new Thread(() -> {
+                    try {
+                        task.call();
+                    }
+                    catch (Exception e) {
+                        broadcast(GSON.toJson(errorMap(e)));
+                    }
+                }, "viper-vision-test");
+                t.setDaemon(true);
+                t.start();
+            }
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
     }
 
     private static Map<String, Object> describeCameras() {

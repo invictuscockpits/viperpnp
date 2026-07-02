@@ -633,6 +633,12 @@ public class ReferenceFiducialLocator extends AbstractPartSettingsHolder impleme
             pipeline.setProperty("MaskCircle.center", location);
             pipeline.process();
 
+            // Publish the working image for headless viewers (kept even when no
+            // match is found below, so failed detections stay inspectable).
+            org.openpnp.viper.VisionBridge.publish(camera,
+                    OpenCvUtils.toBufferedImage(pipeline.getWorkingImage()),
+                    partSettingsHolder.getId());
+
             // Get the results
             List<KeyPoint> keypoints = pipeline.getExpectedResult(VisionUtils.PIPELINE_RESULTS_NAME)
                     .getExpectedListModel(KeyPoint.class,
@@ -656,6 +662,11 @@ public class ReferenceFiducialLocator extends AbstractPartSettingsHolder impleme
 
             // And use the closest result
             Location newLocation = locations.get(0);
+
+            org.openpnp.viper.VisionBridge.publish(camera,
+                    OpenCvUtils.toBufferedImage(pipeline.getWorkingImage()),
+                    String.format("%s located at %.3f, %.3f",
+                            partSettingsHolder.getId(), newLocation.getX(), newLocation.getY()));
 
             MainFrame frame = MainFrame.get();
             if (frame != null) {

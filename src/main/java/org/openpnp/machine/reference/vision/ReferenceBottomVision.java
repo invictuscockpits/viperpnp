@@ -444,6 +444,8 @@ public class ReferenceBottomVision extends AbstractPartAlignment {
                     +" Δ:"+lengthConverter.convertForward(offsets.getLinearLengthTo(Location.origin));
         }
         Logger.debug("Alignment result: {}", s);
+        // Publish the annotated working image for headless viewers.
+        org.openpnp.viper.VisionBridge.publish(camera, image, s);
         MainFrame mainFrame = MainFrame.get();
         if (mainFrame != null) {
             try {

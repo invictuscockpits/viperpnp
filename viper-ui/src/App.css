@@ -368,6 +368,39 @@ body {
   cursor: not-allowed;
 }
 
+/* ---- Vision tab ---- */
+.vision-frames {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1rem;
+  margin: 0.6rem 0 1rem;
+}
+
+.vision-frame {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem;
+  background: #0b0e12;
+}
+
+.vision-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 5px;
+}
+
+.vision-empty {
+  padding: 2.2rem 0.5rem;
+  text-align: center;
+  font-size: 0.82rem;
+}
+
+.vision-caption {
+  font-size: 0.74rem;
+  font-family: ui-monospace, monospace;
+}
+
 .reticle {
   position: absolute;
   inset: 0;

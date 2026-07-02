@@ -331,7 +331,14 @@ type TeachTarget =
   | "firstRowLast"
   | "lastComponent";
 
-type Tab = "machine" | "board" | "jobs" | "feeders" | "parts" | "packages";
+type Tab =
+  | "machine"
+  | "board"
+  | "jobs"
+  | "feeders"
+  | "parts"
+  | "packages"
+  | "vision";
 
 const STEPS = [0.01, 0.1, 1, 10, 100];
 
@@ -342,9 +349,10 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "feeders", label: "Feeders" },
   { id: "parts", label: "Parts" },
   { id: "packages", label: "Packages" },
+  { id: "vision", label: "Vision" },
 ];
 
-const SOON = ["Vision", "Log"];
+const SOON = ["Log"];
 
 const MACHINE_CARDS: {
   id: string;
@@ -752,6 +760,13 @@ function App() {
   const [cameras, setCameras] = useState<CameraInfo[]>([]);
   const [captureDevices, setCaptureDevices] = useState<CaptureDeviceInfo[]>([]);
   const [camLights, setCamLights] = useState<Record<string, boolean>>({});
+  const [visionFrames, setVisionFrames] = useState<
+    Record<string, { seq: number; text: string; timestamp: number }>
+  >({});
+  const [visionTest, setVisionTest] = useState<string | null>(null);
+  const [visionSettings, setVisionSettings] = useState<
+    { id: string; name: string; type: string; enabled: boolean; stages: number }[]
+  >([]);
   const [nozzles, setNozzles] = useState<NozzleInfo[]>([]);
   const [nzTips, setNzTips] = useState<NozzleTipInfo[]>([]);
   const [nozzleActs, setNozzleActs] = useState<ActuatorOpt[]>([]);
@@ -1484,7 +1499,16 @@ function App() {
     if (tab === "packages") {
       loadPackages();
     }
-  }, [tab, loadFeeders, loadBoards, loadJobs, loadParts, loadPackages]);
+    if (tab === "vision") {
+      loadCameras();
+      fetch("/api/vision/settings")
+        .then((r) => r.json())
+        .then((d) => setVisionSettings(d.settings ?? []))
+        .catch(() => {
+          /* ignore */
+        });
+    }
+  }, [tab, loadFeeders, loadBoards, loadJobs, loadParts, loadPackages, loadCameras]);
 
   useEffect(() => {
     let closed = false;
@@ -1522,6 +1546,21 @@ function App() {
           syncJobState();
         } else if (data && data.event === "jobStatus") {
           setJobStatus(String(data.text ?? ""));
+        } else if (data && data.event === "visionImage") {
+          setVisionFrames((m) => ({
+            ...m,
+            [String(data.camera)]: {
+              seq: Number(data.seq),
+              text: String(data.text ?? ""),
+              timestamp: Number(data.timestamp ?? Date.now()),
+            },
+          }));
+        } else if (data && data.event === "visionTest") {
+          setVisionTest(
+            data.found
+              ? `✓ ${data.part}: found at (${data.x}, ${data.y}) — Δ ${data.dist} mm from view center, ${data.matches} match${data.matches === 1 ? "" : "es"}`
+              : `✗ ${data.part}: ${data.error ?? "not found"}`,
+          );
         } else if (data && data.event === "alignDone") {
           setJobBoardsRefresh((n) => n + 1);
           setAlignResult({ angle: Number(data.angle) });
@@ -3468,6 +3507,116 @@ function App() {
                   </div>
                 </>
               )}
+            </section>
+          )}
+
+          {tab === "vision" && (
+            <section className="card">
+              <div className="board-head">
+                <h2>Vision</h2>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => {
+                    setVisionTest("running…");
+                    fetch("/api/vision/test/fiducial", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: "{}",
+                    }).catch((e) =>
+                      setVisionTest(e instanceof Error ? e.message : String(e)),
+                    );
+                  }}
+                  disabled={!enabled}
+                  title={
+                    enabled
+                      ? "Run the fiducial pipeline on the top camera's current view (no motion)"
+                      : "Connect the machine first"
+                  }
+                >
+                  Test fiducial pipeline on current view
+                </button>
+              </div>
+              <p className="muted job-hint">
+                Every vision operation (visual homing, fiducial align, bottom
+                vision) publishes its processed working image here — masks and
+                detections included. The test runs the fiducial pipeline against
+                whatever the top camera sees right now, without moving.
+              </p>
+              {visionTest && (
+                <div
+                  className={`banner ${
+                    visionTest.startsWith("✗") ? "banner-warn" : "banner-ok"
+                  }`}
+                >
+                  {visionTest}
+                </div>
+              )}
+              <div className="vision-frames">
+                {cameras.map((c) => {
+                  const f = visionFrames[c.id];
+                  return (
+                    <div key={c.id} className="vision-frame">
+                      <div className="pane-head">
+                        <span className="pane-title">{c.name}</span>
+                        {f && (
+                          <span className="muted vision-caption">{f.text}</span>
+                        )}
+                      </div>
+                      {f ? (
+                        <img
+                          className="vision-img"
+                          src={`/api/vision/image?camera=${c.id}&seq=${f.seq}`}
+                          alt={c.name}
+                          draggable={false}
+                        />
+                      ) : (
+                        <div className="muted vision-empty">
+                          No vision image yet — run a vision operation or the
+                          pipeline test.
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div className="pane-head pane-head-plc">
+                <span className="pane-title">Vision settings (pipelines)</span>
+              </div>
+              <div className="ptable-wrap">
+                <table className="ptable">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Type</th>
+                      <th>Enabled</th>
+                      <th>Stages</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visionSettings.length === 0 && (
+                      <tr>
+                        <td colSpan={4} className="muted">
+                          No vision settings in this configuration.
+                        </td>
+                      </tr>
+                    )}
+                    {visionSettings.map((v) => (
+                      <tr key={v.id}>
+                        <td className="mono">{v.name || v.id}</td>
+                        <td>{v.type}</td>
+                        <td className="cell-center">{v.enabled ? "✓" : ""}</td>
+                        <td className="mono">{v.stages}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="muted job-hint">
+                Pipeline editing stays in OpenPnP for now — these run unchanged
+                from your config. Bottom-vision part alignment and nozzle-tip
+                calibration are next on the Vision roadmap.
+              </p>
             </section>
           )}
 
