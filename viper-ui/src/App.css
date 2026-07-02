@@ -269,6 +269,52 @@ body {
   cursor: not-allowed;
 }
 
+.cam-props {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0.4rem 0 0.6rem;
+  max-width: 480px;
+}
+
+.cam-prop-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.78rem;
+}
+
+.cam-prop-name {
+  width: 9.5rem;
+  color: var(--muted);
+  text-transform: capitalize;
+}
+
+.cam-prop-row input[type="range"] {
+  flex: 1;
+  accent-color: var(--green);
+}
+
+.cam-prop-row input[type="range"]:disabled {
+  opacity: 0.4;
+}
+
+.cam-prop-val {
+  min-width: 3rem;
+  text-align: right;
+}
+
+.cam-prop-auto {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  color: var(--muted);
+}
+
+.cam-prop-reset {
+  padding: 0 0.35rem;
+}
+
 .reticle {
   position: absolute;
   inset: 0;

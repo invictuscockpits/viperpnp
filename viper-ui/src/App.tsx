@@ -434,6 +434,91 @@ function CameraFeed({
   );
 }
 
+interface CamProp {
+  name: string;
+  value: number;
+  min: number;
+  max: number;
+  default: number;
+  autoSupported: boolean;
+  auto: boolean;
+}
+
+/** Driver image controls (exposure, brightness, …) for one camera, self-loading. */
+function CamPropSliders({ id }: { id: string }) {
+  const [props, setProps] = useState<CamProp[]>([]);
+  const load = useCallback(async () => {
+    try {
+      const d = await (await fetch(`/api/camera/props?id=${id}`)).json();
+      setProps(d.props ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, [id]);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const post = (property: string, patch: { auto?: boolean; value?: number }) =>
+    fetch("/api/camera/property", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, property, ...patch }),
+    });
+
+  const setValue = (p: CamProp, value: number) => {
+    // Dragging a slider implies manual control.
+    setProps((ps) =>
+      ps.map((x) => (x.name === p.name ? { ...x, value, auto: false } : x)),
+    );
+    post(p.name, p.autoSupported ? { auto: false, value } : { value });
+  };
+
+  const setAuto = (p: CamProp, auto: boolean) => {
+    setProps((ps) => ps.map((x) => (x.name === p.name ? { ...x, auto } : x)));
+    post(p.name, { auto }).then(() => setTimeout(load, 800));
+  };
+
+  if (props.length === 0) {
+    return null;
+  }
+  return (
+    <div className="cam-props">
+      {props.map((p) => (
+        <div key={p.name} className="cam-prop-row">
+          <span className="cam-prop-name">{p.name}</span>
+          <input
+            type="range"
+            min={p.min}
+            max={p.max}
+            value={p.value}
+            disabled={p.auto}
+            onChange={(e) => setValue(p, Number(e.currentTarget.value))}
+          />
+          <span className="cam-prop-val mono">{p.value}</span>
+          {p.autoSupported && (
+            <label className="cam-prop-auto">
+              <input
+                type="checkbox"
+                checked={p.auto}
+                onChange={(e) => setAuto(p, e.currentTarget.checked)}
+              />
+              auto
+            </label>
+          )}
+          <button
+            className="btn btn-sm btn-icon cam-prop-reset"
+            title={`Reset to default (${p.default})`}
+            onClick={() => setValue(p, p.default)}
+          >
+            ↺
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** Number input with custom gray up/down triangle steppers (native spinners hidden). */
 function NumberInput({
   value,
@@ -5002,14 +5087,17 @@ function App() {
                     </label>
                   </div>
                   {c.bound && (
-                    <div className="cam-preview-wrap">
-                      <CameraFeed
-                        key={c.id}
-                        id={c.id}
-                        w={640}
-                        className="cam-preview"
-                      />
-                    </div>
+                    <>
+                      <div className="cam-preview-wrap">
+                        <CameraFeed
+                          key={c.id}
+                          id={c.id}
+                          w={640}
+                          className="cam-preview"
+                        />
+                      </div>
+                      <CamPropSliders key={`props-${c.id}`} id={c.id} />
+                    </>
                   )}
                   <div className="field-grid">
                     <label className="loc-field">
