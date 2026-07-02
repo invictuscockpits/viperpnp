@@ -141,6 +141,7 @@ public class ViperServer {
 
         loadBoardsFolder();
         loadJobsFolder();
+        loadViperState();
         loadAliases();
         warmCameras();
         autoConnect();
@@ -838,6 +839,42 @@ public class ViperServer {
     /** The currently-active job file's Job, or null if none is active. */
     private static Job activeJob() {
         return activeJobFile == null ? null : findJob(activeJobFile.getAbsolutePath());
+    }
+
+    /** Viper-side UI state (active job, …) — not part of the OpenPnP format. */
+    private static File viperStateFile() {
+        return new File(Configuration.get().getConfigurationDirectory(), "viper-state.json");
+    }
+
+    private static void saveViperState() {
+        try (java.io.FileWriter w = new java.io.FileWriter(viperStateFile())) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("activeJob", activeJobFile != null ? activeJobFile.getAbsolutePath() : null);
+            GSON.toJson(m, w);
+        }
+        catch (Exception e) {
+            System.out.println("[viper] failed to save state: " + e.getMessage());
+        }
+    }
+
+    private static void loadViperState() {
+        if (!viperStateFile().exists()) {
+            return;
+        }
+        try (java.io.FileReader r = new java.io.FileReader(viperStateFile())) {
+            Map<?, ?> m = GSON.fromJson(r, Map.class);
+            Object aj = m != null ? m.get("activeJob") : null;
+            if (aj instanceof String) {
+                Job j = findJob((String) aj);
+                if (j != null) {
+                    activeJobFile = j.getFile();
+                    syncJob();
+                }
+            }
+        }
+        catch (Exception e) {
+            System.out.println("[viper] failed to load state: " + e.getMessage());
+        }
     }
 
     /** The job library: every loaded job with board/placement counts + state. */
@@ -3239,6 +3276,7 @@ public class ViperServer {
                 activeJobFile = j.getFile();
             }
             syncJob();
+            saveViperState();
             ctx.result(GSON.toJson(describeJobs()));
         }
         catch (Exception e) {
@@ -3323,6 +3361,7 @@ public class ViperServer {
                     && activeJobFile.getAbsolutePath().equals(f.getAbsolutePath())) {
                 activeJobFile = null;
                 syncJob();
+                saveViperState();
             }
             if (f != null) {
                 f.delete();
@@ -3363,6 +3402,7 @@ public class ViperServer {
             if (activeJobFile != null && old != null
                     && activeJobFile.getAbsolutePath().equals(old.getAbsolutePath())) {
                 activeJobFile = dest;
+                saveViperState();
             }
             ctx.result(GSON.toJson(describeJobs()));
         }
