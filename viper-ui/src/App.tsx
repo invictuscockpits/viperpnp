@@ -389,6 +389,50 @@ const MACHINE_CARDS: {
   },
 ];
 
+/**
+ * Polled camera view. Chained single-frame requests (each frame's onLoad
+ * schedules the next) instead of an MJPEG stream: infinite multipart streams
+ * bloat and eventually freeze the embedded webview, and their held-open
+ * connections can exhaust Chromium's per-host pool, starving every other
+ * request. Polling is slightly lower fps but self-healing by construction.
+ */
+function CameraFeed({
+  id,
+  w,
+  className,
+}: {
+  id: string;
+  w: number;
+  className: string;
+}) {
+  const [src, setSrc] = useState(`/api/camera/frame?id=${id}&w=${w}&t=0`);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const next = (delay: number) => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(
+      () => setSrc(`/api/camera/frame?id=${id}&w=${w}&t=${Date.now()}`),
+      delay,
+    );
+  };
+  useEffect(() => {
+    setSrc(`/api/camera/frame?id=${id}&w=${w}&t=${Date.now()}`);
+    return () => {
+      if (timer.current) clearTimeout(timer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, w]);
+  return (
+    <img
+      className={className}
+      src={src}
+      alt=""
+      draggable={false}
+      onLoad={() => next(180)}
+      onError={() => next(1200)}
+    />
+  );
+}
+
 /** Number input with custom gray up/down triangle steppers (native spinners hidden). */
 function NumberInput({
   value,
@@ -615,9 +659,6 @@ function App() {
   const [actuators, setActuators] = useState<ActuatorInfo[]>([]);
   const [cameras, setCameras] = useState<CameraInfo[]>([]);
   const [captureDevices, setCaptureDevices] = useState<CaptureDeviceInfo[]>([]);
-  // Bumped on every WS (re)connect: MJPEG <img> streams die silently when the
-  // backend restarts, so remount them by changing their src.
-  const [streamEpoch, setStreamEpoch] = useState(0);
   const [nozzles, setNozzles] = useState<NozzleInfo[]>([]);
   const [nzTips, setNzTips] = useState<NozzleTipInfo[]>([]);
   const [nozzleActs, setNozzleActs] = useState<ActuatorOpt[]>([]);
@@ -1307,7 +1348,6 @@ function App() {
 
       ws.addEventListener("open", () => {
         setOnline(true);
-        setStreamEpoch((n) => n + 1);
         loadCameras();
         loadInventory();
         fetch("/api/config/state")
@@ -2131,15 +2171,11 @@ function App() {
                   <div className="camera-sublabel">{c.name}</div>
                   <div className="camera-view">
                     {live && cam && (
-                      <img
-                        key={`${cam.id}-${streamEpoch}`}
+                      <CameraFeed
+                        key={cam.id}
+                        id={cam.id}
+                        w={480}
                         className="camera-live"
-                        src={`/api/camera/mjpeg?id=${cam.id}&w=480&e=${streamEpoch}`}
-                        alt={c.name}
-                        draggable={false}
-                        onError={() =>
-                          setTimeout(() => setStreamEpoch((n) => n + 1), 2000)
-                        }
                       />
                     )}
                     <svg
@@ -4936,12 +4972,11 @@ function App() {
                   </div>
                   {c.bound && (
                     <div className="cam-preview-wrap">
-                      <img
-                        key={`${c.id}-${streamEpoch}`}
+                      <CameraFeed
+                        key={c.id}
+                        id={c.id}
+                        w={640}
                         className="cam-preview"
-                        src={`/api/camera/mjpeg?id=${c.id}&w=640&e=${streamEpoch}`}
-                        alt={c.name}
-                        draggable={false}
                       />
                     </div>
                   )}

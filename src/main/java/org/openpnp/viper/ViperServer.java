@@ -1860,7 +1860,7 @@ public class ViperServer {
         }
     }
 
-    /** GET /api/camera/frame?id=... — one JPEG frame from the camera (transformed). */
+    /** GET /api/camera/frame?id=...&w=480 — one JPEG frame (transformed, optionally downscaled). */
     private static void cameraFrame(io.javalin.http.Context ctx) {
         try {
             Camera c = findCamera(ctx.queryParam("id"));
@@ -1870,7 +1870,20 @@ public class ViperServer {
                 ctx.result("{\"error\":\"camera not found\"}");
                 return;
             }
+            Integer maxW = null;
+            try {
+                String w = ctx.queryParam("w");
+                if (w != null) {
+                    maxW = Integer.parseInt(w);
+                }
+            }
+            catch (NumberFormatException ignore) {
+                // full size
+            }
             BufferedImage img = c.capture();
+            if (img != null) {
+                img = scaleFrame(img, maxW);
+            }
             if (img == null) {
                 ctx.status(503);
                 ctx.contentType("application/json");
@@ -1879,6 +1892,7 @@ public class ViperServer {
             }
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             ImageIO.write(img, "jpg", buf);
+            ctx.header("Cache-Control", "no-store");
             ctx.contentType("image/jpeg");
             ctx.result(buf.toByteArray());
         }
