@@ -615,6 +615,9 @@ function App() {
   const [actuators, setActuators] = useState<ActuatorInfo[]>([]);
   const [cameras, setCameras] = useState<CameraInfo[]>([]);
   const [captureDevices, setCaptureDevices] = useState<CaptureDeviceInfo[]>([]);
+  // Bumped on every WS (re)connect: MJPEG <img> streams die silently when the
+  // backend restarts, so remount them by changing their src.
+  const [streamEpoch, setStreamEpoch] = useState(0);
   const [nozzles, setNozzles] = useState<NozzleInfo[]>([]);
   const [nzTips, setNzTips] = useState<NozzleTipInfo[]>([]);
   const [nozzleActs, setNozzleActs] = useState<ActuatorOpt[]>([]);
@@ -1304,6 +1307,8 @@ function App() {
 
       ws.addEventListener("open", () => {
         setOnline(true);
+        setStreamEpoch((n) => n + 1);
+        loadCameras();
         loadInventory();
         fetch("/api/config/state")
           .then((r) => r.json())
@@ -1357,7 +1362,7 @@ function App() {
       }
       wsRef.current?.close();
     };
-  }, [loadInventory, loadJobs, syncJobState]);
+  }, [loadInventory, loadJobs, syncJobState, loadCameras]);
 
   const post = useCallback(async (path: string, body?: unknown) => {
     try {
@@ -2127,10 +2132,14 @@ function App() {
                   <div className="camera-view">
                     {live && cam && (
                       <img
+                        key={`${cam.id}-${streamEpoch}`}
                         className="camera-live"
-                        src={`/api/camera/mjpeg?id=${cam.id}`}
+                        src={`/api/camera/mjpeg?id=${cam.id}&e=${streamEpoch}`}
                         alt={c.name}
                         draggable={false}
+                        onError={() =>
+                          setTimeout(() => setStreamEpoch((n) => n + 1), 2000)
+                        }
                       />
                     )}
                     <svg
@@ -4928,8 +4937,9 @@ function App() {
                   {c.bound && (
                     <div className="cam-preview-wrap">
                       <img
+                        key={`${c.id}-${streamEpoch}`}
                         className="cam-preview"
-                        src={`/api/camera/mjpeg?id=${c.id}`}
+                        src={`/api/camera/mjpeg?id=${c.id}&e=${streamEpoch}`}
                         alt={c.name}
                         draggable={false}
                       />
