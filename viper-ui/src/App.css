@@ -245,6 +245,30 @@ body {
   height: auto;
 }
 
+.cam-light-btn {
+  margin-left: 0.5rem;
+  font-size: 0.62rem;
+  letter-spacing: 0.05em;
+  padding: 0.05rem 0.4rem;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.cam-light-btn.on {
+  color: var(--green);
+  border-color: var(--green);
+  box-shadow: 0 0 6px var(--green-dim);
+}
+
+.cam-light-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .reticle {
   position: absolute;
   inset: 0;

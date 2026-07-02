@@ -1682,6 +1682,7 @@ public class ViperServer {
             m.put("rotation", c instanceof ReferenceCamera
                     ? round(((ReferenceCamera) c).getRotation()) : 0);
             m.put("light", c.getLightActuator() != null ? c.getLightActuator().getName() : null);
+            m.put("lightId", c.getLightActuator() != null ? c.getLightActuator().getId() : null);
             if (c instanceof OpenPnpCaptureCamera) {
                 OpenPnpCaptureCamera oc = (OpenPnpCaptureCamera) c;
                 boolean bound = oc.getDevice() != null;

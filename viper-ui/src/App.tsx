@@ -226,6 +226,7 @@ interface CameraInfo {
   uppY: number;
   rotation: number;
   light: string | null;
+  lightId?: string | null;
   bound?: boolean;
   deviceName?: string | null;
   deviceUniqueId?: string | null;
@@ -659,6 +660,7 @@ function App() {
   const [actuators, setActuators] = useState<ActuatorInfo[]>([]);
   const [cameras, setCameras] = useState<CameraInfo[]>([]);
   const [captureDevices, setCaptureDevices] = useState<CaptureDeviceInfo[]>([]);
+  const [camLights, setCamLights] = useState<Record<string, boolean>>({});
   const [nozzles, setNozzles] = useState<NozzleInfo[]>([]);
   const [nzTips, setNzTips] = useState<NozzleTipInfo[]>([]);
   const [nozzleActs, setNozzleActs] = useState<ActuatorOpt[]>([]);
@@ -1151,6 +1153,17 @@ function App() {
       /* ignore */
     }
   }, []);
+
+  const toggleCamLight = (lightId: string) => {
+    const on = !camLights[lightId];
+    fetch("/api/actuator", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target: lightId, on }),
+    })
+      .then(() => setCamLights((m) => ({ ...m, [lightId]: on })))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
 
   const bindCamera = (id: string, uniqueId: string) => {
     fetch("/api/camera/bind", {
@@ -2168,7 +2181,25 @@ function App() {
               const live = cam?.bound;
               return (
                 <div key={c.key} className="camera-cell">
-                  <div className="camera-sublabel">{c.name}</div>
+                  <div className="camera-sublabel">
+                    {c.name}
+                    {cam?.lightId && (
+                      <button
+                        className={`cam-light-btn ${
+                          camLights[cam.lightId] ? "on" : ""
+                        }`}
+                        disabled={!enabled}
+                        onClick={() => toggleCamLight(cam.lightId!)}
+                        title={
+                          enabled
+                            ? "Toggle the camera light"
+                            : "Connect the machine to switch the light"
+                        }
+                      >
+                        LED
+                      </button>
+                    )}
+                  </div>
                   <div className="camera-view">
                     {live && cam && (
                       <CameraFeed
