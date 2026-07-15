@@ -413,9 +413,32 @@ body {
   width: 100%;
   height: 100%;
   stroke: var(--green);
-  stroke-width: 0.6;
+  stroke-width: 1.05;
   opacity: 0.3;
   fill: none;
+}
+
+/* North arm of the crosshair — contrasting so tool rotation is readable. */
+.reticle .reticle-n {
+  stroke: #ffffff;
+}
+
+/* Vision working image flashed over the live feed (masks/detections). */
+.vision-overlay {
+  z-index: 1;
+}
+
+.vision-tag {
+  position: absolute;
+  top: 4px;
+  left: 6px;
+  z-index: 2;
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--green);
+  opacity: 0.85;
+  pointer-events: none;
 }
 
 .camera-hint {

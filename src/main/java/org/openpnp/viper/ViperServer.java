@@ -196,11 +196,37 @@ public class ViperServer {
 
         app.post("/api/machine/home", ctx -> {
             machine.submit(() -> {
-                machine.home();
-                // Core swallows post-home nozzle-tip calibration failures into
-                // a Swing message box (ReferenceNozzle.home ->
-                // UiUtils.messageBoxOnExceptionLater) which never appears
-                // headless. Verify the result ourselves and surface it.
+                // ViperPNP homing policy: runout auto-calibration must NEVER
+                // brick homing or gate the calibration tools. Core runs it
+                // INSIDE home() and (depending on per-tip failHoming) aborts
+                // the whole home on a vision failure. So: suspend the
+                // recal-on-home triggers, home on mechanics + fiducial only,
+                // then run the requested calibrations afterwards best-effort —
+                // a failure is a warning, the machine stays homed and usable.
+                Map<ReferenceNozzleTipCalibration,
+                        ReferenceNozzleTipCalibration.RecalibrationTrigger> saved =
+                        new LinkedHashMap<>();
+                for (NozzleTip nt : machine.getNozzleTips()) {
+                    if (nt instanceof ReferenceNozzleTip) {
+                        ReferenceNozzleTipCalibration cal =
+                                ((ReferenceNozzleTip) nt).getCalibration();
+                        saved.put(cal, cal.getRecalibrationTrigger());
+                        cal.setRecalibrationTrigger(
+                                ReferenceNozzleTipCalibration.RecalibrationTrigger.Manual);
+                    }
+                }
+                try {
+                    machine.home();
+                }
+                finally {
+                    for (Map.Entry<ReferenceNozzleTipCalibration,
+                            ReferenceNozzleTipCalibration.RecalibrationTrigger> e
+                            : saved.entrySet()) {
+                        e.getKey().setRecalibrationTrigger(e.getValue());
+                    }
+                }
+                // Best-effort auto-calibration for tips whose trigger asks
+                // for it on home.
                 for (Head h : machine.getHeads()) {
                     for (Nozzle n : h.getNozzles()) {
                         if (!(n instanceof ReferenceNozzle)) {
@@ -212,15 +238,19 @@ public class ViperServer {
                             continue;
                         }
                         ReferenceNozzleTipCalibration cal = tip.getCalibration();
-                        if (cal.isEnabled() && cal.isRecalibrateOnHomeNeeded(rn)
-                                && !cal.isCalibrated(rn)) {
-                            Map<String, Object> ev = new LinkedHashMap<>();
-                            ev.put("event", "error");
-                            ev.put("message", "Post-home runout calibration did not "
-                                    + "complete for tip " + tip.getName() + " on "
-                                    + rn.getName() + " — check the bottom camera "
-                                    + "image and the tip's calibration pipeline.");
-                            broadcast(GSON.toJson(ev));
+                        if (cal.isEnabled() && cal.isRecalibrateOnHomeNeeded(rn)) {
+                            try {
+                                cal.calibrate(rn);
+                            }
+                            catch (Exception e) {
+                                Map<String, Object> ev = new LinkedHashMap<>();
+                                ev.put("event", "error");
+                                ev.put("message", "Runout auto-calibration failed for tip "
+                                        + tip.getName() + " on " + rn.getName() + ": "
+                                        + e.getMessage() + " — the machine is homed and "
+                                        + "usable; recalibrate from the Nozzles card.");
+                                broadcast(GSON.toJson(ev));
+                            }
                         }
                     }
                 }
@@ -234,8 +264,46 @@ public class ViperServer {
         });
 
         app.post("/api/machine/park", ctx -> {
+            ParkRequest preq = GSON.fromJson(ctx.body(), ParkRequest.class);
+            final String axes = preq != null && preq.axes != null ? preq.axes : "all";
+            final String parkTool = preq != null ? preq.tool : null;
             machine.submit(() -> {
-                MovableUtils.park(machine.getDefaultHead());
+                Head head = machine.getDefaultHead();
+                if ("z".equals(axes)) {
+                    // Raise every nozzle to Safe Z using jog-class motion so
+                    // this also works UNHOMED — a lowered nozzle on an unhomed
+                    // machine is exactly when raising Z matters most.
+                    for (Nozzle n : head.getNozzles()) {
+                        try {
+                            Length safeZ = n.getEffectiveSafeZ();
+                            if (safeZ == null) {
+                                continue;
+                            }
+                            Location l = n.getLocation();
+                            Location t = l.deriveLengths(null, null, safeZ, null);
+                            if (l.convertToUnits(LengthUnit.Millimeters).getZ()
+                                    < t.convertToUnits(LengthUnit.Millimeters).getZ()) {
+                                n.moveTo(t, 1.0, MotionOption.JogMotion);
+                            }
+                        }
+                        catch (Exception e) {
+                            // no safe Z zone mapped for this nozzle — skip
+                        }
+                    }
+                }
+                else if ("c".equals(axes)) {
+                    Nozzle n = nozzleByIdOrName(parkTool);
+                    if (n == null) {
+                        n = head.getDefaultNozzle();
+                    }
+                    Location l = n.getLocation();
+                    n.moveTo(l.derive(null, null, null, 0.0), 1.0,
+                            MotionOption.JogMotion);
+                }
+                else {
+                    // Full park: core raises to Safe Z FIRST, then moves X/Y.
+                    MovableUtils.park(head);
+                }
                 return null;
             }, broadcastCallback());
             ctx.contentType("application/json");
@@ -280,8 +348,14 @@ public class ViperServer {
                     tool = head.getDefaultCamera();
                 }
                 else {
-                    HeadMountable n = head.getNozzle(jog.tool);
-                    tool = n != null ? n : head.getDefaultNozzle();
+                    // Match by id OR name — and never fall back to a different
+                    // tool on a motion command: jogging the wrong nozzle on a
+                    // seesaw-Z machine moves the selected one the WRONG WAY.
+                    HeadMountable found = nozzleByIdOrName(jog.tool);
+                    if (found == null) {
+                        throw new Exception("Jog tool '" + jog.tool + "' not found");
+                    }
+                    tool = found;
                 }
                 Location current = tool.getLocation().convertToUnits(LengthUnit.Millimeters);
                 Location delta = new Location(LengthUnit.Millimeters, jog.dx, jog.dy, jog.dz, jog.dc);
@@ -325,6 +399,7 @@ public class ViperServer {
         app.post("/api/nozzle", ViperServer::updateNozzle);
         app.post("/api/nozzletip", ViperServer::updateNozzleTip);
         app.post("/api/nozzletip/calibrate", ViperServer::calibrateNozzleTip);
+        app.post("/api/nozzle/offsets/capture", ViperServer::captureNozzleOffsets);
         app.post("/api/bottomvision", ViperServer::updateBottomVision);
         app.get("/api/axes/detail", ViperServer::listAxes);
         app.post("/api/axis", ViperServer::updateAxis);
@@ -613,6 +688,22 @@ public class ViperServer {
             pos.put("z", round(l.getZ()));
             pos.put("c", round(l.getRotation()));
             pos.put("units", "mm");
+            // Per-nozzle rotations: the UI reticle rotates with the SELECTED
+            // tool (like OpenPnP's CameraView), and nozzles have independent
+            // rotation axes.
+            List<Map<String, Object>> tools = new ArrayList<>();
+            for (Nozzle n : machine.getDefaultHead().getNozzles()) {
+                Location nl = n.getLocation().convertToUnits(LengthUnit.Millimeters);
+                Map<String, Object> t = new LinkedHashMap<>();
+                t.put("id", n.getId());
+                t.put("name", n.getName());
+                t.put("x", round(nl.getX()));
+                t.put("y", round(nl.getY()));
+                t.put("z", round(nl.getZ()));
+                t.put("c", round(nl.getRotation()));
+                tools.add(t);
+            }
+            pos.put("tools", tools);
             return pos;
         }
         catch (Exception e) {
@@ -688,6 +779,30 @@ public class ViperServer {
         public void machineHeadActivity(Machine m, Head head) {
             broadcast(GSON.toJson(statusSnapshot()));
         }
+    }
+
+    /** The head nozzle matching an id or name, or null (no silent fallback). */
+    private static Nozzle nozzleByIdOrName(String key) {
+        if (key == null || key.isEmpty()) {
+            return null;
+        }
+        try {
+            for (Nozzle n : machine.getDefaultHead().getNozzles()) {
+                if (key.equals(n.getId()) || key.equals(n.getName())) {
+                    return n;
+                }
+            }
+        }
+        catch (Exception e) {
+            // fall through
+        }
+        return null;
+    }
+
+    /** JSON body for POST /api/machine/park. */
+    private static class ParkRequest {
+        String axes; // "all" (default) | "z" | "c"
+        String tool; // c: nozzle id/name (default: head default nozzle)
     }
 
     /** JSON body for POST /api/jog; mm deltas, 0..1 speed, and the tool to move. */
@@ -1355,7 +1470,9 @@ public class ViperServer {
                                 ? rn.getBlowOffActuator().getId() : "");
                         m.put("vacuumSense", rn.getVacuumSenseActuator() != null
                                 ? rn.getVacuumSenseActuator().getId() : "");
+                        m.put("headOffsets", locMap(rn.getHeadOffsets()));
                     }
+                    m.put("isDefault", n == h.getDefaultNozzle());
                     m.put("tip", n.getNozzleTip() != null ? n.getNozzleTip().getName() : null);
                     nozzles.add(m);
                 }
@@ -1403,6 +1520,7 @@ public class ViperServer {
                 tm.put("vacuumDifferencePartOffHigh", t.getVacuumDifferencePartOffHigh());
                 ReferenceNozzleTipCalibration cal = t.getCalibration();
                 tm.put("calEnabled", cal.isEnabled());
+                tm.put("calFailHoming", cal.isFailHoming());
                 tm.put("calRecalTrigger", cal.getRecalibrationTrigger().name());
                 tm.put("calAngleSubdivisions", cal.getAngleSubdivisions());
                 tm.put("calAllowMisdetections", cal.getAllowMisdetections());
@@ -1572,6 +1690,9 @@ public class ViperServer {
                 if (req.calEnabled != null) {
                     cal.setEnabled(req.calEnabled);
                 }
+                if (req.calFailHoming != null) {
+                    cal.setFailHoming(req.calFailHoming);
+                }
                 if (req.calRecalTrigger != null) {
                     cal.setRecalibrationTrigger(
                             ReferenceNozzleTipCalibration.RecalibrationTrigger.valueOf(req.calRecalTrigger));
@@ -1620,10 +1741,13 @@ public class ViperServer {
         Double vacuumDifferencePartOffHigh;
         // nozzle-tip runout calibration
         Boolean calEnabled;
+        Boolean calFailHoming;
         String calRecalTrigger;
         Integer calAngleSubdivisions;
         Integer calAllowMisdetections;
         Double calZOffset;
+        // offsets capture: "primary" | "secondary"
+        String which;
     }
 
     /** JSON body for POST /api/bottomvision — machine-wide alignment settings. */
@@ -1683,6 +1807,154 @@ public class ViperServer {
                 ev.put("info", ftip.getCalibration().getCalibrationInformation(fnoz));
                 broadcast(GSON.toJson(ev));
                 return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/nozzle/offsets/capture — capture nozzle head offsets from a
+     * fiducial touch-off. Body: {id, which: "primary"|"secondary"}.
+     *
+     * Port of OpenPnP's Vision Solutions "Nozzle offsets for the fiducial"
+     * issue (VisionSolutions.perNozzleSolutions): the user jogs the nozzle tip
+     * down until it touches the calibration fiducial, then this captures.
+     * Primary: head offsets = fiducial location − raw nozzle location; for the
+     * default nozzle it also sets the fiducial Z, camera UPP Z and default Z.
+     * Secondary (default nozzle only): sets secondary fiducial Z, camera
+     * secondary UPP Z and ENABLES 3D units-per-pixel.
+     */
+    private static void captureNozzleOffsets(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            NozzleUpdate req = GSON.fromJson(ctx.body(), NozzleUpdate.class);
+            Nozzle n = req != null ? findNozzle(req.id) : null;
+            Head h = machine.getDefaultHead();
+            Camera c = h.getDefaultCamera();
+            if (!(n instanceof ReferenceNozzle) || !(h instanceof ReferenceHead)
+                    || !(c instanceof ReferenceCamera)
+                    || !(machine instanceof ReferenceMachine)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            final boolean primary = req == null || req.which == null
+                    || !req.which.equals("secondary");
+            final ReferenceNozzle nozzle = (ReferenceNozzle) n;
+            final ReferenceHead head = (ReferenceHead) h;
+            final ReferenceCamera camera = (ReferenceCamera) c;
+            final ReferenceMachine rm = (ReferenceMachine) machine;
+            final ReferenceNozzle defaultNozzle =
+                    (ReferenceNozzle) head.getDefaultNozzle();
+            VisionSolutions vs = rm.getVisionSolutions().setMachine(rm);
+            if (nozzle.getSafeZ() == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"nozzle " + nozzle.getName()
+                        + " has no Safe Z zone configured\"}");
+                return;
+            }
+            if (!vs.isSolvedPrimaryXY(head)) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"capture the primary fiducial X/Y first\"}");
+                return;
+            }
+            if (!(nozzle == defaultNozzle || vs.isSolvedPrimaryZ(head))) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"capture the primary fiducial with the default "
+                        + "nozzle first (it establishes Z)\"}");
+                return;
+            }
+            if (!primary) {
+                if (nozzle != defaultNozzle) {
+                    ctx.status(409);
+                    ctx.result("{\"error\":\"the secondary fiducial is captured with the "
+                            + "default nozzle only\"}");
+                    return;
+                }
+                if (!vs.isSolvedSecondaryXY(head)) {
+                    ctx.status(409);
+                    ctx.result("{\"error\":\"capture the secondary fiducial X/Y first\"}");
+                    return;
+                }
+            }
+            machine.submit(() -> {
+                Location headOffsetsBefore = nozzle.getHeadOffsets();
+                try {
+                    if (primary) {
+                        // Reset any former head offset to zero so the nozzle
+                        // reports its raw (uncorrected) location.
+                        nozzle.setHeadOffsets(Location.origin);
+                    }
+                    Location nozzleLocation = nozzle.getLocation();
+                    if (nozzle == defaultNozzle) {
+                        if (nozzle.getSafeZ().compareTo(nozzleLocation.getLengthZ()) <= 0) {
+                            throw new Exception("The fiducial Z must be lower than Safe Z"
+                                    + " — jog the nozzle tip down onto the fiducial first.");
+                        }
+                        if (!primary && Math.abs(head.getCalibrationPrimaryFiducialLocation()
+                                .getLengthZ().subtract(nozzleLocation.getLengthZ())
+                                .convertToUnits(LengthUnit.Millimeters).getValue()) < 2.0) {
+                            throw new Exception("Primary and secondary fiducial Z must be "
+                                    + "more than 2 mm apart.");
+                        }
+                        if (primary) {
+                            head.setCalibrationPrimaryFiducialLocation(
+                                    head.getCalibrationPrimaryFiducialLocation()
+                                            .derive(nozzleLocation, false, false, true, false));
+                            camera.setUnitsPerPixelPrimary(camera.getUnitsPerPixelPrimary()
+                                    .derive(nozzleLocation, false, false, true, false));
+                            camera.setDefaultZ(nozzleLocation.getLengthZ());
+                        }
+                        else {
+                            head.setCalibrationSecondaryFiducialLocation(
+                                    head.getCalibrationSecondaryFiducialLocation()
+                                            .derive(nozzleLocation, false, false, true, false));
+                            camera.setUnitsPerPixelSecondary(camera.getUnitsPerPixelSecondary()
+                                    .derive(nozzleLocation, false, false, true, false));
+                            camera.setEnableUnitsPerPixel3D(true);
+                        }
+                    }
+                    if (primary) {
+                        Location headOffsets = head.getCalibrationPrimaryFiducialLocation()
+                                .subtract(nozzleLocation);
+                        if (headOffsetsBefore.getLinearLengthTo(headOffsets).compareTo(
+                                head.getCalibrationPrimaryFiducialDiameter().multiply(0.5)) < 0) {
+                            // Same guard as core: offsets within half a fiducial
+                            // diameter of the previous ones may already be
+                            // auto-calibrated more precisely — keep X/Y, take Z.
+                            headOffsets = headOffsetsBefore.deriveLengths(null, null,
+                                    headOffsets.getLengthZ(), null);
+                        }
+                        nozzle.setHeadOffsets(headOffsets);
+                    }
+                    markDirty();
+                    Location ho = nozzle.getHeadOffsets()
+                            .convertToUnits(LengthUnit.Millimeters);
+                    Map<String, Object> ev = new LinkedHashMap<>();
+                    ev.put("event", "nozzleOffsetsDone");
+                    ev.put("nozzle", nozzle.getId());
+                    ev.put("name", nozzle.getName());
+                    ev.put("which", primary ? "primary" : "secondary");
+                    ev.put("x", round(ho.getX()));
+                    ev.put("y", round(ho.getY()));
+                    ev.put("z", round(ho.getZ()));
+                    broadcast(GSON.toJson(ev));
+                    return null;
+                }
+                catch (Exception e) {
+                    // Never leave the nozzle with zeroed offsets on failure.
+                    nozzle.setHeadOffsets(headOffsetsBefore);
+                    throw e;
+                }
             }, broadcastCallback());
             ctx.result("{\"submitted\":true}");
         }
@@ -1975,6 +2247,7 @@ public class ViperServer {
     private static class FiducialRequest {
         String which; // "primary" | "secondary" (default secondary)
         String tool; // go: "camera" (default) | "nozzle"
+        String nozzleId; // go with tool=nozzle: which nozzle (default: head default)
         Double featureDiameterPx; // locate: expected diameter in pixels
     }
 
@@ -2083,12 +2356,16 @@ public class ViperServer {
             }
             final Location target = fidLocation(head, fidIsSecondary(req));
             final boolean nozzleTool = req != null && "nozzle".equals(req.tool);
+            final String nozzleId = req != null ? req.nozzleId : null;
             machine.submit(() -> {
                 if (nozzleTool) {
                     // Position the nozzle tip over the fiducial and STAY at
                     // safe Z — the fiducial's Z is unknown (that's what the
                     // user is about to measure by jogging down to touch).
-                    Nozzle n = machine.getDefaultHead().getDefaultNozzle();
+                    Nozzle n = nozzleId != null ? findNozzle(nozzleId) : null;
+                    if (n == null) {
+                        n = machine.getDefaultHead().getDefaultNozzle();
+                    }
                     n.moveToSafeZ();
                     Location cur = n.getLocation();
                     MovableUtils.moveToLocationAtSafeZ(n,

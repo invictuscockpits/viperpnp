@@ -43,6 +43,7 @@ interface Position {
   z: number;
   c: number;
   units: string;
+  tools?: { id: string; name: string; x: number; y: number; z: number; c: number }[];
 }
 
 interface IoState {
@@ -248,6 +249,8 @@ interface NozzleInfo {
   blowOff: string;
   vacuumSense: string;
   tip: string | null;
+  headOffsets?: { x: number; y: number; z: number };
+  isDefault?: boolean;
 }
 interface NozzleTipInfo {
   id: string;
@@ -270,6 +273,7 @@ interface NozzleTipInfo {
   vacuumDifferencePartOffHigh?: number;
   // nozzle-tip runout calibration
   calEnabled?: boolean;
+  calFailHoming?: boolean;
   calRecalTrigger?: string;
   calAngleSubdivisions?: number;
   calAllowMisdetections?: number;
@@ -790,6 +794,12 @@ function App() {
   const [visionFrames, setVisionFrames] = useState<
     Record<string, { seq: number; text: string; timestamp: number }>
   >({});
+  // Camera panes briefly show the vision working image when one arrives,
+  // like OpenPnP's CameraView.showFilteredImage (masks, detections).
+  const [visionFlash, setVisionFlash] = useState<Record<string, boolean>>({});
+  const visionFlashTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>(
+    {},
+  );
   const [visionTest, setVisionTest] = useState<string | null>(null);
   const [visionSettings, setVisionSettings] = useState<
     { id: string; name: string; type: string; enabled: boolean; stages: number }[]
@@ -807,6 +817,7 @@ function App() {
   const [fidBusy, setFidBusy] = useState(false);
   const [fidPx, setFidPx] = useState(50);
   const [fidMsg, setFidMsg] = useState<string | null>(null);
+  const [nozOffMsg, setNozOffMsg] = useState<string | null>(null);
   const [axes, setAxes] = useState<AxisInfo[]>([]);
   const [general, setGeneral] = useState<GeneralInfo | null>(null);
   const [reference, setReference] = useState("camera");
@@ -1451,6 +1462,57 @@ function App() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
 
+  const nozzleOverFid = (nozzleId: string, which: "primary" | "secondary") => {
+    fetch("/api/head/fiducial/go", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ which, tool: "nozzle", nozzleId }),
+    })
+      .then(async (r) => {
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}));
+          throw new Error(e.error ?? `move failed (${r.status})`);
+        }
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
+  const captureNozzleOffsets = (id: string, which: "primary" | "secondary") => {
+    // Core's red-letter warning: re-capturing the primary with a default
+    // nozzle that has a non-zero Z head offset resets it to zero and
+    // REDEFINES the Z reference — every previously taught Z shifts, which
+    // can cause machine collisions.
+    const noz = nozzles.find((x) => x.id === id);
+    if (
+      which === "primary" &&
+      noz?.isDefault &&
+      Math.abs(noz.headOffsets?.z ?? 0) > 0.1 &&
+      !window.confirm(
+        `CAUTION: ${noz.name} currently has a non-zero Z head offset ` +
+          `(${noz.headOffsets?.z} mm). Capturing will reset it to zero and ` +
+          `redefine the Z reference — ALL previously taught Z coordinates ` +
+          `(feeders, park, fiducials) will shift by that amount, which can ` +
+          `cause collisions. Only proceed as part of a deliberate full ` +
+          `recalibration. Continue?`,
+      )
+    ) {
+      return;
+    }
+    setNozOffMsg(null);
+    fetch("/api/nozzle/offsets/capture", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, which }),
+    })
+      .then(async (r) => {
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}));
+          throw new Error(e.error ?? `capture failed (${r.status})`);
+        }
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
   const calibrateTip = (id: string) => {
     setCalibrating(id);
     fetch("/api/nozzletip/calibrate", {
@@ -1692,14 +1754,24 @@ function App() {
         } else if (data && data.event === "jobStatus") {
           setJobStatus(String(data.text ?? ""));
         } else if (data && data.event === "visionImage") {
+          const camId = String(data.camera);
           setVisionFrames((m) => ({
             ...m,
-            [String(data.camera)]: {
+            [camId]: {
               seq: Number(data.seq),
               text: String(data.text ?? ""),
               timestamp: Number(data.timestamp ?? Date.now()),
             },
           }));
+          // Flash the working image into the camera pane (OpenPnP shows it
+          // for ~1s per vision op; consecutive frames keep it visible).
+          setVisionFlash((m) => (m[camId] ? m : { ...m, [camId]: true }));
+          if (visionFlashTimers.current[camId]) {
+            clearTimeout(visionFlashTimers.current[camId]);
+          }
+          visionFlashTimers.current[camId] = setTimeout(() => {
+            setVisionFlash((m) => ({ ...m, [camId]: false }));
+          }, 1500);
         } else if (data && data.event === "visionTest") {
           setVisionTest(
             data.found
@@ -1723,6 +1795,12 @@ function App() {
           setFidMsg(
             `✓ ${data.which} fiducial located at (${data.x}, ${data.y}) — Ø ${data.diameter} mm`,
           );
+          loadGeneral();
+        } else if (data && data.event === "nozzleOffsetsDone") {
+          setNozOffMsg(
+            `✓ ${data.name} @ ${data.which} fiducial — head offsets X ${data.x} · Y ${data.y} · Z ${data.z}`,
+          );
+          loadNozzles();
           loadGeneral();
         } else if (data && data.event === "fidVerify") {
           if (data.error) {
@@ -1797,7 +1875,8 @@ function App() {
   const toggleConnect = () =>
     post(enabled ? "/api/machine/disconnect" : "/api/machine/connect");
   const home = () => post("/api/machine/home");
-  const park = () => post("/api/machine/park");
+  const park = (axes: "all" | "z" | "c" = "all") =>
+    post("/api/machine/park", { axes, tool: reference });
   const cameraToNozzle = () => post("/api/machine/camera-to-nozzle");
   const nozzleToCamera = () => post("/api/machine/nozzle-to-camera");
   const toggleIo = (target: keyof IoState, on: boolean) =>
@@ -2519,6 +2598,16 @@ function App() {
       label: `Nozzle ${i + 1}`,
     })),
   ];
+  // The selected tool's own coordinates: on a seesaw-Z machine the nozzles'
+  // Z axes are mapped/inverted, so the DRO must show the SELECTED nozzle,
+  // not the default one.
+  const droTool = isCamera
+    ? null
+    : (pos?.tools?.find((t) => t.name === reference || t.id === reference) ??
+      null);
+  // Reticle rotation follows the selected tool, like OpenPnP's CameraView
+  // (camera selected → 0°; nozzles have independent rotation axes).
+  const toolC = isCamera ? 0 : (droTool?.c ?? pos?.c ?? 0);
 
   return (
     <div className="app">
@@ -2573,14 +2662,39 @@ function App() {
                         className="camera-live"
                       />
                     )}
+                    {live && cam && visionFlash[cam.id] && visionFrames[cam.id] && (
+                      <>
+                        <img
+                          className="camera-live vision-overlay"
+                          src={`/api/vision/image?camera=${cam.id}&seq=${visionFrames[cam.id].seq}`}
+                          alt=""
+                          draggable={false}
+                        />
+                        <span className="vision-tag">vision</span>
+                      </>
+                    )}
                     <svg
                       className="reticle"
                       viewBox="0 0 200 150"
                       preserveAspectRatio="xMidYMid meet"
                     >
-                      <line x1="100" y1="6" x2="100" y2="144" />
-                      <line x1="6" y1="75" x2="194" y2="75" />
-                      <circle cx="100" cy="75" r="26" />
+                      {/* Crosshair rotates with the selected tool (screen
+                          coords are Y-down, so negate like OpenPnP does).
+                          The north arm is drawn in a contrasting color so
+                          rotation is readable at a glance. */}
+                      <g transform={`rotate(${-toolC} 100 75)`}>
+                        <line x1="100" y1="75" x2="194" y2="75" />
+                        <line x1="100" y1="75" x2="6" y2="75" />
+                        <line x1="100" y1="75" x2="100" y2="144" />
+                        <line
+                          className="reticle-n"
+                          x1="100"
+                          y1="75"
+                          x2="100"
+                          y2="6"
+                        />
+                        <circle cx="100" cy="75" r="26" />
+                      </g>
                     </svg>
                     {!live && <span className="camera-hint">no camera bound</span>}
                   </div>
@@ -2631,7 +2745,16 @@ function App() {
               >
                 X−
               </button>
-              <button className="jbtn jpark" onClick={park} disabled={!enabled}>
+              <button
+                className="jbtn jpark"
+                onClick={() => park("all")}
+                disabled={!teachReady}
+                title={
+                  teachReady
+                    ? "Park the head (raises to safe Z first, then X/Y)"
+                    : "enable + home the machine first"
+                }
+              >
                 Park
               </button>
               <button
@@ -2657,7 +2780,12 @@ function App() {
               >
                 Z+
               </button>
-              <button className="jbtn jpark" onClick={park} disabled={!enabled}>
+              <button
+                className="jbtn jpark"
+                onClick={() => park("z")}
+                disabled={!enabled}
+                title="Raise all nozzles to safe Z (works before homing — crash recovery)"
+              >
                 Park
               </button>
               <button
@@ -2725,7 +2853,12 @@ function App() {
             >
               ↺
             </button>
-            <button className="jbtn jpark" onClick={park} disabled={!enabled}>
+            <button
+              className="jbtn jpark"
+              onClick={() => park("c")}
+              disabled={!enabled}
+              title="Rotate the selected nozzle to 0°"
+            >
               Park
             </button>
             <button
@@ -2768,7 +2901,9 @@ function App() {
           {(["x", "y", "z", "c"] as const).map((ax) => (
             <div key={ax} className="dro-cell">
               <span className="dro-ax">{ax.toUpperCase()}</span>
-              <span className="dro-val">{pos ? pos[ax].toFixed(2) : "—"}</span>
+              <span className="dro-val">
+                {droTool ? droTool[ax].toFixed(2) : pos ? pos[ax].toFixed(2) : "—"}
+              </span>
             </div>
           ))}
         </div>
@@ -2840,6 +2975,21 @@ function App() {
                 style={{ marginLeft: 8 }}
               >
                 ✕
+              </button>
+            </div>
+          )}
+          {online && enabled && !homed && (
+            <div className="banner">
+              <span style={{ flex: 1 }}>
+                Machine not homed — jog and Z-park work, but teach, calibrate
+                and capture controls are disabled until you home.
+              </span>
+              <button
+                className="btn btn-primary"
+                onClick={home}
+                style={{ marginLeft: 8 }}
+              >
+                Home now
               </button>
             </div>
           )}
@@ -5707,6 +5857,92 @@ function App() {
                         ))}
                       </select>
                     </label>
+                  </div>
+
+                  <div className="detect-grp">
+                    <div className="detect-title">
+                      Head offsets (nozzle ↔ camera)
+                      {n.headOffsets &&
+                        ` — X ${n.headOffsets.x} · Y ${n.headOffsets.y} · Z ${n.headOffsets.z}`}
+                    </div>
+                    <div
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        marginTop: 6,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <button
+                        className="btn"
+                        disabled={!teachReady}
+                        title={
+                          teachReady
+                            ? "Move this nozzle over the primary fiducial at safe Z"
+                            : "enable + home the machine first"
+                        }
+                        onClick={() => nozzleOverFid(n.id, "primary")}
+                      >
+                        Over primary fid
+                      </button>
+                      <button
+                        className="btn btn-primary"
+                        disabled={!teachReady}
+                        title={
+                          teachReady
+                            ? "Tip must be touching the primary fiducial — captures head offsets (and fiducial Z on the default nozzle)"
+                            : "enable + home the machine first"
+                        }
+                        onClick={() => captureNozzleOffsets(n.id, "primary")}
+                      >
+                        Capture @ primary
+                      </button>
+                      {n.isDefault && (
+                        <>
+                          <button
+                            className="btn"
+                            disabled={!teachReady}
+                            title={
+                              teachReady
+                                ? "Move this nozzle over the secondary fiducial at safe Z"
+                                : "enable + home the machine first"
+                            }
+                            onClick={() => nozzleOverFid(n.id, "secondary")}
+                          >
+                            Over secondary fid
+                          </button>
+                          <button
+                            className="btn btn-primary"
+                            disabled={!teachReady}
+                            title={
+                              teachReady
+                                ? "Tip must be touching the secondary fiducial — sets its Z and enables 3D units-per-pixel"
+                                : "enable + home the machine first"
+                            }
+                            onClick={() =>
+                              captureNozzleOffsets(n.id, "secondary")
+                            }
+                          >
+                            Capture @ secondary
+                          </button>
+                        </>
+                      )}
+                    </div>
+                    {nozOffMsg && (
+                      <div className="muted" style={{ marginTop: 6 }}>
+                        {nozOffMsg}
+                      </div>
+                    )}
+                    {n.isDefault && (
+                      <div className="muted" style={{ marginTop: 6 }}>
+                        Touch-off calibration, in order: ① this nozzle on the
+                        primary fiducial (sets offsets + reference Z), ② this
+                        nozzle on the secondary fiducial (sets its Z, enables
+                        3D units-per-pixel), ③ the other nozzle on the primary
+                        (sets its offsets, equalizes Z). Jog the tip down until
+                        it just touches before each capture.
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
