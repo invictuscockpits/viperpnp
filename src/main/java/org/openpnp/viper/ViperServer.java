@@ -26,14 +26,18 @@ import org.openpnp.machine.reference.ReferenceFeeder;
 import org.openpnp.machine.reference.ReferenceMachine;
 import org.openpnp.capture.CaptureDevice;
 import org.openpnp.capture.CaptureFormat;
+import org.openpnp.machine.reference.ReferenceHead;
 import org.openpnp.machine.reference.ReferenceNozzle;
 import org.openpnp.machine.reference.ReferenceNozzleTip;
 import org.openpnp.machine.reference.ReferenceNozzleTip.VacuumMeasurementMethod;
+import org.openpnp.machine.reference.ReferenceNozzleTipCalibration;
+import org.openpnp.machine.reference.solutions.VisionSolutions;
 import org.openpnp.machine.reference.ReferencePnpJobProcessor;
 import org.openpnp.machine.reference.axis.ReferenceControllerAxis;
 import org.opencv.core.KeyPoint;
 import org.openpnp.machine.reference.camera.OpenPnpCaptureCamera;
 import org.openpnp.machine.reference.camera.ReferenceCamera;
+import org.openpnp.machine.reference.vision.ReferenceBottomVision;
 import org.openpnp.machine.reference.vision.ReferenceFiducialLocator;
 import org.openpnp.model.AbstractVisionSettings;
 import org.openpnp.model.BottomVisionSettings;
@@ -152,6 +156,10 @@ public class ViperServer {
         loadViperState();
         loadAliases();
         hookVisionBridge();
+        // Errors that core would show in a Swing message box (which never
+        // appears headless) get broadcast to the UI instead.
+        org.openpnp.util.UiUtils.setHeadlessErrorListener(
+                t -> broadcast(GSON.toJson(errorMap(t))));
         warmCameras();
         autoConnect();
         machine.addListener(new StatusBroadcastListener());
@@ -186,6 +194,33 @@ public class ViperServer {
         app.post("/api/machine/home", ctx -> {
             machine.submit(() -> {
                 machine.home();
+                // Core swallows post-home nozzle-tip calibration failures into
+                // a Swing message box (ReferenceNozzle.home ->
+                // UiUtils.messageBoxOnExceptionLater) which never appears
+                // headless. Verify the result ourselves and surface it.
+                for (Head h : machine.getHeads()) {
+                    for (Nozzle n : h.getNozzles()) {
+                        if (!(n instanceof ReferenceNozzle)) {
+                            continue;
+                        }
+                        ReferenceNozzle rn = (ReferenceNozzle) n;
+                        ReferenceNozzleTip tip = rn.getCalibrationNozzleTip();
+                        if (tip == null) {
+                            continue;
+                        }
+                        ReferenceNozzleTipCalibration cal = tip.getCalibration();
+                        if (cal.isEnabled() && cal.isRecalibrateOnHomeNeeded(rn)
+                                && !cal.isCalibrated(rn)) {
+                            Map<String, Object> ev = new LinkedHashMap<>();
+                            ev.put("event", "error");
+                            ev.put("message", "Post-home runout calibration did not "
+                                    + "complete for tip " + tip.getName() + " on "
+                                    + rn.getName() + " — check the bottom camera "
+                                    + "image and the tip's calibration pipeline.");
+                            broadcast(GSON.toJson(ev));
+                        }
+                    }
+                }
                 return null;
             }, broadcastCallback());
             ctx.contentType("application/json");
@@ -283,10 +318,15 @@ public class ViperServer {
         app.get("/api/nozzles/detail", ViperServer::listNozzles);
         app.post("/api/nozzle", ViperServer::updateNozzle);
         app.post("/api/nozzletip", ViperServer::updateNozzleTip);
+        app.post("/api/nozzletip/calibrate", ViperServer::calibrateNozzleTip);
+        app.post("/api/bottomvision", ViperServer::updateBottomVision);
         app.get("/api/axes/detail", ViperServer::listAxes);
         app.post("/api/axis", ViperServer::updateAxis);
         app.get("/api/general", ViperServer::getGeneral);
         app.post("/api/general", ViperServer::updateGeneral);
+        app.post("/api/head/fiducial/go", ViperServer::fiducialGo);
+        app.post("/api/head/fiducial/capture", ViperServer::fiducialCapture);
+        app.post("/api/head/fiducial/locate", ViperServer::fiducialLocate);
         app.get("/api/parts/detail", ViperServer::listPartsDetail);
         app.post("/api/part", ViperServer::updatePart);
         app.post("/api/part/add", ViperServer::addPart);
@@ -586,6 +626,10 @@ public class ViperServer {
 
             @Override
             public void onFailure(Throwable t) {
+                // stderr is unbuffered, so this reaches the log file
+                // immediately — the WS event alone proved too easy to miss.
+                System.err.println("[viper] machine task FAILED: " + t);
+                t.printStackTrace();
                 broadcast(GSON.toJson(errorMap(t)));
             }
         };
@@ -1345,6 +1389,15 @@ public class ViperServer {
                 tm.put("vacuumLevelPartOffHigh", t.getVacuumLevelPartOffHigh());
                 tm.put("vacuumDifferencePartOffLow", t.getVacuumDifferencePartOffLow());
                 tm.put("vacuumDifferencePartOffHigh", t.getVacuumDifferencePartOffHigh());
+                ReferenceNozzleTipCalibration cal = t.getCalibration();
+                tm.put("calEnabled", cal.isEnabled());
+                tm.put("calRecalTrigger", cal.getRecalibrationTrigger().name());
+                tm.put("calAngleSubdivisions", cal.getAngleSubdivisions());
+                tm.put("calAllowMisdetections", cal.getAllowMisdetections());
+                tm.put("calZOffset", mm(cal.getCalibrationZOffset()));
+                ReferenceNozzle carrier = nozzleWithTip(t);
+                tm.put("calibrated", carrier != null && cal.isCalibrated(carrier));
+                tm.put("loaded", carrier != null);
             }
             tips.add(tm);
         }
@@ -1352,6 +1405,15 @@ public class ViperServer {
         root.put("nozzles", nozzles);
         root.put("actuators", acts);
         root.put("nozzleTips", tips);
+        ReferenceBottomVision bv = ReferenceBottomVision.getDefault();
+        if (bv != null) {
+            Map<String, Object> bvm = new LinkedHashMap<>();
+            bvm.put("preRotate", bv.isPreRotate());
+            bvm.put("maxVisionPasses", bv.getMaxVisionPasses());
+            bvm.put("maxLinearOffset", mm(bv.getMaxLinearOffset()));
+            bvm.put("maxAngularOffset", bv.getMaxAngularOffset());
+            root.put("bottomVision", bvm);
+        }
         return root;
     }
 
@@ -1366,6 +1428,23 @@ public class ViperServer {
                 for (Nozzle n : h.getNozzles()) {
                     if (n.getId().equals(id)) {
                         return n;
+                    }
+                }
+            }
+        }
+        catch (Exception e) {
+            // ignore
+        }
+        return null;
+    }
+
+    /** The nozzle currently carrying the given tip, or null if the tip isn't loaded. */
+    private static ReferenceNozzle nozzleWithTip(ReferenceNozzleTip tip) {
+        try {
+            for (Head h : machine.getHeads()) {
+                for (Nozzle n : h.getNozzles()) {
+                    if (n instanceof ReferenceNozzle && n.getNozzleTip() == tip) {
+                        return (ReferenceNozzle) n;
                     }
                 }
             }
@@ -1477,6 +1556,23 @@ public class ViperServer {
                 if (req.vacuumDifferencePartOffHigh != null) {
                     t.setVacuumDifferencePartOffHigh(req.vacuumDifferencePartOffHigh);
                 }
+                ReferenceNozzleTipCalibration cal = t.getCalibration();
+                if (req.calEnabled != null) {
+                    cal.setEnabled(req.calEnabled);
+                }
+                if (req.calRecalTrigger != null) {
+                    cal.setRecalibrationTrigger(
+                            ReferenceNozzleTipCalibration.RecalibrationTrigger.valueOf(req.calRecalTrigger));
+                }
+                if (req.calAngleSubdivisions != null) {
+                    cal.setAngleSubdivisions(req.calAngleSubdivisions);
+                }
+                if (req.calAllowMisdetections != null) {
+                    cal.setAllowMisdetections(req.calAllowMisdetections);
+                }
+                if (req.calZOffset != null) {
+                    cal.setCalibrationZOffset(new Length(req.calZOffset, LengthUnit.Millimeters));
+                }
             }
             markDirty();
             ctx.result(GSON.toJson(describeNozzles()));
@@ -1510,6 +1606,113 @@ public class ViperServer {
         Double vacuumLevelPartOffHigh;
         Double vacuumDifferencePartOffLow;
         Double vacuumDifferencePartOffHigh;
+        // nozzle-tip runout calibration
+        Boolean calEnabled;
+        String calRecalTrigger;
+        Integer calAngleSubdivisions;
+        Integer calAllowMisdetections;
+        Double calZOffset;
+    }
+
+    /** JSON body for POST /api/bottomvision — machine-wide alignment settings. */
+    private static class BottomVisionUpdate {
+        Boolean preRotate;
+        Integer maxVisionPasses;
+        Double maxLinearOffset;
+        Double maxAngularOffset;
+    }
+
+    /**
+     * POST /api/nozzletip/calibrate — run nozzle-tip runout (eccentricity)
+     * calibration for the tip currently loaded on a nozzle. Body: {id}.
+     * Requires the machine enabled + homed and the tip loaded. Broadcasts a
+     * "calibrateDone" WebSocket event with the result when finished.
+     */
+    private static void calibrateNozzleTip(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            NozzleUpdate req = GSON.fromJson(ctx.body(), NozzleUpdate.class);
+            ReferenceNozzleTip tip = null;
+            for (NozzleTip nt : machine.getNozzleTips()) {
+                if (nt instanceof ReferenceNozzleTip && req != null && nt.getId().equals(req.id)) {
+                    tip = (ReferenceNozzleTip) nt;
+                    break;
+                }
+            }
+            if (tip == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle tip not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            if (!tip.getCalibration().isEnabled()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"enable calibration for this tip first\"}");
+                return;
+            }
+            ReferenceNozzle carrier = nozzleWithTip(tip);
+            if (carrier == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"load this tip on a nozzle before calibrating\"}");
+                return;
+            }
+            final ReferenceNozzleTip ftip = tip;
+            final ReferenceNozzle fnoz = carrier;
+            machine.submit(() -> {
+                ftip.getCalibration().calibrate(fnoz);
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "calibrateDone");
+                ev.put("tip", ftip.getId());
+                ev.put("calibrated", ftip.getCalibration().isCalibrated(fnoz));
+                ev.put("info", ftip.getCalibration().getCalibrationInformation(fnoz));
+                broadcast(GSON.toJson(ev));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/bottomvision — machine-wide bottom-vision alignment settings.
+     * Body: {preRotate?, maxVisionPasses?, maxLinearOffset?, maxAngularOffset?}.
+     */
+    private static void updateBottomVision(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            BottomVisionUpdate req = GSON.fromJson(ctx.body(), BottomVisionUpdate.class);
+            ReferenceBottomVision bv = ReferenceBottomVision.getDefault();
+            if (bv == null || req == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"bottom vision not configured\"}");
+                return;
+            }
+            if (req.preRotate != null) {
+                bv.setPreRotate(req.preRotate);
+            }
+            if (req.maxVisionPasses != null) {
+                bv.setMaxVisionPasses(req.maxVisionPasses);
+            }
+            if (req.maxLinearOffset != null) {
+                bv.setMaxLinearOffset(new Length(req.maxLinearOffset, LengthUnit.Millimeters));
+            }
+            if (req.maxAngularOffset != null) {
+                bv.setMaxAngularOffset(req.maxAngularOffset);
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describeNozzles()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
     }
 
     // -------------------------------------------------------- Motion & axes
@@ -1640,6 +1843,17 @@ public class ViperServer {
             root.put("park", locMap(head.getParkLocation()));
             root.put("headName", head.getName());
         }
+        if (head instanceof ReferenceHead) {
+            root.put("homingFiducial",
+                    locMap(((ReferenceHead) head).getHomingFiducialLocation()));
+        }
+        if (head instanceof AbstractHead) {
+            AbstractHead ah = (AbstractHead) head;
+            root.put("primaryFiducial", locMap(ah.getCalibrationPrimaryFiducialLocation()));
+            root.put("primaryFiducialDiameter", mm(ah.getCalibrationPrimaryFiducialDiameter()));
+            root.put("secondaryFiducial", locMap(ah.getCalibrationSecondaryFiducialLocation()));
+            root.put("secondaryFiducialDiameter", mm(ah.getCalibrationSecondaryFiducialDiameter()));
+        }
         return root;
     }
 
@@ -1692,6 +1906,23 @@ public class ViperServer {
                             p.getRotation()));
                 }
             }
+            if (req.secFidX != null || req.secFidY != null || req.secFidZ != null
+                    || req.secFidDiameter != null) {
+                AbstractHead head = fidHead();
+                if (head != null) {
+                    Location s = fidLocation(head, true).convertToUnits(LengthUnit.Millimeters);
+                    head.setCalibrationSecondaryFiducialLocation(new Location(
+                            LengthUnit.Millimeters,
+                            req.secFidX != null ? req.secFidX : s.getX(),
+                            req.secFidY != null ? req.secFidY : s.getY(),
+                            req.secFidZ != null ? req.secFidZ : s.getZ(),
+                            s.getRotation()));
+                    if (req.secFidDiameter != null) {
+                        head.setCalibrationSecondaryFiducialDiameter(
+                                new Length(req.secFidDiameter, LengthUnit.Millimeters));
+                    }
+                }
+            }
             markDirty();
             ctx.result(GSON.toJson(describeGeneral()));
         }
@@ -1713,6 +1944,191 @@ public class ViperServer {
         Double parkX;
         Double parkY;
         Double parkZ;
+        // secondary calibration fiducial (manual edit)
+        Double secFidX;
+        Double secFidY;
+        Double secFidZ;
+        Double secFidDiameter;
+    }
+
+    // ------------------------------------------- Calibration fiducials
+
+    /** JSON body for the /api/head/fiducial/* endpoints. */
+    private static class FiducialRequest {
+        String which; // "primary" | "secondary" (default secondary)
+        Double featureDiameterPx; // locate: expected diameter in pixels
+    }
+
+    private static boolean fidIsSecondary(FiducialRequest req) {
+        return req == null || req.which == null || !req.which.equals("primary");
+    }
+
+    private static AbstractHead fidHead() {
+        try {
+            Head h = machine.getDefaultHead();
+            if (h instanceof AbstractHead) {
+                return (AbstractHead) h;
+            }
+        }
+        catch (Exception e) {
+            // fall through
+        }
+        return null;
+    }
+
+    private static Location fidLocation(AbstractHead head, boolean secondary) {
+        Location l = secondary ? head.getCalibrationSecondaryFiducialLocation()
+                : head.getCalibrationPrimaryFiducialLocation();
+        return l != null ? l : new Location(LengthUnit.Millimeters);
+    }
+
+    /** POST /api/head/fiducial/go — move the top camera over the stored location. */
+    private static void fiducialGo(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            FiducialRequest req = GSON.fromJson(ctx.body(), FiducialRequest.class);
+            AbstractHead head = fidHead();
+            if (head == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"no head\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            final Location target = fidLocation(head, fidIsSecondary(req));
+            machine.submit(() -> {
+                Camera cam = machine.getDefaultHead().getDefaultCamera();
+                MovableUtils.moveToLocationAtSafeZ(cam,
+                        cam.getLocation().derive(target, true, true, false, false));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/head/fiducial/capture — store the camera's current X/Y (Z kept). */
+    private static void fiducialCapture(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            FiducialRequest req = GSON.fromJson(ctx.body(), FiducialRequest.class);
+            AbstractHead head = fidHead();
+            if (head == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"no head\"}");
+                return;
+            }
+            boolean secondary = fidIsSecondary(req);
+            Camera cam = machine.getDefaultHead().getDefaultCamera();
+            Location camLoc = cam.getLocation().convertToUnits(LengthUnit.Millimeters);
+            Location old = fidLocation(head, secondary).convertToUnits(LengthUnit.Millimeters);
+            Location nw = new Location(LengthUnit.Millimeters, camLoc.getX(), camLoc.getY(),
+                    old.getZ(), old.getRotation());
+            if (secondary) {
+                head.setCalibrationSecondaryFiducialLocation(nw);
+            }
+            else {
+                head.setCalibrationPrimaryFiducialLocation(nw);
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describeGeneral()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/head/fiducial/locate — precision-locate the fiducial by vision,
+     * the same way OpenPnP's Issues &amp; Solutions wizard does: a short
+     * jog-around pass that also seeds the camera's (secondary) units-per-pixel,
+     * then an iterative center-in. The camera must already be roughly over the
+     * fiducial. X/Y and diameter are stored; Z stays as manually configured.
+     */
+    private static void fiducialLocate(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            FiducialRequest req = GSON.fromJson(ctx.body(), FiducialRequest.class);
+            AbstractHead head = fidHead();
+            if (head == null || !(machine instanceof ReferenceMachine)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"no head\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            Camera c = machine.getDefaultHead().getDefaultCamera();
+            if (!(c instanceof ReferenceCamera)) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no reference top camera\"}");
+                return;
+            }
+            final boolean secondary = fidIsSecondary(req);
+            final ReferenceCamera cam = (ReferenceCamera) c;
+            // Expected on-screen diameter in pixels: explicit param, else derived
+            // from the stored fiducial diameter through the camera's UPP.
+            double px = 0;
+            if (req != null && req.featureDiameterPx != null && req.featureDiameterPx > 0) {
+                px = req.featureDiameterPx;
+            }
+            else {
+                Length dia = secondary ? head.getCalibrationSecondaryFiducialDiameter()
+                        : head.getCalibrationPrimaryFiducialDiameter();
+                if (dia != null && dia.getValue() > 0) {
+                    px = dia.divide(cam.getUnitsPerPixel().getLengthX());
+                }
+            }
+            if (px <= 0) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no fiducial diameter known — enter the expected "
+                        + "diameter in pixels (or set the diameter in mm) first\"}");
+                return;
+            }
+            final double featurePx = px;
+            final ReferenceMachine rm = (ReferenceMachine) machine;
+            final String tag = (secondary ? "Secondary" : "Primary") + " fiducial locate";
+            machine.submit(() -> {
+                VisionSolutions vs = rm.getVisionSolutions().setMachine(rm);
+                Length diameter = vs.autoCalibrateCamera(cam, cam, featurePx, tag, secondary, false);
+                Location found = vs.centerInOnSubjectLocation(cam, cam, diameter, tag, secondary);
+                Location f = found.convertToUnits(LengthUnit.Millimeters);
+                Location old = fidLocation(head, secondary).convertToUnits(LengthUnit.Millimeters);
+                Location stored = new Location(LengthUnit.Millimeters, f.getX(), f.getY(),
+                        old.getZ(), old.getRotation());
+                if (secondary) {
+                    head.setCalibrationSecondaryFiducialLocation(stored);
+                    head.setCalibrationSecondaryFiducialDiameter(diameter);
+                }
+                else {
+                    head.setCalibrationPrimaryFiducialLocation(stored);
+                    head.setCalibrationPrimaryFiducialDiameter(diameter);
+                }
+                markDirty();
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "fidLocateDone");
+                ev.put("which", secondary ? "secondary" : "primary");
+                ev.put("x", round(stored.getX()));
+                ev.put("y", round(stored.getY()));
+                ev.put("diameter", round(mm(diameter)));
+                broadcast(GSON.toJson(ev));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
     }
 
     // ------------------------------------------------------------- Cameras
@@ -1994,8 +2410,34 @@ public class ViperServer {
             byCam.put(cam, r);
         }
 
-        // Pass A: name-role match (e.g. camera "Top" → device "PnP Top Camera").
+        // Pass A: exact stored device. This must win over name matching: the
+        // LumenPnP cameras can re-enumerate with IDENTICAL names (both
+        // "PnP Bottom Camera" after a power cycle), and a name match would
+        // then cross-bind top/bottom. A saved uniqueId is the user-verified
+        // truth, so honor it whenever the device is present.
         for (OpenPnpCaptureCamera cam : cams) {
+            Map<String, Object> r = byCam.get(cam);
+            String want = cam.getDevice() != null ? cam.getDevice().getUniqueId()
+                    : storedUniqueId(cam);
+            if (want == null || want.isEmpty() || claimed.contains(want)) {
+                continue;
+            }
+            try {
+                if (bindCaptureDevice(cam, want, null)) {
+                    claimed.add(want);
+                    r.put("bound", true);
+                    r.put("note", "reconnected");
+                }
+            }
+            catch (Exception e) {
+                r.put("note", e.getMessage() != null ? e.getMessage() : e.toString());
+            }
+        }
+        // Pass B: name-role match (e.g. camera "Top" → device "PnP Top Camera").
+        for (OpenPnpCaptureCamera cam : cams) {
+            if (Boolean.TRUE.equals(byCam.get(cam).get("bound"))) {
+                continue;
+            }
             String role = cam.getName() != null ? cam.getName().toLowerCase() : "";
             if (role.isEmpty()) {
                 continue;
@@ -2019,28 +2461,6 @@ public class ViperServer {
                         // try next
                     }
                 }
-            }
-        }
-        // Pass B: exact stored device.
-        for (OpenPnpCaptureCamera cam : cams) {
-            Map<String, Object> r = byCam.get(cam);
-            if (Boolean.TRUE.equals(r.get("bound"))) {
-                continue;
-            }
-            String want = cam.getDevice() != null ? cam.getDevice().getUniqueId()
-                    : storedUniqueId(cam);
-            if (want == null || want.isEmpty() || claimed.contains(want)) {
-                continue;
-            }
-            try {
-                if (bindCaptureDevice(cam, want, null)) {
-                    claimed.add(want);
-                    r.put("bound", true);
-                    r.put("note", "reconnected");
-                }
-            }
-            catch (Exception e) {
-                r.put("note", e.getMessage() != null ? e.getMessage() : e.toString());
             }
         }
         // Pass C: any unclaimed LumenPnP device.

@@ -268,8 +268,28 @@ interface NozzleTipInfo {
   vacuumLevelPartOffHigh?: number;
   vacuumDifferencePartOffLow?: number;
   vacuumDifferencePartOffHigh?: number;
+  // nozzle-tip runout calibration
+  calEnabled?: boolean;
+  calRecalTrigger?: string;
+  calAngleSubdivisions?: number;
+  calAllowMisdetections?: number;
+  calZOffset?: number;
+  calibrated?: boolean;
+  loaded?: boolean;
+}
+interface BottomVisionInfo {
+  preRotate: boolean;
+  maxVisionPasses: number;
+  maxLinearOffset: number;
+  maxAngularOffset: number;
 }
 const VAC_METHODS = ["None", "Absolute", "Difference"];
+const RECAL_TRIGGERS = [
+  "NozzleTipChange",
+  "NozzleTipChangeInJob",
+  "MachineHome",
+  "Manual",
+];
 interface ActuatorOpt {
   id: string;
   name: string;
@@ -296,6 +316,11 @@ interface GeneralInfo {
   discard: { x: number; y: number; z: number };
   park?: { x: number; y: number; z: number };
   headName?: string;
+  homingFiducial?: { x: number; y: number; z: number };
+  primaryFiducial?: { x: number; y: number; z: number };
+  primaryFiducialDiameter?: number;
+  secondaryFiducial?: { x: number; y: number; z: number };
+  secondaryFiducialDiameter?: number;
 }
 
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
@@ -771,6 +796,16 @@ function App() {
   const [nozzles, setNozzles] = useState<NozzleInfo[]>([]);
   const [nzTips, setNzTips] = useState<NozzleTipInfo[]>([]);
   const [nozzleActs, setNozzleActs] = useState<ActuatorOpt[]>([]);
+  const [bottomVision, setBottomVision] = useState<BottomVisionInfo | null>(null);
+  const [calibrating, setCalibrating] = useState<string | null>(null);
+  const [calResult, setCalResult] = useState<{
+    tip: string;
+    calibrated: boolean;
+    info: string;
+  } | null>(null);
+  const [fidBusy, setFidBusy] = useState(false);
+  const [fidPx, setFidPx] = useState(50);
+  const [fidMsg, setFidMsg] = useState<string | null>(null);
   const [axes, setAxes] = useState<AxisInfo[]>([]);
   const [general, setGeneral] = useState<GeneralInfo | null>(null);
   const [reference, setReference] = useState("camera");
@@ -1386,6 +1421,7 @@ function App() {
       setNozzles(d.nozzles ?? []);
       setNzTips(d.nozzleTips ?? []);
       setNozzleActs(d.actuators ?? []);
+      setBottomVision(d.bottomVision ?? null);
     } catch {
       /* ignore */
     }
@@ -1395,10 +1431,42 @@ function App() {
     nozzles?: NozzleInfo[];
     nozzleTips?: NozzleTipInfo[];
     actuators?: ActuatorOpt[];
+    bottomVision?: BottomVisionInfo;
   }) => {
     if (d.nozzles) setNozzles(d.nozzles);
     if (d.nozzleTips) setNzTips(d.nozzleTips);
     if (d.actuators) setNozzleActs(d.actuators);
+    if (d.bottomVision) setBottomVision(d.bottomVision);
+  };
+
+  const updateBottomVision = (patch: Partial<BottomVisionInfo>) => {
+    fetch("/api/bottomvision", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    })
+      .then((r) => r.json())
+      .then(applyNozzleResp)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
+  const calibrateTip = (id: string) => {
+    setCalibrating(id);
+    fetch("/api/nozzletip/calibrate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    })
+      .then(async (r) => {
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}));
+          throw new Error(e.error ?? `calibrate failed (${r.status})`);
+        }
+      })
+      .catch((e) => {
+        setCalibrating(null);
+        setError(e instanceof Error ? e.message : String(e));
+      });
   };
 
   const updateNozzle = (id: string, patch: object) => {
@@ -1463,6 +1531,37 @@ function App() {
       .then((r) => r.json())
       .then((d) => setGeneral(d))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
+  const fidAction = (path: "go" | "capture" | "locate") => {
+    if (path === "locate") {
+      setFidBusy(true);
+      setFidMsg(null);
+    }
+    fetch(`/api/head/fiducial/${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        path === "locate"
+          ? { which: "secondary", featureDiameterPx: fidPx }
+          : { which: "secondary" },
+      ),
+    })
+      .then(async (r) => {
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}));
+          throw new Error(e.error ?? `${path} failed (${r.status})`);
+        }
+        if (path === "capture") {
+          const d = await r.json();
+          setGeneral(d);
+          setFidMsg("✓ captured camera position");
+        }
+      })
+      .catch((e) => {
+        setFidBusy(false);
+        setError(e instanceof Error ? e.message : String(e));
+      });
   };
 
   const openCard = (id: string) => {
@@ -1565,8 +1664,10 @@ function App() {
       ws.addEventListener("message", (ev) => {
         const data = JSON.parse(ev.data as string);
         if (data && typeof data.enabled === "boolean") {
+          // Do NOT clear the error banner here: status frames stream in
+          // constantly, so clearing on status made every error vanish within
+          // milliseconds. Errors stay until explicitly dismissed.
           setStatus(data as Status);
-          setError(null);
         } else if (data && data.event === "feeders") {
           setFeeders(data.feeders ?? []);
           setScanning(false);
@@ -1597,6 +1698,20 @@ function App() {
           setJobBoardsRefresh((n) => n + 1);
           setAlignResult({ angle: Number(data.angle) });
           loadJobs();
+        } else if (data && data.event === "calibrateDone") {
+          setCalibrating(null);
+          setCalResult({
+            tip: String(data.tip),
+            calibrated: !!data.calibrated,
+            info: String(data.info ?? ""),
+          });
+          loadNozzles();
+        } else if (data && data.event === "fidLocateDone") {
+          setFidBusy(false);
+          setFidMsg(
+            `✓ ${data.which} fiducial located at (${data.x}, ${data.y}) — Ø ${data.diameter} mm`,
+          );
+          loadGeneral();
         } else if (data && data.event === "jobComplete") {
           setJobStatus(data.aborted ? "Job aborted" : "Job complete");
           setJobSkipped(data.skipped ?? []);
@@ -1607,6 +1722,9 @@ function App() {
         } else if (data && data.event === "error") {
           setError(String(data.message));
           setScanning(false);
+          // A failed machine task must also stop any spinner waiting on it.
+          setCalibrating(null);
+          setFidBusy(false);
         }
       });
       ws.addEventListener("close", () => {
@@ -2685,7 +2803,19 @@ function App() {
               the Java server and this reconnects automatically.
             </div>
           )}
-          {error && <div className="banner banner-warn">{error}</div>}
+          {error && (
+            <div className="banner banner-warn">
+              <span style={{ flex: 1 }}>{error}</span>
+              <button
+                className="icon-btn"
+                onClick={() => setError(null)}
+                title="Dismiss"
+                style={{ marginLeft: 8 }}
+              >
+                ✕
+              </button>
+            </div>
+          )}
 
           {tab === "machine" &&
             (inventory ? (
@@ -5817,9 +5947,184 @@ function App() {
                         </div>
                       )}
                     </div>
+
+                    <div className="detect-grp">
+                      <div className="detect-title">
+                        Runout calibration (rotation compensation)
+                      </div>
+                      <div className="muted" style={{ marginBottom: 6 }}>
+                        {t.loaded
+                          ? t.calibrated
+                            ? "✓ calibrated"
+                            : "loaded — not yet calibrated"
+                          : "tip not loaded on a nozzle"}
+                      </div>
+                      <div className="detect-checks">
+                        <label className="check-row">
+                          <input
+                            type="checkbox"
+                            checked={t.calEnabled ?? false}
+                            onChange={(e) =>
+                              updateTip(t.id, {
+                                calEnabled: e.currentTarget.checked,
+                              })
+                            }
+                          />
+                          <span>enable compensation</span>
+                        </label>
+                      </div>
+                      {t.calEnabled && (
+                        <>
+                          <div className="field-grid">
+                            <label className="loc-field">
+                              <span>Recalibrate</span>
+                              <select
+                                className="type-select"
+                                value={t.calRecalTrigger ?? "NozzleTipChange"}
+                                onChange={(e) =>
+                                  updateTip(t.id, {
+                                    calRecalTrigger: e.currentTarget.value,
+                                  })
+                                }
+                              >
+                                {RECAL_TRIGGERS.map((m) => (
+                                  <option key={m} value={m}>
+                                    {m}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className="loc-field">
+                              <span>Circle divisions</span>
+                              <NumberInput
+                                step={1}
+                                min={3}
+                                value={t.calAngleSubdivisions ?? 6}
+                                onChange={(v) =>
+                                  updateTip(t.id, { calAngleSubdivisions: v })
+                                }
+                              />
+                            </label>
+                            <label className="loc-field">
+                              <span>Allowed misdetects</span>
+                              <NumberInput
+                                step={1}
+                                min={0}
+                                value={t.calAllowMisdetections ?? 0}
+                                onChange={(v) =>
+                                  updateTip(t.id, { calAllowMisdetections: v })
+                                }
+                              />
+                            </label>
+                            <label className="loc-field">
+                              <span>Cal Z offset (mm)</span>
+                              <NumberInput
+                                step={0.1}
+                                value={t.calZOffset ?? 0}
+                                onChange={(v) =>
+                                  updateTip(t.id, { calZOffset: v })
+                                }
+                              />
+                            </label>
+                          </div>
+                          <div style={{ marginTop: 8 }}>
+                            <button
+                              className="btn btn-primary"
+                              disabled={
+                                !teachReady || !t.loaded || calibrating !== null
+                              }
+                              title={
+                                !teachReady
+                                  ? "enable + home the machine first"
+                                  : !t.loaded
+                                    ? "load this tip on a nozzle first"
+                                    : "measure tip runout across rotation"
+                              }
+                              onClick={() => calibrateTip(t.id)}
+                            >
+                              {calibrating === t.id
+                                ? "Calibrating…"
+                                : "Calibrate runout"}
+                            </button>
+                          </div>
+                          {calResult && calResult.tip === t.id && (
+                            <div className="muted" style={{ marginTop: 6 }}>
+                              {calResult.calibrated
+                                ? "✓ runout calibration complete"
+                                : "✗ did not converge — check bottom-cam exposure & pipeline"}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
                   </div>
                 );
               })}
+
+              {bottomVision && (
+                <>
+                  <div className="sub-head" style={{ marginTop: 14 }}>
+                    Bottom-vision alignment (part offset &amp; rotation)
+                  </div>
+                  <div className="teach-block">
+                    <label className="check-row">
+                      <input
+                        type="checkbox"
+                        checked={bottomVision.preRotate}
+                        onChange={(e) =>
+                          updateBottomVision({
+                            preRotate: e.currentTarget.checked,
+                          })
+                        }
+                      />
+                      <span>
+                        Pre-rotate to placement angle before measuring
+                        (recommended)
+                      </span>
+                    </label>
+                    <div className="field-grid" style={{ marginTop: 8 }}>
+                      <label className="loc-field">
+                        <span>Max vision passes</span>
+                        <NumberInput
+                          step={1}
+                          min={1}
+                          value={bottomVision.maxVisionPasses}
+                          onChange={(v) =>
+                            updateBottomVision({ maxVisionPasses: v })
+                          }
+                        />
+                      </label>
+                      <label className="loc-field">
+                        <span>Max linear offset (mm)</span>
+                        <NumberInput
+                          step={0.1}
+                          min={0}
+                          value={bottomVision.maxLinearOffset}
+                          onChange={(v) =>
+                            updateBottomVision({ maxLinearOffset: v })
+                          }
+                        />
+                      </label>
+                      <label className="loc-field">
+                        <span>Max angular offset (°)</span>
+                        <NumberInput
+                          step={1}
+                          min={0}
+                          value={bottomVision.maxAngularOffset}
+                          onChange={(v) =>
+                            updateBottomVision({ maxAngularOffset: v })
+                          }
+                        />
+                      </label>
+                    </div>
+                    <div className="muted" style={{ marginTop: 6 }}>
+                      Pre-rotate images the part at its final angle so residual
+                      nozzle runout is measured out. Multi-pass re-centers the
+                      part until offsets fall under these thresholds.
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
             <div className="modal-foot">
               <button
@@ -6070,6 +6375,128 @@ function App() {
                       </div>
                     </>
                   )}
+
+                  <div className="sub-head" style={{ marginTop: 14 }}>
+                    Calibration fiducials (mm)
+                  </div>
+                  {general.homingFiducial && (
+                    <div className="muted" style={{ marginBottom: 6 }}>
+                      Homing / primary fiducial: X {general.homingFiducial.x} · Y{" "}
+                      {general.homingFiducial.y}
+                      {general.primaryFiducial &&
+                        ` · Z ${general.primaryFiducial.z}`}
+                      {(general.primaryFiducialDiameter ?? 0) > 0 &&
+                        ` · Ø ${general.primaryFiducialDiameter}`}
+                    </div>
+                  )}
+                  <div className="detect-grp">
+                    <div className="detect-title">
+                      Secondary fiducial — raised target enabling 3D
+                      units-per-pixel (camera scale vs. height)
+                    </div>
+                    <div className="field-grid">
+                      <label className="loc-field">
+                        <span>X</span>
+                        <NumberInput
+                          step={0.1}
+                          value={general.secondaryFiducial?.x ?? 0}
+                          onChange={(v) => updateGeneral({ secFidX: v })}
+                        />
+                      </label>
+                      <label className="loc-field">
+                        <span>Y</span>
+                        <NumberInput
+                          step={0.1}
+                          value={general.secondaryFiducial?.y ?? 0}
+                          onChange={(v) => updateGeneral({ secFidY: v })}
+                        />
+                      </label>
+                      <label className="loc-field">
+                        <span>Z (top surface)</span>
+                        <NumberInput
+                          step={0.1}
+                          value={general.secondaryFiducial?.z ?? 0}
+                          onChange={(v) => updateGeneral({ secFidZ: v })}
+                        />
+                      </label>
+                      <label className="loc-field">
+                        <span>Ø diameter</span>
+                        <NumberInput
+                          step={0.1}
+                          value={general.secondaryFiducialDiameter ?? 0}
+                          onChange={(v) => updateGeneral({ secFidDiameter: v })}
+                        />
+                      </label>
+                      <label className="loc-field">
+                        <span>Expected px (locate)</span>
+                        <NumberInput
+                          step={5}
+                          min={5}
+                          value={fidPx}
+                          onChange={(v) => setFidPx(v)}
+                        />
+                      </label>
+                    </div>
+                    <div
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        marginTop: 8,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <button
+                        className="btn"
+                        disabled={!teachReady}
+                        title={
+                          teachReady
+                            ? "Move the top camera over the stored position"
+                            : "enable + home the machine first"
+                        }
+                        onClick={() => fidAction("go")}
+                      >
+                        Go to
+                      </button>
+                      <button
+                        className="btn"
+                        disabled={!teachReady}
+                        title={
+                          teachReady
+                            ? "Store the camera's current X/Y as the fiducial position"
+                            : "enable + home the machine first"
+                        }
+                        onClick={() => fidAction("capture")}
+                      >
+                        Capture camera position
+                      </button>
+                      <button
+                        className="btn btn-primary"
+                        disabled={!teachReady || fidBusy}
+                        title={
+                          teachReady
+                            ? "Jog the camera roughly over the fiducial first — vision then measures it precisely (like OpenPnP Issues & Solutions)"
+                            : "enable + home the machine first"
+                        }
+                        onClick={() => fidAction("locate")}
+                      >
+                        {fidBusy ? "Locating…" : "Auto-locate (vision)"}
+                      </button>
+                    </div>
+                    {fidMsg && (
+                      <div className="muted" style={{ marginTop: 6 }}>
+                        {fidMsg}
+                      </div>
+                    )}
+                    <div className="muted" style={{ marginTop: 6 }}>
+                      Opulo kit installs in slots 19/21 of row A on the primary
+                      staging plate, PCB side toward you. Jog the camera roughly
+                      over the fiducial, set the expected pixel size, then
+                      Auto-locate: the camera jogs around the target to measure
+                      its position (and seeds the camera's secondary
+                      units-per-pixel). Set Z manually — it must differ from the
+                      primary fiducial Z for 3D calibration to work.
+                    </div>
+                  </div>
                 </>
               )}
             </div>

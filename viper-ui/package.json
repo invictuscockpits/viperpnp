@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:stable": "vite --mode stable",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"

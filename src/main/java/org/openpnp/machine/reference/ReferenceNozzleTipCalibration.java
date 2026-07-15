@@ -950,6 +950,14 @@ public class ReferenceNozzleTipCalibration extends AbstractModelObject {
                 mainFrame.getCameraViews().getCameraView(camera).showFilteredImage(
                         OpenCvUtils.toBufferedImage(pipeline.getWorkingImage()), 1000);
             }
+            // ViperPNP: publish the working image headless so the web UI's
+            // Vision tab shows what the calibration actually sees per angle.
+            org.openpnp.viper.VisionBridge.publish(camera,
+                    OpenCvUtils.toBufferedImage(pipeline.getWorkingImage()),
+                    "nozzle-tip calibration " + nozzle.getName() + " @ "
+                            + String.format(java.util.Locale.US, "%.1f°",
+                                    measureLocation.getRotation())
+                            + " — " + results.size() + " detection(s)");
 
             // add all results from pipeline to a Location-list post processing
             // are there any results from the pipeline?

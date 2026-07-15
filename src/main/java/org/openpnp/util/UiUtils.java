@@ -136,7 +136,25 @@ public class UiUtils {
         }
         else {
             Logger.error(t);
+            // ViperPNP: with no Swing MainFrame these errors would otherwise
+            // vanish into the log. Hand them to the headless host (the API
+            // server) so it can surface them to its own UI.
+            if (headlessErrorListener != null) {
+                try {
+                    headlessErrorListener.accept(t);
+                }
+                catch (Exception e) {
+                    // the listener must never break error handling itself
+                }
+            }
         }
+    }
+
+    // ViperPNP: headless error tap, registered by ViperServer at startup.
+    private static java.util.function.Consumer<Throwable> headlessErrorListener;
+
+    public static void setHeadlessErrorListener(java.util.function.Consumer<Throwable> listener) {
+        headlessErrorListener = listener;
     }
 
     /**
