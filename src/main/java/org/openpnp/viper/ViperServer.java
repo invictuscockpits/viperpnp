@@ -401,6 +401,9 @@ public class ViperServer {
         app.post("/api/nozzletip/calibrate", ViperServer::calibrateNozzleTip);
         app.post("/api/nozzle/offsets/capture", ViperServer::captureNozzleOffsets);
         app.post("/api/bottomvision", ViperServer::updateBottomVision);
+        app.post("/api/test/pick", ViperServer::testPick);
+        app.post("/api/test/align", ViperServer::testAlign);
+        app.post("/api/test/discard", ViperServer::testDiscard);
         app.get("/api/axes/detail", ViperServer::listAxes);
         app.post("/api/axis", ViperServer::updateAxis);
         app.get("/api/general", ViperServer::getGeneral);
@@ -443,6 +446,7 @@ public class ViperServer {
         app.post("/api/job/board/move", ViperServer::moveToJobBoard);
         app.post("/api/job/board/capture", ViperServer::captureJobBoard);
         app.post("/api/job/board/origin", ViperServer::jobBoardOriginFromPlacement);
+        app.post("/api/job/placement/capture", ViperServer::capturePlacementFromCamera);
         app.post("/api/job/board/fiducials", ViperServer::jobBoardFiducials);
         app.post("/api/job/board/align/go", ViperServer::alignGo);
         app.post("/api/job/board/align/capture", ViperServer::alignCapture);
@@ -1955,6 +1959,207 @@ public class ViperServer {
                     nozzle.setHeadOffsets(headOffsetsBefore);
                     throw e;
                 }
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for the /api/test/* endpoints. */
+    private static class TestRequest {
+        String feederId;
+        String nozzleId;
+    }
+
+    private static Feeder findFeederById(String id) {
+        if (id == null) {
+            return null;
+        }
+        for (Feeder f : machine.getFeeders()) {
+            if (id.equals(f.getId())) {
+                return f;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * POST /api/test/pick — job-identical feed + pick from a feeder with an
+     * explicit nozzle. Port of FeedersPanel.pickFeeder minus the Swing tail:
+     * feed → part-off vacuum check → pick → part-on vacuum check.
+     * Body: {feederId, nozzleId}.
+     */
+    private static void testPick(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            TestRequest req = GSON.fromJson(ctx.body(), TestRequest.class);
+            final Feeder feeder = req != null ? findFeederById(req.feederId) : null;
+            final Nozzle nozzle = req != null ? nozzleByIdOrName(req.nozzleId) : null;
+            if (feeder == null || nozzle == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"feeder or nozzle not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            final Part part = feeder.getPart();
+            if (part == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"feeder has no part assigned\"}");
+                return;
+            }
+            if (nozzle.getNozzleTip() == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"nozzle " + nozzle.getName()
+                        + " has no tip loaded\"}");
+                return;
+            }
+            java.util.Set<NozzleTip> compatible =
+                    part.getPackage() != null
+                            ? part.getPackage().getCompatibleNozzleTips() : null;
+            if (compatible != null && !compatible.isEmpty()
+                    && !compatible.contains(nozzle.getNozzleTip())) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"tip " + nozzle.getNozzleTip().getName()
+                        + " is not marked compatible with package "
+                        + part.getPackage().getId()
+                        + " — check the Packages page\"}");
+                return;
+            }
+            machine.submit(() -> {
+                if (!nozzle.isCalibrated()) {
+                    nozzle.calibrate();
+                }
+                Map<String, Object> globals = new java.util.HashMap<>();
+                globals.put("nozzle", nozzle);
+                globals.put("feeder", feeder);
+                globals.put("part", part);
+                nozzle.moveToSafeZ();
+                Configuration.get().getScripting().on("Feeder.BeforeFeed", globals);
+                feeder.feed(nozzle);
+                Configuration.get().getScripting().on("Feeder.AfterFeed", globals);
+                if (nozzle.isPartOffEnabled(Nozzle.PartOffStep.BeforePick)) {
+                    nozzle.moveToSafeZ();
+                    if (!nozzle.isPartOff()) {
+                        throw new Exception("Part vacuum-detected on nozzle before pick.");
+                    }
+                }
+                nozzle.moveToPickLocation(feeder);
+                nozzle.pick(part, feeder);
+                nozzle.moveToSafeZ();
+                feeder.postPick(nozzle);
+                if (nozzle.isPartOnEnabled(Nozzle.PartOnStep.AfterPick)) {
+                    if (!nozzle.isPartOn()) {
+                        throw new Exception("No part detected on the nozzle after pick "
+                                + "(vacuum check). The pocket may be empty or the pick "
+                                + "Z/location off.");
+                    }
+                }
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "testPick");
+                ev.put("nozzle", nozzle.getName());
+                ev.put("part", part.getId());
+                broadcast(GSON.toJson(ev));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/test/align — bottom-vision alignment of the part currently on
+     * the nozzle (like OpenPnP's Test Alignment). Uses a synthetic 0° placement
+     * (findOffsetsPreRotate dereferences the placement). The working images
+     * flash into the camera panes via VisionBridge. Body: {nozzleId}.
+     */
+    private static void testAlign(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            TestRequest req = GSON.fromJson(ctx.body(), TestRequest.class);
+            final Nozzle nozzle = req != null ? nozzleByIdOrName(req.nozzleId) : null;
+            if (nozzle == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            final Part part = nozzle.getPart();
+            if (part == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no part on nozzle " + nozzle.getName()
+                        + " — pick one first\"}");
+                return;
+            }
+            machine.submit(() -> {
+                ReferenceBottomVision bv = ReferenceBottomVision.getDefault();
+                if (bv == null) {
+                    throw new Exception("Bottom vision is not configured.");
+                }
+                Placement dummy = new Placement("ViperTestAlignment");
+                dummy.setLocation(new Location(LengthUnit.Millimeters, 0, 0, 0, 0));
+                org.openpnp.spi.PartAlignment.PartAlignmentOffset off =
+                        bv.findOffsets(part, null, dummy, nozzle);
+                nozzle.moveToSafeZ();
+                Location l = off.getLocation().convertToUnits(LengthUnit.Millimeters);
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "alignTest");
+                ev.put("nozzle", nozzle.getName());
+                ev.put("part", part.getId());
+                ev.put("x", round(l.getX()));
+                ev.put("y", round(l.getY()));
+                ev.put("rotation", round(l.getRotation()));
+                ev.put("preRotated", off.getPreRotated());
+                broadcast(GSON.toJson(ev));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/test/discard — drop the part on the nozzle at the discard
+     * location (core Cycles.discard). Body: {nozzleId}.
+     */
+    private static void testDiscard(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            TestRequest req = GSON.fromJson(ctx.body(), TestRequest.class);
+            final Nozzle nozzle = req != null ? nozzleByIdOrName(req.nozzleId) : null;
+            if (nozzle == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            machine.submit(() -> {
+                org.openpnp.util.Cycles.discard(nozzle);
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "testDiscard");
+                ev.put("nozzle", nozzle.getName());
+                broadcast(GSON.toJson(ev));
+                return null;
             }, broadcastCallback());
             ctx.result("{\"submitted\":true}");
         }
@@ -3719,6 +3924,15 @@ public class ViperServer {
                     || !realPackages.contains(pk.getId());
             m.put("fiducial", fiducial);
             m.put("hasNozzle", !nts.isEmpty() || fiducial);
+            org.openpnp.model.Footprint fp = pk.getFootprint();
+            if (fp != null) {
+                // Body dimensions size the bottom-vision mask & search bounds;
+                // an all-zero footprint makes part alignment see everything.
+                double scale = new Length(1, fp.getUnits())
+                        .convertToUnits(LengthUnit.Millimeters).getValue();
+                m.put("bodyWidth", round(fp.getBodyWidth() * scale));
+                m.put("bodyHeight", round(fp.getBodyHeight() * scale));
+            }
             pkgs.add(m);
         }
         List<Map<String, Object>> allNts = new ArrayList<>();
@@ -3771,6 +3985,21 @@ public class ViperServer {
                     if (nt != null) {
                         pk.addCompatibleNozzleTip(nt);
                     }
+                }
+            }
+            if (req.bodyWidth != null || req.bodyHeight != null) {
+                org.openpnp.model.Footprint fp = pk.getFootprint();
+                if (fp == null) {
+                    fp = new org.openpnp.model.Footprint();
+                    pk.setFootprint(fp);
+                }
+                double scale = new Length(1, LengthUnit.Millimeters)
+                        .convertToUnits(fp.getUnits()).getValue();
+                if (req.bodyWidth != null) {
+                    fp.setBodyWidth(req.bodyWidth * scale);
+                }
+                if (req.bodyHeight != null) {
+                    fp.setBodyHeight(req.bodyHeight * scale);
                 }
             }
             markDirty();
@@ -3847,6 +4076,8 @@ public class ViperServer {
         String id;
         String description;
         List<String> nozzleTips;
+        Double bodyWidth; // mm — footprint body, sizes the vision mask
+        Double bodyHeight; // mm
     }
 
     /** GET /api/boards — the board library. */
@@ -4821,6 +5052,53 @@ public class ViperServer {
                     origin.getRotation()));
             j.setDirty(true);
             ctx.result(GSON.toJson(describeJobBoards(j)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/job/placement/capture — set a placement's board-local X/Y from
+     * the camera's CURRENT position, converted through the board-location's
+     * alignment transform (run fiducial alignment first, then hover the camera
+     * over the real part and capture). Keeps the placement's Z and rotation.
+     * Body: {file, uid, placementId}.
+     */
+    private static void capturePlacementFromCamera(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+            Placement p = bl != null ? bl.getBoard().getPlacements().get(req.placementId) : null;
+            if (bl == null || p == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"board location or placement not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            Camera camera = machine.getDefaultHead().getDefaultCamera();
+            Location cam = camera.getLocation();
+            // Machine coords → board-local, honoring the placement transform
+            // set by fiducial alignment (or the nominal location without one).
+            Location local = Utils2D.calculateBoardPlacementLocationInverse(bl, cam)
+                    .convertToUnits(LengthUnit.Millimeters);
+            Location old = p.getLocation().convertToUnits(LengthUnit.Millimeters);
+            p.setLocation(new Location(LengthUnit.Millimeters, local.getX(), local.getY(),
+                    old.getZ(), old.getRotation()));
+            bl.getBoard().setDirty(true);
+            markDirty();
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("ok", true);
+            out.put("x", round(local.getX()));
+            out.put("y", round(local.getY()));
+            ctx.result(GSON.toJson(out));
         }
         catch (Exception e) {
             ctx.status(500);

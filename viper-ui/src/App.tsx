@@ -189,6 +189,8 @@ interface PackageInfo {
   description: string | null;
   nozzleTips: string[];
   hasNozzle: boolean;
+  bodyWidth?: number;
+  bodyHeight?: number;
 }
 
 interface NtInfo {
@@ -818,6 +820,9 @@ function App() {
   const [fidPx, setFidPx] = useState(50);
   const [fidMsg, setFidMsg] = useState<string | null>(null);
   const [nozOffMsg, setNozOffMsg] = useState<string | null>(null);
+  const [pickFeederId, setPickFeederId] = useState("");
+  const [pickNozzleId, setPickNozzleId] = useState("");
+  const [pickMsg, setPickMsg] = useState<string | null>(null);
   const [axes, setAxes] = useState<AxisInfo[]>([]);
   const [general, setGeneral] = useState<GeneralInfo | null>(null);
   const [reference, setReference] = useState("camera");
@@ -1259,6 +1264,31 @@ function App() {
     }).catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
   };
 
+  const capturePlacementFromCamera = async (placementId: string) => {
+    setPlcMenu(null);
+    if (!jobEditFile || !selectedBoardUid) return;
+    setJobErr("");
+    try {
+      const res = await fetch("/api/job/placement/capture", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file: jobEditFile,
+          uid: selectedBoardUid,
+          placementId,
+        }),
+      });
+      const d = await res.json();
+      if (!res.ok) {
+        setJobErr(d.error ?? "Could not capture the placement location.");
+        return;
+      }
+      setPlcRefresh((n) => n + 1);
+    } catch (e) {
+      setJobErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const stepJob = () => {
     setJobErr("");
     fetch("/api/job/step", { method: "POST" })
@@ -1460,6 +1490,27 @@ function App() {
       .then((r) => r.json())
       .then(applyNozzleResp)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
+  const pickTest = (path: "pick" | "align" | "discard") => {
+    setPickMsg(
+      path === "pick" ? "picking…" : path === "align" ? "aligning…" : "discarding…",
+    );
+    fetch(`/api/test/${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ feederId: pickFeederId, nozzleId: pickNozzleId }),
+    })
+      .then(async (r) => {
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}));
+          throw new Error(e.error ?? `${path} failed (${r.status})`);
+        }
+      })
+      .catch((e) => {
+        setPickMsg(null);
+        setError(e instanceof Error ? e.message : String(e));
+      });
   };
 
   const nozzleOverFid = (nozzleId: string, which: "primary" | "secondary") => {
@@ -1706,6 +1757,8 @@ function App() {
     }
     if (tab === "vision") {
       loadCameras();
+      loadFeeders();
+      loadNozzles();
       fetch("/api/vision/settings")
         .then((r) => r.json())
         .then((d) => setVisionSettings(d.settings ?? []))
@@ -1713,7 +1766,7 @@ function App() {
           /* ignore */
         });
     }
-  }, [tab, loadFeeders, loadBoards, loadJobs, loadParts, loadPackages, loadCameras]);
+  }, [tab, loadFeeders, loadBoards, loadJobs, loadParts, loadPackages, loadCameras, loadNozzles]);
 
   useEffect(() => {
     let closed = false;
@@ -1796,6 +1849,15 @@ function App() {
             `✓ ${data.which} fiducial located at (${data.x}, ${data.y}) — Ø ${data.diameter} mm`,
           );
           loadGeneral();
+        } else if (data && data.event === "testPick") {
+          setPickMsg(`✓ picked ${data.part} with ${data.nozzle} — now run Align`);
+        } else if (data && data.event === "alignTest") {
+          setPickMsg(
+            `✓ ${data.part}: offset X ${data.x} · Y ${data.y} · rotation ${data.rotation}°` +
+              (data.preRotated ? " (pre-rotated)" : ""),
+          );
+        } else if (data && data.event === "testDiscard") {
+          setPickMsg(`✓ ${data.nozzle} discarded the part`);
         } else if (data && data.event === "nozzleOffsetsDone") {
           setNozOffMsg(
             `✓ ${data.name} @ ${data.which} fiducial — head offsets X ${data.x} · Y ${data.y} · Z ${data.z}`,
@@ -1830,6 +1892,7 @@ function App() {
           // A failed machine task must also stop any spinner waiting on it.
           setCalibrating(null);
           setFidBusy(false);
+          setPickMsg(null);
         }
       });
       ws.addEventListener("close", () => {
@@ -2192,16 +2255,24 @@ function App() {
         id,
         description: editPackage.description,
       });
-      if (editPackage.nozzleTips.length)
+      if (
+        editPackage.nozzleTips.length ||
+        editPackage.bodyWidth ||
+        editPackage.bodyHeight
+      )
         await postPackages("/api/package", {
           id,
           nozzleTips: editPackage.nozzleTips,
+          bodyWidth: editPackage.bodyWidth,
+          bodyHeight: editPackage.bodyHeight,
         });
     } else {
       await postPackages("/api/package", {
         id,
         description: editPackage.description,
         nozzleTips: editPackage.nozzleTips,
+        bodyWidth: editPackage.bodyWidth,
+        bodyHeight: editPackage.bodyHeight,
       });
     }
     setEditPackage(null);
@@ -3920,6 +3991,93 @@ function App() {
               </div>
 
               <div className="pane-head pane-head-plc">
+                <span className="pane-title">Pick &amp; align test</span>
+              </div>
+              <p className="muted job-hint">
+                Job-identical feed → pick → bottom-vision alignment, one step at
+                a time. The alignment's masked working image appears above and
+                flashes in the camera panes; the reported offsets are what a job
+                would correct by. Discard drops the part at the discard
+                location.
+              </p>
+              <div
+                style={{
+                  display: "flex",
+                  gap: 8,
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                }}
+              >
+                <select
+                  className="type-select"
+                  value={pickFeederId}
+                  onChange={(e) => setPickFeederId(e.currentTarget.value)}
+                >
+                  <option value="">— feeder —</option>
+                  {feeders
+                    .filter((f) => f.part)
+                    .map((f) => (
+                      <option key={f.id} value={f.id}>
+                        {f.name} — {f.part}
+                      </option>
+                    ))}
+                </select>
+                <select
+                  className="type-select"
+                  value={pickNozzleId}
+                  onChange={(e) => setPickNozzleId(e.currentTarget.value)}
+                >
+                  <option value="">— nozzle —</option>
+                  {nozzles.map((n) => (
+                    <option key={n.id} value={n.id}>
+                      {n.name} ({n.tip ?? "no tip"})
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="btn btn-primary"
+                  disabled={!teachReady || !pickFeederId || !pickNozzleId}
+                  title={
+                    teachReady
+                      ? "Feed the feeder and pick a part (with vacuum checks)"
+                      : "enable + home the machine first"
+                  }
+                  onClick={() => pickTest("pick")}
+                >
+                  Pick
+                </button>
+                <button
+                  className="btn btn-primary"
+                  disabled={!teachReady || !pickNozzleId}
+                  title={
+                    teachReady
+                      ? "Bottom-vision align the part on the nozzle (watch the frames above)"
+                      : "enable + home the machine first"
+                  }
+                  onClick={() => pickTest("align")}
+                >
+                  Align
+                </button>
+                <button
+                  className="btn"
+                  disabled={!teachReady || !pickNozzleId}
+                  title={
+                    teachReady
+                      ? "Drop the part at the discard location"
+                      : "enable + home the machine first"
+                  }
+                  onClick={() => pickTest("discard")}
+                >
+                  Discard
+                </button>
+              </div>
+              {pickMsg && (
+                <div className="muted" style={{ marginTop: 6 }}>
+                  {pickMsg}
+                </div>
+              )}
+
+              <div className="pane-head pane-head-plc">
                 <span className="pane-title">Vision settings (pipelines)</span>
               </div>
               <div className="ptable-wrap">
@@ -5239,6 +5397,39 @@ function App() {
                     })
                   }
                 />
+              </div>
+              <div className="teach-block">
+                <div className="teach-head">
+                  Body size (mm) — bottom vision masks and searches by these;
+                  0×0 makes part alignment fail
+                </div>
+                <div className="field-grid">
+                  <label className="loc-field">
+                    <span>Width (X)</span>
+                    <NumberInput
+                      step={0.1}
+                      min={0}
+                      value={editPackage.bodyWidth ?? 0}
+                      onChange={(v) =>
+                        setEditPackage({ ...editPackage, bodyWidth: v })
+                      }
+                    />
+                  </label>
+                  <label className="loc-field">
+                    <span>Length (Y)</span>
+                    <NumberInput
+                      step={0.1}
+                      min={0}
+                      value={editPackage.bodyHeight ?? 0}
+                      onChange={(v) =>
+                        setEditPackage({ ...editPackage, bodyHeight: v })
+                      }
+                    />
+                  </label>
+                </div>
+                <div className="muted" style={{ marginTop: 4 }}>
+                  e.g. 0603 = 1.6 × 0.8 · 0805 = 2.0 × 1.25 · SOT-23 = 2.9 × 1.3
+                </div>
               </div>
               <div className="teach-block">
                 <div className="teach-head">
@@ -7054,6 +7245,18 @@ function App() {
               }
             >
               <CameraIcon size={13} /> Camera to this placement
+            </button>
+            <button
+              className="ctx-item"
+              onClick={() => capturePlacementFromCamera(plcMenu.id)}
+              disabled={!teachReady}
+              title={
+                teachReady
+                  ? "Set this placement's board-local X/Y from the camera's current position (fiducial-align the board first, then hover over the real part)"
+                  : teachHint
+              }
+            >
+              <CrosshairIcon size={13} /> Capture location from camera
             </button>
           </div>
         </>
