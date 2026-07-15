@@ -321,6 +321,7 @@ interface GeneralInfo {
   primaryFiducialDiameter?: number;
   secondaryFiducial?: { x: number; y: number; z: number };
   secondaryFiducialDiameter?: number;
+  verifyFidAfterHome?: boolean;
 }
 
 const ZERO_LOC: FeederLoc = { x: 0, y: 0, z: 0, rotation: 0 };
@@ -1533,29 +1534,40 @@ function App() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
 
-  const fidAction = (path: "go" | "capture" | "locate") => {
-    if (path === "locate") {
+  const fidAction = (
+    action: "go" | "nozzleGo" | "capture" | "locate" | "zFromNozzle",
+  ) => {
+    if (action === "locate") {
       setFidBusy(true);
       setFidMsg(null);
     }
+    const path =
+      action === "nozzleGo"
+        ? "go"
+        : action === "zFromNozzle"
+          ? "z-from-nozzle"
+          : action;
+    const body: Record<string, unknown> = { which: "secondary" };
+    if (action === "locate") body.featureDiameterPx = fidPx;
+    if (action === "nozzleGo") body.tool = "nozzle";
     fetch(`/api/head/fiducial/${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(
-        path === "locate"
-          ? { which: "secondary", featureDiameterPx: fidPx }
-          : { which: "secondary" },
-      ),
+      body: JSON.stringify(body),
     })
       .then(async (r) => {
         if (!r.ok) {
           const e = await r.json().catch(() => ({}));
           throw new Error(e.error ?? `${path} failed (${r.status})`);
         }
-        if (path === "capture") {
+        if (action === "capture" || action === "zFromNozzle") {
           const d = await r.json();
           setGeneral(d);
-          setFidMsg("✓ captured camera position");
+          setFidMsg(
+            action === "capture"
+              ? "✓ captured camera position"
+              : `✓ Z set from nozzle tip (${d.secondaryFiducial?.z} mm)`,
+          );
         }
       })
       .catch((e) => {
@@ -1712,6 +1724,21 @@ function App() {
             `✓ ${data.which} fiducial located at (${data.x}, ${data.y}) — Ø ${data.diameter} mm`,
           );
           loadGeneral();
+        } else if (data && data.event === "fidVerify") {
+          if (data.error) {
+            setError(`Fiducial drift check failed: ${data.error}`);
+          } else if (data.ok) {
+            setFidMsg(
+              `✓ drift check: ${data.dist} mm, ${data.angleDeg}° — within ±${data.tol} mm`,
+            );
+          } else {
+            setError(
+              `Fiducial drift detected: ${data.dist} mm (Δx ${data.dx}, Δy ${data.dy})` +
+                `, plate rotation ${data.angleDeg}° — exceeds ±${data.tol} mm. ` +
+                `The staging plate or camera calibration may have shifted; ` +
+                `re-run Auto-locate or recalibrate.`,
+            );
+          }
         } else if (data && data.event === "jobComplete") {
           setJobStatus(data.aborted ? "Job aborted" : "Job complete");
           setJobSkipped(data.skipped ?? []);
@@ -6481,20 +6508,63 @@ function App() {
                       >
                         {fidBusy ? "Locating…" : "Auto-locate (vision)"}
                       </button>
+                      <button
+                        className="btn"
+                        disabled={!teachReady}
+                        title={
+                          teachReady
+                            ? "Move the nozzle tip over the fiducial at safe Z (then jog Z down to touch)"
+                            : "enable + home the machine first"
+                        }
+                        onClick={() => fidAction("nozzleGo")}
+                      >
+                        Nozzle over fiducial
+                      </button>
+                      <button
+                        className="btn"
+                        disabled={!teachReady}
+                        title={
+                          teachReady
+                            ? "Store the nozzle's current Z as the fiducial Z (touch-off)"
+                            : "enable + home the machine first"
+                        }
+                        onClick={() => fidAction("zFromNozzle")}
+                      >
+                        Set Z from nozzle tip
+                      </button>
                     </div>
                     {fidMsg && (
                       <div className="muted" style={{ marginTop: 6 }}>
                         {fidMsg}
                       </div>
                     )}
+                    <label className="check-row" style={{ marginTop: 10 }}>
+                      <input
+                        type="checkbox"
+                        checked={general.verifyFidAfterHome ?? false}
+                        onChange={(e) =>
+                          updateGeneral({
+                            verifyFidAfterHome: e.currentTarget.checked,
+                          })
+                        }
+                      />
+                      <span>
+                        Verify after homing — re-measure this fiducial and warn
+                        if the plate or calibration drifted (report-only, never
+                        blocks homing)
+                      </span>
+                    </label>
                     <div className="muted" style={{ marginTop: 6 }}>
                       Opulo kit installs in slots 19/21 of row A on the primary
                       staging plate, PCB side toward you. Jog the camera roughly
                       over the fiducial, set the expected pixel size, then
                       Auto-locate: the camera jogs around the target to measure
                       its position (and seeds the camera's secondary
-                      units-per-pixel). Set Z manually — it must differ from the
-                      primary fiducial Z for 3D calibration to work.
+                      units-per-pixel). For Z: "Nozzle over fiducial", jog Z
+                      down until the tip just touches the surface (watch it
+                      against the ring light), then "Set Z from nozzle tip". Z
+                      must differ from the primary fiducial Z for 3D
+                      calibration to work.
                     </div>
                   </div>
                 </>

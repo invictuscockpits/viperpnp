@@ -125,6 +125,9 @@ public class ViperServer {
     private static final List<Job> jobLibrary = new ArrayList<>();
     /** The job selected as the run/edit target; null = the auto all-boards job. */
     private static File activeJobFile = null;
+    /** Post-home drift check: re-measure the secondary fiducial and warn on drift. */
+    private static volatile boolean verifyFidAfterHome = false;
+    private static final double FID_DRIFT_TOLERANCE_MM = 0.1;
     private static volatile boolean jobRunning = false;
     private static volatile boolean jobAbortRequested = false;
     private static volatile boolean jobStepping = false;
@@ -220,6 +223,9 @@ public class ViperServer {
                             broadcast(GSON.toJson(ev));
                         }
                     }
+                }
+                if (verifyFidAfterHome) {
+                    verifyFiducialDrift();
                 }
                 return null;
             }, broadcastCallback());
@@ -327,6 +333,7 @@ public class ViperServer {
         app.post("/api/head/fiducial/go", ViperServer::fiducialGo);
         app.post("/api/head/fiducial/capture", ViperServer::fiducialCapture);
         app.post("/api/head/fiducial/locate", ViperServer::fiducialLocate);
+        app.post("/api/head/fiducial/z-from-nozzle", ViperServer::fiducialZFromNozzle);
         app.get("/api/parts/detail", ViperServer::listPartsDetail);
         app.post("/api/part", ViperServer::updatePart);
         app.post("/api/part/add", ViperServer::addPart);
@@ -907,6 +914,7 @@ public class ViperServer {
         try (java.io.FileWriter w = new java.io.FileWriter(viperStateFile())) {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("activeJob", activeJobFile != null ? activeJobFile.getAbsolutePath() : null);
+            m.put("verifyFidAfterHome", verifyFidAfterHome);
             GSON.toJson(m, w);
         }
         catch (Exception e) {
@@ -927,6 +935,10 @@ public class ViperServer {
                     activeJobFile = j.getFile();
                     syncJob();
                 }
+            }
+            Object vf = m != null ? m.get("verifyFidAfterHome") : null;
+            if (vf instanceof Boolean) {
+                verifyFidAfterHome = (Boolean) vf;
             }
         }
         catch (Exception e) {
@@ -1854,6 +1866,7 @@ public class ViperServer {
             root.put("secondaryFiducial", locMap(ah.getCalibrationSecondaryFiducialLocation()));
             root.put("secondaryFiducialDiameter", mm(ah.getCalibrationSecondaryFiducialDiameter()));
         }
+        root.put("verifyFidAfterHome", verifyFidAfterHome);
         return root;
     }
 
@@ -1906,6 +1919,10 @@ public class ViperServer {
                             p.getRotation()));
                 }
             }
+            if (req.verifyFidAfterHome != null) {
+                verifyFidAfterHome = req.verifyFidAfterHome;
+                saveViperState();
+            }
             if (req.secFidX != null || req.secFidY != null || req.secFidZ != null
                     || req.secFidDiameter != null) {
                 AbstractHead head = fidHead();
@@ -1949,6 +1966,7 @@ public class ViperServer {
         Double secFidY;
         Double secFidZ;
         Double secFidDiameter;
+        Boolean verifyFidAfterHome;
     }
 
     // ------------------------------------------- Calibration fiducials
@@ -1956,6 +1974,7 @@ public class ViperServer {
     /** JSON body for the /api/head/fiducial/* endpoints. */
     private static class FiducialRequest {
         String which; // "primary" | "secondary" (default secondary)
+        String tool; // go: "camera" (default) | "nozzle"
         Double featureDiameterPx; // locate: expected diameter in pixels
     }
 
@@ -1982,6 +2001,70 @@ public class ViperServer {
         return l != null ? l : new Location(LengthUnit.Millimeters);
     }
 
+    /**
+     * Post-home drift check (report-only, never fails homing): re-measure the
+     * secondary calibration fiducial by vision and compare against its stored
+     * location. Detects staging-plate shift/rotation and camera-scale drift
+     * that single-fiducial visual homing cannot see. Broadcasts a "fidVerify"
+     * event; mutates NO configuration.
+     */
+    private static void verifyFiducialDrift() {
+        Map<String, Object> ev = new LinkedHashMap<>();
+        ev.put("event", "fidVerify");
+        try {
+            AbstractHead head = fidHead();
+            if (head == null || !(machine instanceof ReferenceMachine)) {
+                return;
+            }
+            Location stored = fidLocation(head, true).convertToUnits(LengthUnit.Millimeters);
+            Length dia = head.getCalibrationSecondaryFiducialDiameter();
+            if ((stored.getX() == 0 && stored.getY() == 0)
+                    || dia == null || dia.getValue() <= 0) {
+                return; // secondary fiducial not set up — nothing to verify
+            }
+            Camera c = machine.getDefaultHead().getDefaultCamera();
+            if (!(c instanceof ReferenceCamera)) {
+                return;
+            }
+            ReferenceCamera cam = (ReferenceCamera) c;
+            MovableUtils.moveToLocationAtSafeZ(cam,
+                    cam.getLocation().derive(stored, true, true, false, false));
+            ReferenceMachine rm = (ReferenceMachine) machine;
+            VisionSolutions vs = rm.getVisionSolutions().setMachine(rm);
+            Location found = vs.centerInOnSubjectLocation(cam, cam, dia,
+                    "Fiducial drift check", true).convertToUnits(LengthUnit.Millimeters);
+            double dx = found.getX() - stored.getX();
+            double dy = found.getY() - stored.getY();
+            double dist = Math.hypot(dx, dy);
+            // Estimate plate rotation about the homing fiducial (the anchor
+            // that visual homing just re-zeroed the coordinate system on).
+            double angle = 0;
+            if (head instanceof ReferenceHead) {
+                Location hf = ((ReferenceHead) head).getHomingFiducialLocation()
+                        .convertToUnits(LengthUnit.Millimeters);
+                double a1 = Math.atan2(stored.getY() - hf.getY(), stored.getX() - hf.getX());
+                double a2 = Math.atan2(found.getY() - hf.getY(), found.getX() - hf.getX());
+                angle = Math.toDegrees(a2 - a1);
+            }
+            ev.put("ok", dist <= FID_DRIFT_TOLERANCE_MM);
+            ev.put("dx", round(dx));
+            ev.put("dy", round(dy));
+            ev.put("dist", round(dist));
+            ev.put("angleDeg", round(angle));
+            ev.put("tol", FID_DRIFT_TOLERANCE_MM);
+            broadcast(GSON.toJson(ev));
+            if (rm.isParkAfterHomed()) {
+                MovableUtils.park(machine.getDefaultHead());
+            }
+        }
+        catch (Exception e) {
+            // Report-only: a failed check must never fail the home.
+            ev.put("ok", false);
+            ev.put("error", e.getMessage() != null ? e.getMessage() : e.toString());
+            broadcast(GSON.toJson(ev));
+        }
+    }
+
     /** POST /api/head/fiducial/go — move the top camera over the stored location. */
     private static void fiducialGo(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
@@ -1999,10 +2082,23 @@ public class ViperServer {
                 return;
             }
             final Location target = fidLocation(head, fidIsSecondary(req));
+            final boolean nozzleTool = req != null && "nozzle".equals(req.tool);
             machine.submit(() -> {
-                Camera cam = machine.getDefaultHead().getDefaultCamera();
-                MovableUtils.moveToLocationAtSafeZ(cam,
-                        cam.getLocation().derive(target, true, true, false, false));
+                if (nozzleTool) {
+                    // Position the nozzle tip over the fiducial and STAY at
+                    // safe Z — the fiducial's Z is unknown (that's what the
+                    // user is about to measure by jogging down to touch).
+                    Nozzle n = machine.getDefaultHead().getDefaultNozzle();
+                    n.moveToSafeZ();
+                    Location cur = n.getLocation();
+                    MovableUtils.moveToLocationAtSafeZ(n,
+                            cur.derive(target, true, true, false, false));
+                }
+                else {
+                    Camera cam = machine.getDefaultHead().getDefaultCamera();
+                    MovableUtils.moveToLocationAtSafeZ(cam,
+                            cam.getLocation().derive(target, true, true, false, false));
+                }
                 return null;
             }, broadcastCallback());
             ctx.result("{\"submitted\":true}");
@@ -2030,6 +2126,42 @@ public class ViperServer {
             Location old = fidLocation(head, secondary).convertToUnits(LengthUnit.Millimeters);
             Location nw = new Location(LengthUnit.Millimeters, camLoc.getX(), camLoc.getY(),
                     old.getZ(), old.getRotation());
+            if (secondary) {
+                head.setCalibrationSecondaryFiducialLocation(nw);
+            }
+            else {
+                head.setCalibrationPrimaryFiducialLocation(nw);
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describeGeneral()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/head/fiducial/z-from-nozzle — store the default nozzle's
+     * current Z as the fiducial's Z (touch-off: jog the tip down until it
+     * just contacts the fiducial surface, then capture).
+     */
+    private static void fiducialZFromNozzle(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            FiducialRequest req = GSON.fromJson(ctx.body(), FiducialRequest.class);
+            AbstractHead head = fidHead();
+            if (head == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"no head\"}");
+                return;
+            }
+            boolean secondary = fidIsSecondary(req);
+            Nozzle n = machine.getDefaultHead().getDefaultNozzle();
+            Location nz = n.getLocation().convertToUnits(LengthUnit.Millimeters);
+            Location old = fidLocation(head, secondary).convertToUnits(LengthUnit.Millimeters);
+            Location nw = new Location(LengthUnit.Millimeters, old.getX(), old.getY(),
+                    nz.getZ(), old.getRotation());
             if (secondary) {
                 head.setCalibrationSecondaryFiducialLocation(nw);
             }
