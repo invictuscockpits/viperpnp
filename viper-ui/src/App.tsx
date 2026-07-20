@@ -837,6 +837,8 @@ function App() {
     null,
   );
   const [scanning, setScanning] = useState(false);
+  const [railScanBusy, setRailScanBusy] = useState(false);
+  const [railScanMsg, setRailScanMsg] = useState<string | null>(null);
   const [configDirty, setConfigDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
@@ -1739,6 +1741,7 @@ function App() {
   useEffect(() => {
     if (tab === "feeders") {
       loadFeeders();
+      loadParts();
     }
     if (tab === "board") {
       loadBoards();
@@ -1771,6 +1774,7 @@ function App() {
   useEffect(() => {
     let closed = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
+    let offlineDebounce: ReturnType<typeof setTimeout> | undefined;
 
     const connect = () => {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -1778,6 +1782,10 @@ function App() {
       wsRef.current = ws;
 
       ws.addEventListener("open", () => {
+        if (offlineDebounce) {
+          clearTimeout(offlineDebounce);
+          offlineDebounce = undefined;
+        }
         setOnline(true);
         loadCameras();
         loadInventory();
@@ -1858,6 +1866,47 @@ function App() {
           );
         } else if (data && data.event === "testDiscard") {
           setPickMsg(`✓ ${data.nozzle} discarded the part`);
+        } else if (data && data.event === "railScan") {
+          setRailScanMsg(
+            data.ok
+              ? `slot ${data.address} ${data.inferred ? "≈ inferred" : "✓"}` +
+                  (data.driftMm !== undefined
+                    ? ` drift ${data.driftMm} mm`
+                    : "") +
+                  ` (${data.done}/${data.total})`
+              : `slot ${data.address} — ` +
+                  (data.rejectedOffMm !== undefined
+                    ? `found but ${data.rejectedOffMm} mm off-model, rejected`
+                    : "no fiducial") +
+                  ` (${data.done}/${data.total})`,
+          );
+        } else if (data && data.event === "busScanDone") {
+          setRailScanMsg(
+            `✓ bus scan: ${data.found} feeders answered` +
+              (data.created ? `, ${data.created} new` : "") +
+              (data.recovered?.length
+                ? `, recovered by UUID: ${data.recovered.join(", ")}`
+                : "") +
+              (data.conflicts?.length
+                ? `, STALE ADDRESS CLAIMS rejected: ${data.conflicts.join(", ")}`
+                : "") +
+              (data.unresponsive?.length
+                ? ` — NOT RESPONDING (kept, check seating): slots ${data.unresponsive.join(", ")}`
+                : ""),
+          );
+        } else if (data && data.event === "railScanDone") {
+          setRailScanBusy(false);
+          setRailScanMsg(
+            `✓ rail scan: ${data.found}/${data.total} measured` +
+              (data.inferred?.length
+                ? `, ${data.inferred.length} inferred (${data.inferred.join(", ")})`
+                : "") +
+              (data.missed?.length
+                ? `, UNRESOLVED: ${data.missed.join(", ")}`
+                : "") +
+              ` — max drift ${data.maxDriftMm} mm. Save to keep.`,
+          );
+          loadFeeders();
         } else if (data && data.event === "nozzleOffsetsDone") {
           setNozOffMsg(
             `✓ ${data.name} @ ${data.which} fiducial — head offsets X ${data.x} · Y ${data.y} · Z ${data.z}`,
@@ -1893,10 +1942,15 @@ function App() {
           setCalibrating(null);
           setFidBusy(false);
           setPickMsg(null);
+          setRailScanBusy(false);
         }
       });
       ws.addEventListener("close", () => {
-        setOnline(false);
+        // Debounce the offline banner: a blip that reconnects within 2 s
+        // (idle-timeout cycles, backend restarts mid-reconnect) never shows.
+        if (!offlineDebounce) {
+          offlineDebounce = setTimeout(() => setOnline(false), 2000);
+        }
         if (!closed) {
           retry = setTimeout(connect, 1500);
         }
@@ -1909,6 +1963,9 @@ function App() {
       closed = true;
       if (retry) {
         clearTimeout(retry);
+      }
+      if (offlineDebounce) {
+        clearTimeout(offlineDebounce);
       }
       wsRef.current?.close();
     };
@@ -2581,6 +2638,27 @@ function App() {
       .catch(() => setScanning(false));
   };
 
+  const railScan = (onlyAddress?: number) => {
+    setRailScanBusy(true);
+    setRailScanMsg("starting…");
+    fetch("/api/feeders/railscan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(onlyAddress ? { onlyAddress } : {}),
+    })
+      .then(async (r) => {
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}));
+          throw new Error(e.error ?? `rail scan failed (${r.status})`);
+        }
+      })
+      .catch((e) => {
+        setRailScanBusy(false);
+        setRailScanMsg(null);
+        setError(e instanceof Error ? e.message : String(e));
+      });
+  };
+
   const photonAction = (id: string, action: "find" | "feed") => {
     fetch(`/api/feeder/photon/${action}`, {
       method: "POST",
@@ -2669,6 +2747,16 @@ function App() {
       label: `Nozzle ${i + 1}`,
     })),
   ];
+  // Feeder part dropdown: canonical (merged) parts only, no fiducials,
+  // sorted for scanning by eye. Falls back to the plain id list until the
+  // detailed list has loaded.
+  const feederPartOptions =
+    partsDetail.length > 0
+      ? partsDetail
+          .filter((p) => !p.fiducial)
+          .map((p) => p.id)
+          .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+      : parts;
   // The selected tool's own coordinates: on a seesaw-Z machine the nozzles'
   // Z axes are mapped/inverted, so the DRO must show the SELECTED nozzle,
   // not the default one.
@@ -4149,7 +4237,42 @@ function App() {
                   >
                     {scanning ? "Scanning…" : "Scan bus"}
                   </button>
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      const a = window.prompt(
+                        "Test the rail scan on ONE slot first. Slot address:",
+                        "3",
+                      );
+                      if (a) railScan(parseInt(a, 10));
+                    }}
+                    disabled={!teachReady || railScanBusy}
+                    title={
+                      teachReady
+                        ? "Scan a single slot and check the vision frame in the camera pane before trusting the full walk"
+                        : "enable + home the machine first"
+                    }
+                  >
+                    Rail scan: test one slot
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() => railScan()}
+                    disabled={!teachReady || railScanBusy}
+                    title={
+                      teachReady
+                        ? "Walk the anchor grid from slots 1–2: X by their pitch, Y on their fiducial line, Z from slot 1. Finds >4 mm off-model are rejected; unreadable fiducials get the exact grid position."
+                        : "enable + home the machine first"
+                    }
+                  >
+                    {railScanBusy ? railScanMsg || "Rail scan…" : "Rail scan (vision)"}
+                  </button>
                 </div>
+                {!railScanBusy && railScanMsg && (
+                  <div className="muted" style={{ marginTop: 4 }}>
+                    {railScanMsg}
+                  </div>
+                )}
               </div>
               {feeders.length === 0 ? (
                 <div className="muted">
@@ -4248,8 +4371,11 @@ function App() {
                                 })
                               }
                             >
-                              <option value="">—</option>
-                              {parts.map((p) => (
+                              <option value="">— empty —</option>
+                              {f.part && !feederPartOptions.includes(f.part) && (
+                                <option value={f.part}>{f.part}</option>
+                              )}
+                              {feederPartOptions.map((p) => (
                                 <option key={p} value={p}>
                                   {p}
                                 </option>
@@ -4604,8 +4730,12 @@ function App() {
                     openEditFeeder(editFeeder.id);
                   }}
                 >
-                  <option value="">—</option>
-                  {parts.map((p) => (
+                  <option value="">— empty —</option>
+                  {editFeeder.part &&
+                    !feederPartOptions.includes(editFeeder.part) && (
+                      <option value={editFeeder.part}>{editFeeder.part}</option>
+                    )}
+                  {feederPartOptions.map((p) => (
                     <option key={p} value={p}>
                       {p}
                     </option>

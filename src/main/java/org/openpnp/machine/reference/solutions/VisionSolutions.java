@@ -1524,14 +1524,21 @@ public class VisionSolutions implements Solutions.Subject {
                 Imgcodecs.imwrite(file.getAbsolutePath(), image);
             }                
             final BufferedImage diagnosticImage = OpenCvUtils.toBufferedImage(image);
-            SwingUtilities.invokeLater(() -> {
-                MainFrame.get()
-                .getCameraViews()
-                .getCameraView(camera)
-                .showFilteredImage(diagnosticImage, 
-                        diagnostics.replace("{score}", String.format("%.2f", scoreRange.finalScore)), 
-                        diagnosticsMilliseconds);
-            });
+            // ViperPNP: publish headless (web Vision tab) …
+            org.openpnp.viper.VisionBridge.publish(camera, diagnosticImage,
+                    diagnostics.replace("{score}",
+                            String.format("%.2f", scoreRange.finalScore)));
+            // … and only touch the Swing camera view when a GUI exists.
+            if (MainFrame.get() != null) {
+                SwingUtilities.invokeLater(() -> {
+                    MainFrame.get()
+                    .getCameraViews()
+                    .getCameraView(camera)
+                    .showFilteredImage(diagnosticImage,
+                            diagnostics.replace("{score}", String.format("%.2f", scoreRange.finalScore)),
+                            diagnosticsMilliseconds);
+                });
+            }
         }
         if (results.size() < 1) {
             throw new Exception("Subject not found.");

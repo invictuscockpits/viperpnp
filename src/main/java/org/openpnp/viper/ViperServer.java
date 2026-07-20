@@ -516,9 +516,17 @@ public class ViperServer {
         app.post("/api/feeders/add", ViperServer::addFeeder);
         app.post("/api/feeders/delete", ViperServer::deleteFeeder);
         app.post("/api/feeders/reorder", ViperServer::reorderFeeders);
+        app.post("/api/feeders/sort", ctx -> {
+            sortFeedersBySlot();
+            markDirty();
+            ctx.contentType("application/json");
+            ctx.result(GSON.toJson(describeFeeders()));
+        });
         app.get("/api/feeder/{id}", ViperServer::getFeederConfig);
         app.post("/api/feeder/location", ViperServer::setFeederLocation);
         app.post("/api/feeder/photon", ViperServer::setPhoton);
+        app.post("/api/feeders/railscan", ViperServer::railScan);
+        app.post("/api/feeder/scope", ViperServer::scopeFeederPocket);
         app.post("/api/feeder/photon/find", ctx -> photonAction(ctx, false));
         app.post("/api/feeder/photon/feed", ctx -> photonAction(ctx, true));
         app.post("/api/feeder/strip", ViperServer::setStrip);
@@ -528,7 +536,7 @@ public class ViperServer {
         app.post("/api/feeder/retry", ViperServer::setFeederRetry);
         app.post("/api/feeders/scan", ctx -> {
             machine.submit(() -> {
-                PhotonFeeder.findAllFeeders((addr, state) -> { });
+                robustPhotonScan();
                 return null;
             }, new FutureCallback<Object>() {
                 @Override
@@ -567,12 +575,33 @@ public class ViperServer {
 
         app.ws("/ws/events", ws -> {
             ws.onConnect(sctx -> {
+                // Jetty closes idle WebSockets after ~5 min; a quiet machine
+                // must not look like a dead server.
+                sctx.session.setIdleTimeout(java.time.Duration.ofHours(24));
                 SESSIONS.add(sctx);
                 sctx.send(GSON.toJson(statusSnapshot()));
             });
             ws.onClose(sctx -> SESSIONS.remove(sctx));
             ws.onError(sctx -> SESSIONS.remove(sctx));
         });
+
+        // Heartbeat: keeps connections traffic-alive and the DRO fresh even
+        // when no machine events fire.
+        Thread heartbeat = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(30000);
+                    if (!SESSIONS.isEmpty()) {
+                        broadcast(GSON.toJson(statusSnapshot()));
+                    }
+                }
+                catch (Exception e) {
+                    // never die; the heartbeat must outlive transient errors
+                }
+            }
+        }, "viper-ws-heartbeat");
+        heartbeat.setDaemon(true);
+        heartbeat.start();
 
         app.start(port);
         System.out.println("[viper] ViperPNP server listening on http://localhost:" + port);
@@ -3047,7 +3076,51 @@ public class ViperServer {
                 r.put("note", e.getMessage() != null ? e.getMessage() : e.toString());
             }
         }
-        // Pass B: name-role match (e.g. camera "Top" → device "PnP Top Camera").
+        // Pass A2: USB port-path match. The LumenPnP cameras' instance IDs and
+        // even their NAMES churn across power cycles, but the interface path
+        // fragment ("mi_00#6&…" vs "mi_00#7&…") tracks the physical USB port
+        // and has stayed stable across every enumeration state seen on this
+        // machine. Match the stored ID's port digit against present devices.
+        for (OpenPnpCaptureCamera cam : cams) {
+            Map<String, Object> r = byCam.get(cam);
+            if (Boolean.TRUE.equals(r.get("bound"))) {
+                continue;
+            }
+            String want = storedUniqueId(cam);
+            if (want == null) {
+                continue;
+            }
+            java.util.regex.Matcher m =
+                    java.util.regex.Pattern.compile("mi_\\d+#(\\d+)&").matcher(want);
+            if (!m.find()) {
+                continue;
+            }
+            String portFragment = "mi_00#" + m.group(1) + "&";
+            for (CaptureDevice d : present) {
+                String uid = d.getUniqueId();
+                if (uid == null || claimed.contains(uid)
+                        || !uid.toLowerCase().contains("32e4")
+                        || !uid.contains(portFragment)) {
+                    continue;
+                }
+                try {
+                    if (bindCaptureDevice(cam, uid, null)) {
+                        claimed.add(uid);
+                        r.put("bound", true);
+                        r.put("note", "matched USB port path " + portFragment);
+                        break;
+                    }
+                }
+                catch (Exception e) {
+                    // try next
+                }
+            }
+        }
+        // Pass B: name-role match (e.g. camera "Top" → device "PnP Top Camera")
+        // — but ONLY when exactly one present device matches the role. These
+        // cameras can re-enumerate with IDENTICAL names, and binding an
+        // ambiguous match silently cross-wires top/bottom. Stock OpenPnP's
+        // rule is the right one: guess deterministically or fail visibly.
         for (OpenPnpCaptureCamera cam : cams) {
             if (Boolean.TRUE.equals(byCam.get(cam).get("bound"))) {
                 continue;
@@ -3056,6 +3129,8 @@ public class ViperServer {
             if (role.isEmpty()) {
                 continue;
             }
+            CaptureDevice match = null;
+            int matches = 0;
             for (CaptureDevice d : present) {
                 String uid = d.getUniqueId();
                 if (uid == null || claimed.contains(uid)
@@ -3063,47 +3138,39 @@ public class ViperServer {
                     continue;
                 }
                 if (d.getName() != null && d.getName().toLowerCase().contains(role)) {
-                    try {
-                        if (bindCaptureDevice(cam, uid, null)) {
-                            claimed.add(uid);
-                            byCam.get(cam).put("bound", true);
-                            byCam.get(cam).put("note", "matched " + d.getName());
-                            break;
-                        }
-                    }
-                    catch (Exception e) {
-                        // try next
-                    }
+                    matches++;
+                    match = d;
                 }
             }
-        }
-        // Pass C: any unclaimed LumenPnP device.
-        for (OpenPnpCaptureCamera cam : cams) {
-            Map<String, Object> r = byCam.get(cam);
-            if (Boolean.TRUE.equals(r.get("bound"))) {
+            if (matches != 1) {
+                if (matches > 1) {
+                    byCam.get(cam).put("note",
+                            "ambiguous device names — bind manually in the Cameras card");
+                }
                 continue;
             }
-            for (CaptureDevice d : present) {
-                String uid = d.getUniqueId();
-                if (uid == null || claimed.contains(uid)
-                        || !uid.toLowerCase().contains("32e4")) {
-                    continue;
-                }
-                try {
-                    if (bindCaptureDevice(cam, uid, null)) {
-                        claimed.add(uid);
-                        r.put("bound", true);
-                        r.put("note", "auto-assigned to " + d.getName()
-                                + " (verify top/bottom)");
-                        break;
-                    }
-                }
-                catch (Exception e) {
-                    // try next
+            try {
+                if (bindCaptureDevice(cam, match.getUniqueId(), null)) {
+                    claimed.add(match.getUniqueId());
+                    byCam.get(cam).put("bound", true);
+                    byCam.get(cam).put("note", "matched " + match.getName());
                 }
             }
-            if (!Boolean.TRUE.equals(r.get("bound"))) {
-                r.put("note", "no device available — check USB, or rebind here");
+            catch (Exception e) {
+                byCam.get(cam).put("note",
+                        e.getMessage() != null ? e.getMessage() : e.toString());
+            }
+        }
+        // No last-resort "grab any device" pass: a silent 50/50 guess is how
+        // top/bottom got cross-wired three times. Like stock OpenPnP, an
+        // unresolvable camera stays UNBOUND and visibly so — bind it once in
+        // the Cameras card and the exact-ID + port-path passes take over on
+        // every future boot.
+        for (OpenPnpCaptureCamera cam : cams) {
+            Map<String, Object> r = byCam.get(cam);
+            if (!Boolean.TRUE.equals(r.get("bound"))
+                    && "no device".equals(r.get("note"))) {
+                r.put("note", "not auto-resolvable — bind manually in the Cameras card");
             }
         }
         return new ArrayList<>(byCam.values());
@@ -3932,6 +3999,9 @@ public class ViperServer {
                         .convertToUnits(LengthUnit.Millimeters).getValue();
                 m.put("bodyWidth", round(fp.getBodyWidth() * scale));
                 m.put("bodyHeight", round(fp.getBodyHeight() * scale));
+                m.put("padCount", fp.getPadCount());
+                m.put("padPitch", round(fp.getPadPitch() * scale));
+                m.put("padAcross", round(fp.getPadAcross() * scale));
             }
             pkgs.add(m);
         }
@@ -3987,7 +4057,9 @@ public class ViperServer {
                     }
                 }
             }
-            if (req.bodyWidth != null || req.bodyHeight != null) {
+            if (req.bodyWidth != null || req.bodyHeight != null
+                    || req.padCount != null || req.padPitch != null
+                    || req.padAcross != null) {
                 org.openpnp.model.Footprint fp = pk.getFootprint();
                 if (fp == null) {
                     fp = new org.openpnp.model.Footprint();
@@ -4000,6 +4072,18 @@ public class ViperServer {
                 }
                 if (req.bodyHeight != null) {
                     fp.setBodyHeight(req.bodyHeight * scale);
+                }
+                // Generated pads: bottom vision sizes its mask and search
+                // window from the footprint's pad extents — without pads the
+                // mask never applies and alignment can lock onto anything.
+                if (req.padCount != null) {
+                    fp.setPadCount(req.padCount);
+                }
+                if (req.padPitch != null) {
+                    fp.setPadPitch(req.padPitch * scale);
+                }
+                if (req.padAcross != null) {
+                    fp.setPadAcross(req.padAcross * scale);
                 }
             }
             markDirty();
@@ -4078,6 +4162,9 @@ public class ViperServer {
         List<String> nozzleTips;
         Double bodyWidth; // mm — footprint body, sizes the vision mask
         Double bodyHeight; // mm
+        Integer padCount; // generated footprint pads (vision mask extents)
+        Double padPitch; // mm
+        Double padAcross; // mm
     }
 
     /** GET /api/boards — the board library. */
@@ -5719,6 +5806,43 @@ public class ViperServer {
      * Reorders the machine feeder list to the given id order. The feeder list is
      * an unmodifiable view, so we rebuild it via remove/add. Body: {order:[ids]}.
      */
+    /**
+     * Reorders the machine feeder list: Photon feeders by slot address
+     * ascending first, then Photons without a slot, then everything else in
+     * their existing relative order (stable sort).
+     */
+    private static void sortFeedersBySlot() throws Exception {
+        List<Feeder> current = new ArrayList<>(machine.getFeeders());
+        List<Feeder> sorted = new ArrayList<>(current);
+        sorted.sort((x, y) -> {
+            Integer ax = x instanceof PhotonFeeder
+                    ? ((PhotonFeeder) x).getSlotAddress() : null;
+            Integer ay = y instanceof PhotonFeeder
+                    ? ((PhotonFeeder) y).getSlotAddress() : null;
+            boolean px = x instanceof PhotonFeeder;
+            boolean py = y instanceof PhotonFeeder;
+            if (px != py) {
+                return px ? -1 : 1;
+            }
+            if (ax != null && ay != null) {
+                return Integer.compare(ax, ay);
+            }
+            if (ax != null || ay != null) {
+                return ax != null ? -1 : 1;
+            }
+            return 0;
+        });
+        if (sorted.equals(current)) {
+            return;
+        }
+        for (Feeder f : current) {
+            machine.removeFeeder(f);
+        }
+        for (Feeder f : sorted) {
+            machine.addFeeder(f);
+        }
+    }
+
     private static void reorderFeeders(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
@@ -6029,6 +6153,548 @@ public class ViperServer {
                 pf.getSlot().setLocation(loc(req.slotLocation));
             }
             ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * RS-485 Photon bus scan, hardened against single-shot comm misses (the
+     * core scan queries each address exactly once and CLEARS the mapping of
+     * any previously-known feeder that fails to answer — one hiccup unmapped
+     * a working feeder). This version retries per address and only unmaps on
+     * EVIDENCE: the feeder's hardware id answering at a different address, or
+     * a different feeder answering at its address. Unresponsive known slots
+     * are kept and reported.
+     */
+    private static void robustPhotonScan() throws Exception {
+        org.openpnp.machine.photon.protocol.PhotonBusInterface bus =
+                PhotonFeeder.getBus();
+        if (bus == null) {
+            throw new Exception("Photon bus not available — enable the machine first.");
+        }
+        PhotonProperties props = new PhotonProperties(machine);
+        int max = props.getMaxFeederAddress();
+        Map<Integer, String> hwByAddress = new LinkedHashMap<>();
+        List<Integer> unresponsive = new ArrayList<>();
+        for (int address = 1; address <= max; address++) {
+            boolean expected = PhotonFeeder.findBySlotAddress(address) != null;
+            int attempts = expected ? 3 : 2;
+            org.openpnp.machine.photon.protocol.commands.GetFeederId.Response response = null;
+            for (int a = 0; a < attempts && response == null; a++) {
+                response = new org.openpnp.machine.photon.protocol.commands
+                        .GetFeederId(address).send(bus);
+            }
+            if (response == null) {
+                if (expected) {
+                    unresponsive.add(address);
+                }
+                continue;
+            }
+            hwByAddress.put(address, response.uuid);
+        }
+        // Reconcile with evidence only.
+        List<PhotonFeeder> toAdd = new ArrayList<>();
+        int created = 0;
+        for (Map.Entry<Integer, String> e : hwByAddress.entrySet()) {
+            int address = e.getKey();
+            String uuid = e.getValue();
+            // A different feeder claiming this address has provably moved out.
+            PhotonFeeder previous = PhotonFeeder.findBySlotAddress(address);
+            if (previous != null && !uuid.equals(previous.getHardwareId())) {
+                previous.setSlotAddress(null);
+            }
+            PhotonFeeder feeder = PhotonFeeder.findByHardwareId(uuid);
+            if (feeder == null) {
+                // Adopt a blank feeder before creating a new one (core behavior).
+                feeder = PhotonFeeder.findByHardwareId(null);
+                if (feeder == null) {
+                    feeder = new PhotonFeeder();
+                    toAdd.add(feeder);
+                    created++;
+                }
+            }
+            feeder.setHardwareId(uuid);
+            feeder.setSlotAddress(address);
+        }
+        for (PhotonFeeder feeder : toAdd) {
+            machine.addFeeder(feeder);
+        }
+        // Phase 2: a feeder that ignores addressed queries may still answer a
+        // by-UUID broadcast (GetFeederAddress) — typical for feeders MOVED
+        // between slots whose addressed-mode state went stale. Ask each known
+        // hardware id that the sweep didn't confirm where it thinks it is.
+        List<String> recovered = new ArrayList<>();
+        List<String> conflicts = new ArrayList<>();
+        for (Feeder f : machine.getFeeders()) {
+            if (!(f instanceof PhotonFeeder)) {
+                continue;
+            }
+            PhotonFeeder pf = (PhotonFeeder) f;
+            if (pf.getHardwareId() == null || pf.getSlotAddress() != null) {
+                continue;
+            }
+            for (int a = 0; a < 2 && pf.getSlotAddress() == null; a++) {
+                pf.findSlotAddress();
+            }
+            Integer claimed = pf.getSlotAddress();
+            if (claimed == null) {
+                continue;
+            }
+            if (claimed == 255) {
+                // 0xFF = the feeder answers on the bus but has no address —
+                // it cannot read its slot's 1-Wire EEPROM. Power/comms are
+                // fine; the feeder-side EEPROM contact pin is the suspect.
+                pf.setSlotAddress(null);
+                conflicts.add(shortUuid(pf.getHardwareId())
+                        + " answers but can't read ANY slot EEPROM — check the "
+                        + "1-Wire contact pin under the feeder");
+                continue;
+            }
+            String confirmedUuid = hwByAddress.get(claimed);
+            if (confirmedUuid != null && !confirmedUuid.equals(pf.getHardwareId())) {
+                // Claims an address another feeder verifiably occupies —
+                // stale state; distrust it.
+                pf.setSlotAddress(null);
+                conflicts.add(shortUuid(pf.getHardwareId()) + "→" + claimed);
+                continue;
+            }
+            recovered.add(shortUuid(pf.getHardwareId()) + "@" + claimed);
+        }
+        // Default presentation: automatic feeders in slot order.
+        sortFeedersBySlot();
+        Map<String, Object> ev = new LinkedHashMap<>();
+        ev.put("event", "busScanDone");
+        ev.put("found", hwByAddress.size());
+        ev.put("created", created);
+        ev.put("unresponsive", unresponsive);
+        ev.put("recovered", recovered);
+        ev.put("conflicts", conflicts);
+        broadcast(GSON.toJson(ev));
+    }
+
+    private static String shortUuid(String uuid) {
+        return uuid == null ? "?" : uuid.substring(Math.max(0, uuid.length() - 6));
+    }
+
+    /**
+     * Moves a Photon slot to its new location while counter-shifting every
+     * taught feeder offset on that address, so pick = slot + offset stays
+     * invariant.
+     */
+    private static void applySlotLocation(PhotonFeeder pf, int address,
+            Location storedMm, Location newLoc) {
+        // Counter-shift X, Y AND Z: normalizing slot Z to the anchor's value
+        // must not change the physical pick height (pick = slot + offset).
+        Location shift = new Location(LengthUnit.Millimeters,
+                storedMm.getX() - newLoc.getX(),
+                storedMm.getY() - newLoc.getY(),
+                storedMm.getZ() - newLoc.getZ(), 0);
+        for (Feeder other : machine.getFeeders()) {
+            if (other instanceof PhotonFeeder) {
+                PhotonFeeder opf = (PhotonFeeder) other;
+                if (Integer.valueOf(address).equals(opf.getSlotAddress())
+                        && opf.getOffset() != null) {
+                    Location oo = opf.getOffset().convertToUnits(LengthUnit.Millimeters);
+                    if (oo.getX() != 0 || oo.getY() != 0 || oo.getZ() != 0) {
+                        opf.setOffset(oo.add(shift));
+                    }
+                }
+            }
+        }
+        pf.getSlot().setLocation(newLoc);
+    }
+
+    /** JSON body for POST /api/feeder/scope. */
+    private static class ScopeRequest {
+        String id;
+        Double holeDiameterMm; // sprocket hole, default 1.5
+        Double probeXmm; // diagnostic: aim offset from current pick
+        Double probeYmm;
+        Boolean apply; // false (default) = diagnostic only, write nothing
+        // apply mode: aim relative to the (accurate) slot fiducial, then set
+        // the pick offset from the detected hole + the hole->pocket vector.
+        Double aimXmm; // camera aim = slotFiducial + (aimX, aimY) ~ the hole
+        Double aimYmm;
+        Double vxMm; // hole -> pocket vector
+        Double vyMm;
+        Double pickZmm; // uniform pick Z (machine coord)
+        Double maxAimErrMm; // reject a hole further than this from aim (default 1.9)
+    }
+
+    /**
+     * POST /api/feeder/scope — DIAGNOSTIC (default) sprocket-hole scope for a
+     * Photon feeder pocket. Moves the camera to the feeder's expected pick,
+     * locates the nearest tape sprocket hole (Ø1.5 mm) by vision, and reports
+     * where it found it relative to the expected pick. Writes NOTHING unless
+     * apply=true. This is step 1: prove detection before automating offsets.
+     */
+    private static void scopeFeederPocket(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            ScopeRequest req = GSON.fromJson(ctx.body(), ScopeRequest.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (!(f instanceof PhotonFeeder)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"photon feeder not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            final PhotonFeeder pf = (PhotonFeeder) f;
+            final boolean apply = req != null && Boolean.TRUE.equals(req.apply);
+            final ScopeRequest freq = req;
+            final Location slotLoc = pf.getSlot() != null && pf.getSlot().getLocation() != null
+                    ? pf.getSlot().getLocation().convertToUnits(LengthUnit.Millimeters)
+                    : null;
+            if (apply && (slotLoc == null || req.aimXmm == null || req.vxMm == null
+                    || req.pickZmm == null)) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"apply needs a taught slot + aimX/Y, vX/Y, pickZ\"}");
+                return;
+            }
+            final double probeX = req != null && req.probeXmm != null ? req.probeXmm : 0;
+            final double probeY = req != null && req.probeYmm != null ? req.probeYmm : 0;
+            // Apply mode aims off the accurate slot fiducial; diagnostic aims
+            // off the current (possibly wrong) pick.
+            final Location pick = apply
+                    ? slotLoc.add(new Location(LengthUnit.Millimeters,
+                            req.aimXmm, req.aimYmm, 0, 0))
+                    : pf.getPickLocation().convertToUnits(LengthUnit.Millimeters)
+                            .add(new Location(LengthUnit.Millimeters, probeX, probeY, 0, 0));
+            Camera c = machine.getDefaultHead().getDefaultCamera();
+            if (!(c instanceof ReferenceCamera) || !(machine instanceof ReferenceMachine)) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no reference top camera\"}");
+                return;
+            }
+            final ReferenceCamera cam = (ReferenceCamera) c;
+            final ReferenceMachine rm = (ReferenceMachine) machine;
+            final double holeDia = req != null && req.holeDiameterMm != null
+                    && req.holeDiameterMm > 0 ? req.holeDiameterMm : 1.5;
+            machine.submit(() -> {
+                MovableUtils.moveToLocationAtSafeZ(cam,
+                        cam.getLocation().derive(pick, true, true, false, false));
+                VisionSolutions vs = rm.getVisionSolutions().setMachine(rm);
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "feederScope");
+                ev.put("feeder", pf.getName());
+                ev.put("pickX", round(pick.getX()));
+                ev.put("pickY", round(pick.getY()));
+                try {
+                    Location hole = vs.centerInOnSubjectLocation(cam, cam,
+                            new Length(holeDia, LengthUnit.Millimeters),
+                            "Feeder pocket scope", false)
+                            .convertToUnits(LengthUnit.Millimeters);
+                    ev.put("ok", true);
+                    ev.put("holeX", round(hole.getX()));
+                    ev.put("holeY", round(hole.getY()));
+                    ev.put("dx", round(hole.getX() - pick.getX()));
+                    ev.put("dy", round(hole.getY() - pick.getY()));
+                    ev.put("dist", round(Math.hypot(hole.getX() - pick.getX(),
+                            hole.getY() - pick.getY())));
+                    if (apply) {
+                        // Reject a wrong lock, but allow legitimate per-feeder
+                        // tape-phase shift (the hole nearest the pick point
+                        // moves up to ±half the sprocket pitch = ±2 mm on 4 mm
+                        // tape). Default 1.9 mm sits just under that.
+                        double maxAim = freq.maxAimErrMm != null && freq.maxAimErrMm > 0
+                                ? freq.maxAimErrMm : 1.9;
+                        double aimErr = Math.hypot(hole.getX() - pick.getX(),
+                                hole.getY() - pick.getY());
+                        if (aimErr > maxAim) {
+                            ev.put("applied", false);
+                            ev.put("error", "hole " + round(aimErr)
+                                    + " mm off aim — not writing");
+                        }
+                        else {
+                            double pocketX = hole.getX() + freq.vxMm;
+                            double pocketY = hole.getY() + freq.vyMm;
+                            Location old = pf.getOffset() != null
+                                    ? pf.getOffset().convertToUnits(LengthUnit.Millimeters)
+                                    : new Location(LengthUnit.Millimeters);
+                            pf.setOffset(new Location(LengthUnit.Millimeters,
+                                    pocketX - slotLoc.getX(),
+                                    pocketY - slotLoc.getY(),
+                                    freq.pickZmm - slotLoc.getZ(),
+                                    old.getRotation()));
+                            markDirty();
+                            ev.put("applied", true);
+                            ev.put("pickX", round(pocketX));
+                            ev.put("pickY", round(pocketY));
+                            ev.put("pickZ", round(freq.pickZmm));
+                        }
+                    }
+                }
+                catch (Exception miss) {
+                    ev.put("ok", false);
+                    ev.put("error", miss.getMessage());
+                }
+                broadcast(GSON.toJson(ev));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for POST /api/feeders/railscan. */
+    private static class RailScanRequest {
+        Double fidDiameterMm; // Photon nose-board center fiducial (default 1.0)
+        Integer onlyAddress; // test mode: scan just this one slot
+    }
+
+    /**
+     * POST /api/feeders/railscan — vision-refine every taught Photon slot
+     * location using the center fiducial on the nose board of the feeder
+     * currently in it (Opulo ships the fiducials; stock OpenPnP never reads
+     * them). Anchors on STORED slot locations — never on address order, which
+     * is not guaranteed to match physical order (this machine has address 49
+     * physically between 19 and 21, and a reversed back rail). The offset
+     * between a stored location and the nose fiducial is learned per rail
+     * from the first find and used to pre-aim the rest. When a slot location
+     * shifts, every taught feeder offset on that address is counter-shifted
+     * so pick locations stay invariant.
+     */
+    private static void railScan(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            RailScanRequest req = GSON.fromJson(ctx.body(), RailScanRequest.class);
+            // The Photon nose board carries THREE fiducials: the CENTER
+            // location fiducial flanked by two smaller width-encoding dots
+            // ~2 mm to each side. Hardware sweep: Ø1.5 locks the center
+            // reliably (Ø1.0 can prefer a side dot, Ø2.0 misses entirely).
+            // The 1.0 mm acceptance gate below is the real guard: side locks
+            // land ±2 mm off the grid prediction and are rejected.
+            final double fidDia = req != null && req.fidDiameterMm != null
+                    && req.fidDiameterMm > 0 ? req.fidDiameterMm : 1.5;
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            Camera c = machine.getDefaultHead().getDefaultCamera();
+            if (!(c instanceof ReferenceCamera) || !(machine instanceof ReferenceMachine)) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no reference top camera\"}");
+                return;
+            }
+            final ReferenceCamera cam = (ReferenceCamera) c;
+            final ReferenceMachine rm = (ReferenceMachine) machine;
+            // One entry per occupied, taught slot address.
+            final Map<Integer, PhotonFeeder> targets = new java.util.TreeMap<>();
+            for (Feeder f : machine.getFeeders()) {
+                if (f instanceof PhotonFeeder) {
+                    PhotonFeeder pf = (PhotonFeeder) f;
+                    if (pf.getSlotAddress() != null && pf.getSlot() != null
+                            && pf.getSlot().getLocation() != null) {
+                        targets.putIfAbsent(pf.getSlotAddress(), pf);
+                    }
+                }
+            }
+            // The rail model is anchored ENTIRELY on slots 1 and 2, which are
+            // taught exactly at the nose fiducial: X marches by their pitch,
+            // Y is their fiducial line, Z is slot 1's. (The old rough slot
+            // teachings sit ~20 mm off the fiducial line in Y — aiming from
+            // them is what wrecked the first attempt.)
+            PhotonFeeder anchor1 = targets.get(1);
+            PhotonFeeder anchor2 = targets.get(2);
+            if (anchor1 == null || anchor2 == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"slots 1 and 2 must be taught (at the nose "
+                        + "fiducial) — they anchor the rail model\"}");
+                return;
+            }
+            final Location a1 = anchor1.getSlot().getLocation()
+                    .convertToUnits(LengthUnit.Millimeters);
+            final Location a2 = anchor2.getSlot().getLocation()
+                    .convertToUnits(LengthUnit.Millimeters);
+            final double pitch = a2.getX() - a1.getX();
+            final double fidY = (a1.getY() + a2.getY()) / 2.0;
+            final double slotZ = a1.getZ();
+            if (Math.abs(a2.getY() - a1.getY()) > 3 || pitch < 10 || pitch > 25) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"slots 1 and 2 don't form a sane rail model "
+                        + "(pitch " + round(pitch) + " mm, dY "
+                        + round(a2.getY() - a1.getY()) + " mm) — re-teach them at "
+                        + "the nose fiducials\"}");
+                return;
+            }
+            // Assign each occupied slot to a grid position by snapping its
+            // stored X to the anchor grid (handles out-of-order addresses,
+            // e.g. address 49 sitting physically between 19 and 21). Only the
+            // anchors' rail is scanned.
+            final int anchorRail = (int) Math.round(a1.getY() / 100);
+            final Map<Integer, Map.Entry<Integer, PhotonFeeder>> byIndex =
+                    new java.util.TreeMap<>();
+            final List<Integer> unassignable = new ArrayList<>();
+            for (Map.Entry<Integer, PhotonFeeder> e : targets.entrySet()) {
+                if (req != null && req.onlyAddress != null
+                        && !req.onlyAddress.equals(e.getKey())) {
+                    continue;
+                }
+                Location l = e.getValue().getSlot().getLocation()
+                        .convertToUnits(LengthUnit.Millimeters);
+                if ((int) Math.round(l.getY() / 100) != anchorRail) {
+                    continue; // other rail — out of scope for this model
+                }
+                int idx = (int) Math.round((l.getX() - a1.getX()) / pitch);
+                double gridErr = Math.abs(l.getX() - (a1.getX() + pitch * idx));
+                if (idx < 0 || idx > 60 || gridErr > pitch / 2.0
+                        || byIndex.containsKey(idx)) {
+                    unassignable.add(e.getKey());
+                    continue;
+                }
+                byIndex.put(idx, e);
+            }
+            if (byIndex.isEmpty()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no slots matched the rail model\"}");
+                return;
+            }
+            final List<Map.Entry<Integer, PhotonFeeder>> order =
+                    new ArrayList<>(byIndex.values());
+            final List<Integer> indexOrder = new ArrayList<>(byIndex.keySet());
+            machine.submit(() -> {
+                VisionSolutions vs = rm.getVisionSolutions().setMachine(rm);
+                Length dia = new Length(fidDia, LengthUnit.Millimeters);
+                List<Object[]> misses = new ArrayList<>(); // {address, feeder, aim}
+                double maxDrift = 0;
+                int done = 0;
+                int foundCount = 0;
+                // The grid prediction should be within ~1 mm; only a small
+                // fallback pattern is needed.
+                double[][] pattern = {{0, 0}, {0, 3}, {0, -3}, {3, 0}, {-3, 0}};
+                // Dead reckoning: rails are not perfectly straight (this one
+                // climbs ~0.5 mm over the first four slots and deviates over
+                // 2 mm at the far plate) — so each slot is aimed from the
+                // LAST FOUND fiducial plus pitch, not from the global anchor
+                // line. Local slot-to-slot error stays well inside the gate.
+                Location lastFound = null;
+                int lastIdx = 0;
+                for (int i = 0; i < order.size(); i++) {
+                    Map.Entry<Integer, PhotonFeeder> e = order.get(i);
+                    int address = e.getKey();
+                    int idx = indexOrder.get(i);
+                    PhotonFeeder pf = e.getValue();
+                    Location stored = pf.getSlot().getLocation()
+                            .convertToUnits(LengthUnit.Millimeters);
+                    Location aim = lastFound != null
+                            ? new Location(LengthUnit.Millimeters,
+                                    lastFound.getX() + pitch * (idx - lastIdx),
+                                    lastFound.getY(), 0, 0)
+                            : new Location(LengthUnit.Millimeters,
+                                    a1.getX() + pitch * idx, fidY, 0, 0);
+                    Location found = null;
+                    for (double[] off : pattern) {
+                        Location probe = aim.add(new Location(LengthUnit.Millimeters,
+                                off[0], off[1], 0, 0));
+                        MovableUtils.moveToLocationAtSafeZ(cam,
+                                cam.getLocation().derive(probe, true, true, false, false));
+                        try {
+                            found = vs.centerInOnSubjectLocation(cam, cam, dia,
+                                    "Rail scan slot " + address, false);
+                            break;
+                        }
+                        catch (Exception miss) {
+                            // no fiducial in this view — try the next offset
+                        }
+                    }
+                    done++;
+                    // Acceptance gate: a find far from the local prediction is
+                    // a wrong lock (side fiducials sit ±2 mm away). With dead
+                    // reckoning the local prediction error is ~0.1–0.3 mm.
+                    double rejectedDist = 0;
+                    if (found != null) {
+                        Location f = found.convertToUnits(LengthUnit.Millimeters);
+                        double d = Math.hypot(f.getX() - aim.getX(),
+                                f.getY() - aim.getY());
+                        if (d > 1.0) {
+                            rejectedDist = d;
+                            found = null;
+                        }
+                    }
+                    if (found == null) {
+                        misses.add(new Object[] {address, pf, aim});
+                        Map<String, Object> ev = new LinkedHashMap<>();
+                        ev.put("event", "railScan");
+                        ev.put("done", done);
+                        ev.put("total", order.size());
+                        ev.put("address", address);
+                        ev.put("ok", false);
+                        if (rejectedDist > 0) {
+                            // Diagnostic gold: found SOMETHING but off-model.
+                            ev.put("rejectedOffMm", round(rejectedDist));
+                        }
+                        broadcast(GSON.toJson(ev));
+                        continue;
+                    }
+                    Location f = found.convertToUnits(LengthUnit.Millimeters);
+                    Location newLoc = new Location(LengthUnit.Millimeters, f.getX(),
+                            f.getY(), slotZ, stored.getRotation());
+                    double drift = Math.hypot(f.getX() - aim.getX(),
+                            f.getY() - aim.getY());
+                    applySlotLocation(pf, address, stored, newLoc);
+                    lastFound = f;
+                    lastIdx = idx;
+                    foundCount++;
+                    maxDrift = Math.max(maxDrift, drift);
+                    Map<String, Object> ev = new LinkedHashMap<>();
+                    ev.put("event", "railScan");
+                    ev.put("done", done);
+                    ev.put("total", order.size());
+                    ev.put("address", address);
+                    ev.put("position", idx + 1);
+                    ev.put("ok", true);
+                    ev.put("x", round(f.getX()));
+                    ev.put("y", round(f.getY()));
+                    ev.put("driftMm", round(drift));
+                    broadcast(GSON.toJson(ev));
+                }
+                // Feeders without a readable nose fiducial: their slot gets
+                // the exact grid position (the model IS the measurement).
+                List<Integer> inferred = new ArrayList<>();
+                for (Object[] m : misses) {
+                    int address = (Integer) m[0];
+                    PhotonFeeder pf = (PhotonFeeder) m[1];
+                    Location aim = (Location) m[2];
+                    Location stored = pf.getSlot().getLocation()
+                            .convertToUnits(LengthUnit.Millimeters);
+                    Location newLoc = new Location(LengthUnit.Millimeters, aim.getX(),
+                            aim.getY(), slotZ, stored.getRotation());
+                    applySlotLocation(pf, address, stored, newLoc);
+                    inferred.add(address);
+                    Map<String, Object> ev = new LinkedHashMap<>();
+                    ev.put("event", "railScan");
+                    ev.put("done", order.size());
+                    ev.put("total", order.size());
+                    ev.put("address", address);
+                    ev.put("ok", true);
+                    ev.put("inferred", true);
+                    ev.put("x", round(aim.getX()));
+                    ev.put("y", round(aim.getY()));
+                    broadcast(GSON.toJson(ev));
+                }
+                markDirty();
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "railScanDone");
+                ev.put("found", foundCount);
+                ev.put("inferred", inferred);
+                ev.put("total", order.size());
+                ev.put("missed", unassignable);
+                ev.put("maxDriftMm", round(maxDrift));
+                broadcast(GSON.toJson(ev));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
         }
         catch (Exception e) {
             ctx.status(500);
