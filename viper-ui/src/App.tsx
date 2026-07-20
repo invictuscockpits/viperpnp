@@ -1946,14 +1946,20 @@ function App() {
         }
       });
       ws.addEventListener("close", () => {
+        // Only react to UNEXPECTED closes. An intentional teardown
+        // (React StrictMode remount, unmount) sets closed=true first; without
+        // this guard its close event scheduled a setOnline(false) in the old
+        // effect scope that the remount couldn't cancel — leaving the offline
+        // banner stuck on while the backend was fine.
+        if (closed) {
+          return;
+        }
         // Debounce the offline banner: a blip that reconnects within 2 s
         // (idle-timeout cycles, backend restarts mid-reconnect) never shows.
         if (!offlineDebounce) {
           offlineDebounce = setTimeout(() => setOnline(false), 2000);
         }
-        if (!closed) {
-          retry = setTimeout(connect, 1500);
-        }
+        retry = setTimeout(connect, 1500);
       });
       ws.addEventListener("error", () => ws.close());
     };
