@@ -127,6 +127,21 @@ public class ViperServer {
     private static File activeJobFile = null;
     /** Post-home drift check: re-measure the secondary fiducial and warn on drift. */
     private static volatile boolean verifyFidAfterHome = false;
+    /**
+     * Per-feeder vision re-lock reference, keyed by hardware id (so it travels
+     * with the feeder on a slot swap). aim = slot fiducial -> sprocket hole;
+     * v = sprocket hole -> pick pocket. Both are per-tape, captured once when
+     * the feeder is first taught. Persisted in viper-state.json.
+     */
+    private static final Map<String, double[]> feederVisionRef =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * In-memory tail of the tinylog stream for the Log tab. Reuses OpenPnP's own
+     * LogEntryListModel (already a tinylog Writer) so the Log tab shows exactly
+     * what the desktop app's Log panel would, headlessly.
+     */
+    private static final org.openpnp.gui.support.LogEntryListModel viperLog =
+            new org.openpnp.gui.support.LogEntryListModel();
     private static final double FID_DRIFT_TOLERANCE_MM = 0.1;
     private static volatile boolean jobRunning = false;
     private static volatile boolean jobAbortRequested = false;
@@ -153,6 +168,14 @@ public class ViperServer {
         machine = Configuration.get().getMachine();
         System.out.println("[viper] core booted headless from " + configDir + " in "
                 + (System.currentTimeMillis() - t0) + " ms");
+
+        // Tap the tinylog stream for the Log tab (same buffer the desktop app uses).
+        try {
+            org.pmw.tinylog.Configurator.currentConfig().addWriter(viperLog).activate();
+        }
+        catch (Exception e) {
+            System.out.println("[viper] log capture setup failed: " + e.getMessage());
+        }
 
         loadBoardsFolder();
         loadJobsFolder();
@@ -388,6 +411,7 @@ public class ViperServer {
         app.get("/api/cameras/devices", ViperServer::listCaptureDevices);
         app.post("/api/camera/bind", ViperServer::bindCamera);
         app.post("/api/cameras/reconnect", ViperServer::reconnectCameras);
+        app.post("/api/cameras/swap", ViperServer::swapCameras);
         app.get("/api/camera/frame", ViperServer::cameraFrame);
         app.get("/api/camera/mjpeg", ViperServer::cameraMjpeg);
         app.get("/api/camera/props", ViperServer::cameraProps);
@@ -442,6 +466,7 @@ public class ViperServer {
         app.post("/api/job/boards", ViperServer::jobBoards);
         app.post("/api/job/board/add", ViperServer::addJobBoard);
         app.post("/api/job/board/remove", ViperServer::removeJobBoard);
+        app.post("/api/job/panelize", ViperServer::panelizeJob);
         app.post("/api/job/board", ViperServer::updateJobBoard);
         app.post("/api/job/board/move", ViperServer::moveToJobBoard);
         app.post("/api/job/board/capture", ViperServer::captureJobBoard);
@@ -490,8 +515,71 @@ public class ViperServer {
                 }
                 Configuration.get().save();
                 configDirty = false;
+                // Snapshot the just-saved machine.xml so any save is recoverable.
+                backupConfig("save");
                 broadcast(GSON.toJson(configEvent()));
                 ctx.result(GSON.toJson(configEvent()));
+            }
+            catch (Exception e) {
+                ctx.status(500);
+                ctx.result(GSON.toJson(errorMap(e)));
+            }
+        });
+        app.get("/api/log", ViperServer::getLog);
+        app.get("/api/config/backups", ctx -> {
+            ctx.contentType("application/json");
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("backups", listConfigBackups());
+            ctx.result(GSON.toJson(out));
+        });
+        app.post("/api/config/backup", ctx -> {
+            ctx.contentType("application/json");
+            try {
+                Map<?, ?> body = GSON.fromJson(ctx.body(), Map.class);
+                Object l = body != null ? body.get("label") : null;
+                String name = backupConfig(l instanceof String && !((String) l).trim().isEmpty()
+                        ? (String) l : "manual");
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("created", name);
+                out.put("backups", listConfigBackups());
+                ctx.result(GSON.toJson(out));
+            }
+            catch (Exception e) {
+                ctx.status(500);
+                ctx.result(GSON.toJson(errorMap(e)));
+            }
+        });
+        app.post("/api/config/restore", ctx -> {
+            ctx.contentType("application/json");
+            try {
+                Map<?, ?> body = GSON.fromJson(ctx.body(), Map.class);
+                Object n = body != null ? body.get("name") : null;
+                if (!(n instanceof String) || ((String) n).isEmpty()) {
+                    ctx.status(400);
+                    ctx.result("{\"error\":\"backup name required\"}");
+                    return;
+                }
+                // Reject anything that isn't a plain backup file name (no paths).
+                String name = (String) n;
+                if (!name.matches("machine_[A-Za-z0-9._-]+\\.xml")) {
+                    ctx.status(400);
+                    ctx.result("{\"error\":\"invalid backup name\"}");
+                    return;
+                }
+                File chosen = new File(backupsDir(), name);
+                if (!chosen.exists()) {
+                    ctx.status(404);
+                    ctx.result("{\"error\":\"backup not found\"}");
+                    return;
+                }
+                // Snapshot the current state first, so restore is itself undoable.
+                backupConfig("pre-restore");
+                java.nio.file.Files.copy(chosen.toPath(), machineConfigFile().toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("restored", name);
+                out.put("restartRequired", true);
+                ctx.result(GSON.toJson(out));
             }
             catch (Exception e) {
                 ctx.status(500);
@@ -555,6 +643,10 @@ public class ViperServer {
         });
         app.post("/api/feeder/move", ViperServer::moveToFeeder);
         app.post("/api/feeder/capture", ViperServer::captureFeeder);
+        app.post("/api/feeder/pickz", ViperServer::setFeederPickZ);
+        app.post("/api/feeder/feedoption", ViperServer::setFeederFeedOption);
+        app.post("/api/feeder/vision/record", ViperServer::recordFeederVisionRef);
+        app.post("/api/feeder/vision/relock", ViperServer::relockFeederVision);
 
         // Any successful POST that edits persistent config marks it dirty.
         app.after(ctx -> {
@@ -746,6 +838,11 @@ public class ViperServer {
 
     private static double round(double v) {
         return Math.round(v * 1000.0) / 1000.0;
+    }
+
+    /** Coerce a parsed-JSON value to a double (0 if null/non-numeric). */
+    private static double asDouble(Object o) {
+        return o instanceof Number ? ((Number) o).doubleValue() : 0;
     }
 
     private static FutureCallback<Object> broadcastCallback() {
@@ -981,7 +1078,42 @@ public class ViperServer {
                 System.out.println("[viper] failed to load board " + f + ": " + e.getMessage());
             }
         }
+        applyAliasesOnLoad();
         syncJob();
+    }
+
+    /**
+     * Remaps any placement that uses an alias "from" part to its canonical "to"
+     * part, so boards added by ANY means (importer, bulk file-copy, restore) end
+     * up with the merged names — not just those brought in through the import
+     * wizard. In-memory only; the pre-existing dirty state is preserved so this
+     * never dirties a clean-on-disk board (the remap simply re-applies each load).
+     */
+    private static void applyAliasesOnLoad() {
+        if (partAliases.isEmpty()) {
+            return;
+        }
+        for (Board b : Configuration.get().getBoards()) {
+            boolean wasDirty = b.isDirty();
+            boolean changed = false;
+            for (Placement p : b.getPlacements()) {
+                Part part = p.getPart();
+                if (part == null) {
+                    continue;
+                }
+                String to = partAliases.get(part.getId());
+                if (to != null) {
+                    Part toPart = Configuration.get().getPart(to);
+                    if (toPart != null && toPart != part) {
+                        p.setPart(toPart);
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) {
+                b.setDirty(wasDirty);
+            }
+        }
     }
 
     // --------------------------------------------------------- Job library
@@ -1063,6 +1195,17 @@ public class ViperServer {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("activeJob", activeJobFile != null ? activeJobFile.getAbsolutePath() : null);
             m.put("verifyFidAfterHome", verifyFidAfterHome);
+            Map<String, Object> vr = new LinkedHashMap<>();
+            for (Map.Entry<String, double[]> e : feederVisionRef.entrySet()) {
+                double[] a = e.getValue();
+                Map<String, Object> one = new LinkedHashMap<>();
+                one.put("aimX", a[0]);
+                one.put("aimY", a[1]);
+                one.put("vx", a[2]);
+                one.put("vy", a[3]);
+                vr.put(e.getKey(), one);
+            }
+            m.put("feederVisionRef", vr);
             GSON.toJson(m, w);
         }
         catch (Exception e) {
@@ -1088,10 +1231,161 @@ public class ViperServer {
             if (vf instanceof Boolean) {
                 verifyFidAfterHome = (Boolean) vf;
             }
+            Object vr = m != null ? m.get("feederVisionRef") : null;
+            if (vr instanceof Map) {
+                for (Map.Entry<?, ?> e : ((Map<?, ?>) vr).entrySet()) {
+                    if (!(e.getKey() instanceof String) || !(e.getValue() instanceof Map)) {
+                        continue;
+                    }
+                    Map<?, ?> one = (Map<?, ?>) e.getValue();
+                    feederVisionRef.put((String) e.getKey(), new double[] {
+                            asDouble(one.get("aimX")), asDouble(one.get("aimY")),
+                            asDouble(one.get("vx")), asDouble(one.get("vy")) });
+                }
+            }
         }
         catch (Exception e) {
             System.out.println("[viper] failed to load state: " + e.getMessage());
         }
+    }
+
+    /**
+     * GET /api/log?lines=N&level=INFO — the most recent log lines from the live
+     * tinylog stream (core + system). Flushes pending entries on each call, so
+     * the UI can poll it. level filters to that severity and above.
+     */
+    private static void getLog(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            viperLog.refresh();
+            int lines = 500;
+            try {
+                if (ctx.queryParam("lines") != null) {
+                    lines = Math.max(1, Math.min(10000, Integer.parseInt(ctx.queryParam("lines"))));
+                }
+            }
+            catch (NumberFormatException ignore) {
+                // keep default
+            }
+            org.pmw.tinylog.Level min = null;
+            String lvl = ctx.queryParam("level");
+            if (lvl != null) {
+                try {
+                    min = org.pmw.tinylog.Level.valueOf(lvl.toUpperCase());
+                }
+                catch (IllegalArgumentException ignore) {
+                    // no filter
+                }
+            }
+            List<org.pmw.tinylog.LogEntry> all = viperLog.getOriginalLogEntries();
+            List<Map<String, Object>> out = new ArrayList<>();
+            for (org.pmw.tinylog.LogEntry e : all) {
+                if (min != null && e.getLevel().ordinal() < min.ordinal()) {
+                    continue;
+                }
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("level", e.getLevel().name());
+                String rendered = e.getRenderedLogEntry();
+                m.put("text", rendered != null ? rendered.replaceAll("\\r?\\n$", "")
+                        : String.valueOf(e.getMessage()));
+                out.add(m);
+            }
+            if (out.size() > lines) {
+                out = new ArrayList<>(out.subList(out.size() - lines, out.size()));
+            }
+            Map<String, Object> root = new LinkedHashMap<>();
+            root.put("lines", out);
+            ctx.result(GSON.toJson(root));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** Where timestamped machine.xml snapshots live. */
+    private static File backupsDir() {
+        File d = new File(Configuration.get().getConfigurationDirectory(), "backups");
+        d.mkdirs();
+        return d;
+    }
+
+    /** The live machine.xml (the file that holds fiducials, offsets, feeders). */
+    private static File machineConfigFile() {
+        return new File(Configuration.get().getConfigurationDirectory(), "machine.xml");
+    }
+
+    private static final int MAX_CONFIG_BACKUPS = 40;
+    private static final java.text.SimpleDateFormat BACKUP_STAMP =
+            new java.text.SimpleDateFormat("yyyyMMdd-HHmmss");
+
+    /**
+     * Copies the current machine.xml to backups/machine_<stamp>_<label>.xml and
+     * prunes to the most recent MAX_CONFIG_BACKUPS. A cheap rollback point: the
+     * whole calibration state (fiducials, nozzle offsets, feeder offsets) lives
+     * in machine.xml, so a snapshot before a risky step makes a bad calibration
+     * a one-click restore instead of a re-do. Never throws (best-effort safety).
+     */
+    private static String backupConfig(String label) {
+        try {
+            File src = machineConfigFile();
+            if (!src.exists()) {
+                return null;
+            }
+            String safe = (label == null ? "" : label).replaceAll("[^a-zA-Z0-9._-]", "-");
+            if (safe.isEmpty()) {
+                safe = "manual";
+            }
+            String name = "machine_" + BACKUP_STAMP.format(new java.util.Date())
+                    + "_" + safe + ".xml";
+            File dst = new File(backupsDir(), name);
+            java.nio.file.Files.copy(src.toPath(), dst.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            pruneConfigBackups();
+            return name;
+        }
+        catch (Exception e) {
+            System.out.println("[viper] config backup failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static void pruneConfigBackups() {
+        File[] files = backupsDir().listFiles((d, n) ->
+                n.startsWith("machine_") && n.endsWith(".xml"));
+        if (files == null || files.length <= MAX_CONFIG_BACKUPS) {
+            return;
+        }
+        java.util.Arrays.sort(files, java.util.Comparator
+                .comparingLong(File::lastModified).reversed());
+        for (int i = MAX_CONFIG_BACKUPS; i < files.length; i++) {
+            files[i].delete();
+        }
+    }
+
+    /** Newest-first list of config backups: {name, label, whenMs, sizeBytes}. */
+    private static List<Map<String, Object>> listConfigBackups() {
+        List<Map<String, Object>> out = new ArrayList<>();
+        File[] files = backupsDir().listFiles((d, n) ->
+                n.startsWith("machine_") && n.endsWith(".xml"));
+        if (files == null) {
+            return out;
+        }
+        java.util.Arrays.sort(files, java.util.Comparator
+                .comparingLong(File::lastModified).reversed());
+        for (File f : files) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("name", f.getName());
+            // machine_<stamp>_<label>.xml -> label
+            String base = f.getName().replaceFirst("^machine_", "")
+                    .replaceFirst("\\.xml$", "");
+            int us = base.indexOf('_');
+            m.put("label", us >= 0 && us + 1 < base.length() ? base.substring(us + 1) : "");
+            m.put("whenMs", f.lastModified());
+            m.put("sizeBytes", f.length());
+            out.add(m);
+        }
+        return out;
     }
 
     /** The job library: every loaded job with board/placement counts + state. */
@@ -1831,6 +2125,9 @@ public class ViperServer {
             }
             final ReferenceNozzleTip ftip = tip;
             final ReferenceNozzle fnoz = carrier;
+            // Snapshot before touching calibration state, so a bad run is a
+            // one-click rollback (the corruption cluster from the field).
+            backupConfig("pre-nozzle-cal");
             machine.submit(() -> {
                 ftip.getCalibration().calibrate(fnoz);
                 Map<String, Object> ev = new LinkedHashMap<>();
@@ -2944,6 +3241,65 @@ public class ViperServer {
                 ctx.result("{\"error\":\"capture device not found\"}");
                 return;
             }
+            markDirty();
+            ctx.result(GSON.toJson(describeCameras()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** The machine's capture (USB) cameras, machine-mounted first then head. */
+    private static List<OpenPnpCaptureCamera> captureCameras() {
+        List<Camera> all = new ArrayList<>(machine.getCameras());
+        try {
+            for (Head h : machine.getHeads()) {
+                all.addAll(h.getCameras());
+            }
+        }
+        catch (Exception e) {
+            // ignore
+        }
+        List<OpenPnpCaptureCamera> cams = new ArrayList<>();
+        for (Camera c : all) {
+            if (c instanceof OpenPnpCaptureCamera) {
+                cams.add((OpenPnpCaptureCamera) c);
+            }
+        }
+        return cams;
+    }
+
+    /**
+     * POST /api/cameras/swap — swap the two capture cameras' device bindings. For
+     * the fix when top/bottom are crossed (the LumenPnP cameras share a name, so a
+     * USB re-plug onto different ports can bind them backwards). Releases both, then
+     * rebinds swapped so one device is never opened twice. Persists on config save.
+     */
+    private static void swapCameras(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            List<OpenPnpCaptureCamera> cams = captureCameras();
+            if (cams.size() != 2) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"need exactly two capture cameras to swap (found "
+                        + cams.size() + ")\"}");
+                return;
+            }
+            OpenPnpCaptureCamera a = cams.get(0);
+            OpenPnpCaptureCamera b = cams.get(1);
+            String devA = a.getDevice() != null ? a.getDevice().getUniqueId() : null;
+            String devB = b.getDevice() != null ? b.getDevice().getUniqueId() : null;
+            if (devA == null || devB == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"both cameras must be bound before swapping\"}");
+                return;
+            }
+            // Release both first so a single physical device is never opened twice.
+            try { a.setDevice(null); } catch (Exception ignore) { }
+            try { b.setDevice(null); } catch (Exception ignore) { }
+            bindCaptureDevice(a, devB, null);
+            bindCaptureDevice(b, devA, null);
             markDirty();
             ctx.result(GSON.toJson(describeCameras()));
         }
@@ -5002,6 +5358,68 @@ public class ViperServer {
         }
     }
 
+    /** JSON body for POST /api/job/panelize. */
+    private static class PanelizeRequest {
+        String file; // job file
+        String boardFile; // library board to array
+        Integer rows;
+        Integer cols;
+        Double xPitch; // mm between columns (board origin to board origin)
+        Double yPitch; // mm between rows
+        Double x0; // origin of the array (first board), default 0
+        Double y0;
+        String side; // Top | Bottom, default Top
+    }
+
+    /**
+     * POST /api/job/panelize — add an R×C array of one board to the job, laid out
+     * on a grid (xPitch between columns, yPitch between rows) from origin (x0,y0).
+     * This is the practical panelize: every copy is a real BoardLocation the job
+     * places. Shared panel-fiducial alignment (OpenPnP's Panel object) is a
+     * follow-on; each board here aligns from its own fiducials.
+     */
+    private static void panelizeJob(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PanelizeRequest req = GSON.fromJson(ctx.body(), PanelizeRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            Board b = req != null ? findBoard(req.boardFile) : null;
+            if (j == null || b == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"job or board not found\"}");
+                return;
+            }
+            int rows = req.rows != null ? req.rows : 1;
+            int cols = req.cols != null ? req.cols : 1;
+            if (rows < 1 || cols < 1 || rows * cols > 400) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"rows and cols must be >=1 and rows*cols <=400\"}");
+                return;
+            }
+            double xp = req.xPitch != null ? req.xPitch : 0;
+            double yp = req.yPitch != null ? req.yPitch : 0;
+            double x0 = req.x0 != null ? req.x0 : 0;
+            double y0 = req.y0 != null ? req.y0 : 0;
+            Side side = "Bottom".equalsIgnoreCase(req.side) ? Side.Bottom : Side.Top;
+            for (int r = 0; r < rows; r++) {
+                for (int c = 0; c < cols; c++) {
+                    BoardLocation bl = new BoardLocation(b);
+                    bl.setGlobalSide(side);
+                    bl.setLocation(new Location(LengthUnit.Millimeters,
+                            x0 + c * xp, y0 + r * yp, 0, 0));
+                    j.addBoardOrPanelLocation(bl);
+                }
+            }
+            j.setDirty(true);
+            syncJob();
+            ctx.result(GSON.toJson(describeJobBoards(j)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
     /** POST /api/job/board/remove — Body: {file, uid}. Rebuilds the job without that board. */
     private static void removeJobBoard(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
@@ -5911,6 +6329,19 @@ public class ViperServer {
             ph.put("offset", locMap(pf.getOffset()));
             ph.put("slotLocation", pf.getSlot() != null ? locMap(pf.getSlot().getLocation()) : null);
             ph.put("commMaxRetry", new PhotonProperties(machine).getFeederCommunicationMaxRetry());
+            // Current pick Z (slot Z + offset Z) so the UI can show/set uniform depth.
+            if (pf.getSlot() != null && pf.getSlot().getLocation() != null && pf.getOffset() != null) {
+                double slotZ = pf.getSlot().getLocation()
+                        .convertToUnits(LengthUnit.Millimeters).getZ();
+                double offZ = pf.getOffset().convertToUnits(LengthUnit.Millimeters).getZ();
+                ph.put("pickZ", round(slotZ + offZ));
+            }
+            ph.put("visionRef", pf.getHardwareId() != null
+                    && feederVisionRef.containsKey(pf.getHardwareId()));
+            // Feed mode: Normal / SkipNext (one) / Disable — lets a user pick-test
+            // a part repeatedly without advancing the tape (Disable), then set
+            // back to Normal. Also drives whether Recycle/take-back is available.
+            ph.put("feedOption", pf.getFeedOptions().name());
             m.put("photon", ph);
             m.put("editableLocation", false);
         }
@@ -7045,6 +7476,288 @@ public class ViperServer {
                 return;
             }
             ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** JSON body for the uniform-pick-Z + vision re-lock actions. */
+    private static class PickZRequest {
+        String id;
+        Double pickZmm; // absolute machine Z for the pick
+        Double holeDiameterMm; // sprocket hole, default 1.5
+        Double maxAimErrMm; // reject a hole further than this from aim
+    }
+
+    /** JSON body for POST /api/feeder/feedoption. */
+    private static class FeedOptionRequest {
+        String id;
+        String feedOption; // Normal | SkipNext | Disable
+    }
+
+    /**
+     * POST /api/feeder/feedoption — set a feeder's feed mode. Disable lets a user
+     * pick-test the presented part over and over without advancing the tape;
+     * SkipNext skips just the next feed; Normal is production. No motion.
+     */
+    private static void setFeederFeedOption(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            FeedOptionRequest req = GSON.fromJson(ctx.body(), FeedOptionRequest.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (!(f instanceof ReferenceFeeder)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"feeder not found\"}");
+                return;
+            }
+            if (req.feedOption == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"feedOption required\"}");
+                return;
+            }
+            ReferenceFeeder.FeedOptions opt;
+            try {
+                opt = ReferenceFeeder.FeedOptions.valueOf(req.feedOption);
+            }
+            catch (IllegalArgumentException bad) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"feedOption must be Normal, SkipNext or Disable\"}");
+                return;
+            }
+            ((ReferenceFeeder) f).setFeedOptions(opt);
+            markDirty();
+            ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/feeder/pickz — set a Photon feeder's pick depth uniformly by
+     * writing offset.z = pickZ - slotZ (X/Y/rotation untouched). Pick Z is the
+     * same for every feeder by design (shared nose plate), so this removes Z
+     * from the per-feeder camera teach — the operator only nails X/Y. No motion.
+     */
+    private static void setFeederPickZ(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PickZRequest req = GSON.fromJson(ctx.body(), PickZRequest.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (!(f instanceof PhotonFeeder)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"photon feeder not found\"}");
+                return;
+            }
+            PhotonFeeder pf = (PhotonFeeder) f;
+            if (pf.getSlot() == null || pf.getSlot().getLocation() == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"assign + teach a slot location first\"}");
+                return;
+            }
+            if (req.pickZmm == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"pickZmm required\"}");
+                return;
+            }
+            double slotZ = pf.getSlot().getLocation()
+                    .convertToUnits(LengthUnit.Millimeters).getZ();
+            Location off = pf.getOffset() != null
+                    ? pf.getOffset().convertToUnits(LengthUnit.Millimeters)
+                    : new Location(LengthUnit.Millimeters);
+            pf.setOffset(new Location(LengthUnit.Millimeters, off.getX(), off.getY(),
+                    req.pickZmm - slotZ, off.getRotation()));
+            markDirty();
+            ctx.result(GSON.toJson(feederConfig(f)));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/feeder/vision/record — with the camera already centered on the
+     * taught pocket, locate the nearest sprocket hole and store this feeder's
+     * per-tape vision reference (keyed by hardware id): aim = slotFiducial->hole,
+     * v = hole->pocket. A later re-lock re-finds the hole and re-derives the
+     * pocket without any manual jog. Reads the CURRENT camera position as the
+     * pocket truth — teach X/Y first, then record.
+     */
+    private static void recordFeederVisionRef(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PickZRequest req = GSON.fromJson(ctx.body(), PickZRequest.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (!(f instanceof PhotonFeeder)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"photon feeder not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            final PhotonFeeder pf = (PhotonFeeder) f;
+            if (pf.getHardwareId() == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"feeder has no hardware id — bus-scan first\"}");
+                return;
+            }
+            final Location slotLoc = pf.getSlot() != null && pf.getSlot().getLocation() != null
+                    ? pf.getSlot().getLocation().convertToUnits(LengthUnit.Millimeters) : null;
+            if (slotLoc == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"teach a slot location first\"}");
+                return;
+            }
+            Camera c = machine.getDefaultHead().getDefaultCamera();
+            if (!(c instanceof ReferenceCamera) || !(machine instanceof ReferenceMachine)) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no reference top camera\"}");
+                return;
+            }
+            final ReferenceCamera cam = (ReferenceCamera) c;
+            final ReferenceMachine rm = (ReferenceMachine) machine;
+            final double holeDia = req.holeDiameterMm != null && req.holeDiameterMm > 0
+                    ? req.holeDiameterMm : 1.5;
+            machine.submit(() -> {
+                Location pocket = cam.getLocation().convertToUnits(LengthUnit.Millimeters);
+                VisionSolutions vs = rm.getVisionSolutions().setMachine(rm);
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "feederVisionRecord");
+                ev.put("feeder", pf.getName());
+                try {
+                    Location hole = vs.centerInOnSubjectLocation(cam, cam,
+                            new Length(holeDia, LengthUnit.Millimeters),
+                            "Feeder vision record", false)
+                            .convertToUnits(LengthUnit.Millimeters);
+                    double[] ref = new double[] {
+                            hole.getX() - slotLoc.getX(), hole.getY() - slotLoc.getY(),
+                            pocket.getX() - hole.getX(), pocket.getY() - hole.getY() };
+                    feederVisionRef.put(pf.getHardwareId(), ref);
+                    saveViperState();
+                    ev.put("ok", true);
+                    ev.put("aimX", round(ref[0]));
+                    ev.put("aimY", round(ref[1]));
+                    ev.put("vx", round(ref[2]));
+                    ev.put("vy", round(ref[3]));
+                }
+                catch (Exception miss) {
+                    ev.put("ok", false);
+                    ev.put("error", miss.getMessage());
+                }
+                broadcast(GSON.toJson(ev));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/feeder/vision/relock — re-derive a feeder's pick offset from its
+     * stored per-tape vision reference: aim the camera at slotFiducial+aim,
+     * detect the sprocket hole, set pocket = hole + v, offset.z = pickZ - slotZ.
+     * Rejects a hole further than maxAimErr from the aim (a wrong lock). This is
+     * the swap-friendly recalibration: no manual jog, uses this feeder's own tape
+     * geometry (not a shared global vector).
+     */
+    private static void relockFeederVision(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            PickZRequest req = GSON.fromJson(ctx.body(), PickZRequest.class);
+            Feeder f = req != null ? machine.getFeeder(req.id) : null;
+            if (!(f instanceof PhotonFeeder)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"photon feeder not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            final PhotonFeeder pf = (PhotonFeeder) f;
+            final double[] ref = pf.getHardwareId() != null
+                    ? feederVisionRef.get(pf.getHardwareId()) : null;
+            if (ref == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no vision reference for this feeder — record one first\"}");
+                return;
+            }
+            final Location slotLoc = pf.getSlot() != null && pf.getSlot().getLocation() != null
+                    ? pf.getSlot().getLocation().convertToUnits(LengthUnit.Millimeters) : null;
+            if (slotLoc == null || req.pickZmm == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"needs a taught slot + pickZmm\"}");
+                return;
+            }
+            Camera c = machine.getDefaultHead().getDefaultCamera();
+            if (!(c instanceof ReferenceCamera) || !(machine instanceof ReferenceMachine)) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no reference top camera\"}");
+                return;
+            }
+            final ReferenceCamera cam = (ReferenceCamera) c;
+            final ReferenceMachine rm = (ReferenceMachine) machine;
+            final double holeDia = req.holeDiameterMm != null && req.holeDiameterMm > 0
+                    ? req.holeDiameterMm : 1.5;
+            final double maxAim = req.maxAimErrMm != null && req.maxAimErrMm > 0
+                    ? req.maxAimErrMm : 1.9;
+            final double pickZ = req.pickZmm;
+            final Location aim = slotLoc.add(new Location(LengthUnit.Millimeters,
+                    ref[0], ref[1], 0, 0));
+            machine.submit(() -> {
+                MovableUtils.moveToLocationAtSafeZ(cam,
+                        cam.getLocation().derive(aim, true, true, false, false));
+                VisionSolutions vs = rm.getVisionSolutions().setMachine(rm);
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "feederRelock");
+                ev.put("feeder", pf.getName());
+                try {
+                    Location hole = vs.centerInOnSubjectLocation(cam, cam,
+                            new Length(holeDia, LengthUnit.Millimeters),
+                            "Feeder vision relock", false)
+                            .convertToUnits(LengthUnit.Millimeters);
+                    double aimErr = Math.hypot(hole.getX() - aim.getX(),
+                            hole.getY() - aim.getY());
+                    if (aimErr > maxAim) {
+                        ev.put("ok", false);
+                        ev.put("error", "hole " + round(aimErr) + " mm off aim — not writing");
+                    }
+                    else {
+                        double pocketX = hole.getX() + ref[2];
+                        double pocketY = hole.getY() + ref[3];
+                        Location old = pf.getOffset() != null
+                                ? pf.getOffset().convertToUnits(LengthUnit.Millimeters)
+                                : new Location(LengthUnit.Millimeters);
+                        pf.setOffset(new Location(LengthUnit.Millimeters,
+                                pocketX - slotLoc.getX(), pocketY - slotLoc.getY(),
+                                pickZ - slotLoc.getZ(), old.getRotation()));
+                        markDirty();
+                        ev.put("ok", true);
+                        ev.put("pickX", round(pocketX));
+                        ev.put("pickY", round(pocketY));
+                        ev.put("pickZ", round(pickZ));
+                        ev.put("aimErr", round(aimErr));
+                    }
+                }
+                catch (Exception miss) {
+                    ev.put("ok", false);
+                    ev.put("error", miss.getMessage());
+                }
+                broadcast(GSON.toJson(ev));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
         }
         catch (Exception e) {
             ctx.status(500);

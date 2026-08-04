@@ -2371,3 +2371,47 @@ input[type="number"] {
     grid-template-columns: 1fr;
   }
 }
+
+/* Config backups list (General card) */
+.backup-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.backup-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 8px;
+  border: 1px solid var(--border, #2a2f37);
+  border-radius: 6px;
+}
+.backup-when {
+  flex: 1 1 auto;
+  font-size: 13px;
+}
+.backup-label {
+  color: var(--muted, #8a949e);
+  font-size: 12px;
+}
+
+/* Log tab */
+.log-card { display: flex; flex-direction: column; gap: 10px; }
+.log-controls { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.log-view {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  background: #0a0d11;
+  border: 1px solid var(--border, #2a2f37);
+  border-radius: 6px;
+  padding: 8px 10px;
+  height: 62vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.log-line { color: #c8d1da; }
+.log-line.log-warning { color: #e9c46a; }
+.log-line.log-error { color: #ff6b6b; }
+.log-line.log-debug, .log-line.log-trace { color: #7d8792; }

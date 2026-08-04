@@ -87,6 +87,9 @@ interface PhotonCfg {
   offset: FeederLoc | null;
   slotLocation: FeederLoc | null;
   commMaxRetry: number;
+  pickZ?: number;
+  visionRef?: boolean;
+  feedOption?: string;
 }
 
 interface StripCfg {
@@ -371,21 +374,25 @@ type Tab =
   | "feeders"
   | "parts"
   | "packages"
-  | "vision";
+  | "vision"
+  | "log"
+  | "panels";
 
 const STEPS = [0.01, 0.1, 1, 10, 100];
 
 const TABS: { id: Tab; label: string }[] = [
-  { id: "machine", label: "Machine" },
-  { id: "board", label: "Board" },
-  { id: "jobs", label: "Jobs" },
+  { id: "jobs", label: "Job" },
+  { id: "panels", label: "Panels" },
+  { id: "board", label: "Boards" },
   { id: "feeders", label: "Feeders" },
   { id: "parts", label: "Parts" },
   { id: "packages", label: "Packages" },
   { id: "vision", label: "Vision" },
+  { id: "machine", label: "Machine" },
+  { id: "log", label: "Log" },
 ];
 
-const SOON = ["Log"];
+const SOON: string[] = [];
 
 const MACHINE_CARDS: {
   id: string;
@@ -825,6 +832,38 @@ function App() {
   const [pickMsg, setPickMsg] = useState<string | null>(null);
   const [axes, setAxes] = useState<AxisInfo[]>([]);
   const [general, setGeneral] = useState<GeneralInfo | null>(null);
+  const [backups, setBackups] = useState<
+    { name: string; label: string; whenMs: number; sizeBytes: number }[]
+  >([]);
+  const [backupMsg, setBackupMsg] = useState<string>("");
+  const [logLines, setLogLines] = useState<{ level: string; text: string }[]>(
+    [],
+  );
+  const [logLevel, setLogLevel] = useState<string>("INFO");
+  const [logPaused, setLogPaused] = useState<boolean>(false);
+  const [logSearch, setLogSearch] = useState<string>("");
+  const logViewRef = useRef<HTMLDivElement | null>(null);
+  const downloadLog = () => {
+    const text = logLines.map((l) => l.text).join("\n");
+    const blob = new Blob([text], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "viperpnp-log.txt";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  // Panels tab (PCB panelization: array a board across the job)
+  const [panelBoard, setPanelBoard] = useState<string>("");
+  const [panelJob, setPanelJob] = useState<string>("");
+  const [panelRows, setPanelRows] = useState<number>(2);
+  const [panelCols, setPanelCols] = useState<number>(2);
+  const [panelXPitch, setPanelXPitch] = useState<number>(50);
+  const [panelYPitch, setPanelYPitch] = useState<number>(50);
+  const [panelX0, setPanelX0] = useState<number>(0);
+  const [panelY0, setPanelY0] = useState<number>(0);
+  const [panelSide, setPanelSide] = useState<string>("Top");
+  const [panelMsg, setPanelMsg] = useState<string>("");
   const [reference, setReference] = useState("camera");
   const [tab, setTab] = useState<Tab>("board");
   const [feeders, setFeeders] = useState<FeederInfo[]>([]);
@@ -832,6 +871,13 @@ function App() {
   const [feederType, setFeederType] = useState("photon");
   const [feederName, setFeederName] = useState("");
   const [editFeeder, setEditFeeder] = useState<FeederConfig | null>(null);
+  // Uniform pick depth shared by every Photon feeder (same nose plate).
+  const [pickZInput, setPickZInput] = useState<number>(() => {
+    const v = parseFloat(localStorage.getItem("viper.pickZ") ?? "");
+    return Number.isFinite(v) ? v : 15.9;
+  });
+  const [feederTeachMsg, setFeederTeachMsg] = useState<string>("");
+  const [feederTeachBusy, setFeederTeachBusy] = useState<boolean>(false);
   const [deleteTarget, setDeleteTarget] = useState<FeederInfo | null>(null);
   const [tip, setTip] = useState<{ text: string; x: number; y: number } | null>(
     null,
@@ -843,6 +889,8 @@ function App() {
   const [saving, setSaving] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const dragIndex = useRef<number | null>(null);
+  // Live id of the feeder in the edit modal, for async WS handlers to refresh.
+  const editFeederIdRef = useRef<string | null>(null);
 
   const loadInventory = useCallback(async () => {
     try {
@@ -1427,6 +1475,25 @@ function App() {
     }
   };
 
+  const swapCameras = async () => {
+    setCamReconnecting(true);
+    try {
+      const res = await fetch("/api/cameras/swap", { method: "POST" });
+      const d = await res.json();
+      if (!res.ok) {
+        setError(d.error ?? `swap failed (HTTP ${res.status})`);
+        return;
+      }
+      if (d.cameras) setCameras(d.cameras);
+      await loadCaptureDevices();
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCamReconnecting(false);
+    }
+  };
+
   const bindCamera = (id: string, uniqueId: string) => {
     fetch("/api/camera/bind", {
       method: "POST",
@@ -1638,6 +1705,59 @@ function App() {
     }
   }, []);
 
+  const loadBackups = useCallback(async () => {
+    try {
+      const d = await (await fetch("/api/config/backups")).json();
+      setBackups(d.backups ?? []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const snapshotConfig = () => {
+    setBackupMsg("Saving snapshot…");
+    fetch("/api/config/backup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label: "manual" }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        setBackups(d.backups ?? []);
+        setBackupMsg(d.created ? `✓ snapshot saved: ${d.created}` : "");
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
+  const restoreConfig = (name: string) => {
+    if (
+      !window.confirm(
+        `Restore ${name}? This overwrites the live machine config. ` +
+          `Your current config is snapshotted first, and the restart is required ` +
+          `for it to take effect.`,
+      )
+    ) {
+      return;
+    }
+    fetch("/api/config/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.error) {
+          setError(d.error);
+          return;
+        }
+        loadBackups();
+        setBackupMsg(
+          `✓ restored ${d.restored} — restart the backend for it to take effect`,
+        );
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
   const updateGeneral = (patch: object) => {
     fetch("/api/general", {
       method: "POST",
@@ -1700,7 +1820,10 @@ function App() {
     }
     if (id === "nozzles") loadNozzles();
     if (id === "motion") loadAxes();
-    if (id === "general") loadGeneral();
+    if (id === "general") {
+      loadGeneral();
+      loadBackups();
+    }
     setMachineCard(id);
   };
 
@@ -1880,6 +2003,26 @@ function App() {
                     : "no fiducial") +
                   ` (${data.done}/${data.total})`,
           );
+        } else if (data && data.event === "feederVisionRecord") {
+          setFeederTeachBusy(false);
+          setFeederTeachMsg(
+            data.ok
+              ? `✓ vision reference recorded — aim (${data.aimX}, ${data.aimY}), hole→pocket (${data.vx}, ${data.vy})`
+              : `✗ record failed: ${data.error ?? "no sprocket hole found"}`,
+          );
+          if (data.ok && editFeederIdRef.current) {
+            openEditFeeder(editFeederIdRef.current);
+          }
+        } else if (data && data.event === "feederRelock") {
+          setFeederTeachBusy(false);
+          setFeederTeachMsg(
+            data.ok
+              ? `✓ re-locked — pick (${data.pickX}, ${data.pickY}, Z ${data.pickZ}), aim err ${data.aimErr} mm`
+              : `✗ re-lock failed: ${data.error ?? "no sprocket hole found"}`,
+          );
+          if (data.ok && editFeederIdRef.current) {
+            openEditFeeder(editFeederIdRef.current);
+          }
         } else if (data && data.event === "busScanDone") {
           setRailScanMsg(
             `✓ bus scan: ${data.found} feeders answered` +
@@ -1979,15 +2122,95 @@ function App() {
 
   const post = useCallback(async (path: string, body?: unknown) => {
     try {
-      await fetch(path, {
+      const res = await fetch(path, {
         method: "POST",
         headers: body ? { "Content-Type": "application/json" } : undefined,
         body: body ? JSON.stringify(body) : undefined,
       });
+      // A failed machine action (e.g. connect when the COM port is wedged)
+      // returns a non-OK status; surface it instead of failing silently.
+      if (!res.ok) {
+        let msg = `${path} failed (HTTP ${res.status})`;
+        try {
+          const j = await res.json();
+          if (j && j.error) msg = String(j.error);
+        } catch {
+          /* empty/non-JSON body — keep the generic message */
+        }
+        setError(msg);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
+
+  useEffect(() => {
+    if (tab !== "log" || logPaused) return;
+    let active = true;
+    const fetchLog = async () => {
+      try {
+        const d = await (
+          await fetch(`/api/log?lines=800&level=${logLevel}`)
+        ).json();
+        if (active && Array.isArray(d.lines)) setLogLines(d.lines);
+      } catch {
+        /* ignore */
+      }
+    };
+    fetchLog();
+    const iv = setInterval(fetchLog, 2000);
+    return () => {
+      active = false;
+      clearInterval(iv);
+    };
+  }, [tab, logLevel, logPaused]);
+
+  useEffect(() => {
+    const el = logViewRef.current;
+    if (el && tab === "log" && !logPaused) el.scrollTop = el.scrollHeight;
+  }, [logLines, tab, logPaused]);
+
+  const applyPanelize = async () => {
+    const jobFile = panelJob || activeJobFile;
+    if (!jobFile) {
+      setPanelMsg("Select or activate a job first.");
+      return;
+    }
+    if (!panelBoard) {
+      setPanelMsg("Pick a board to array.");
+      return;
+    }
+    setPanelMsg("Adding array…");
+    try {
+      const res = await fetch("/api/job/panelize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file: jobFile,
+          boardFile: panelBoard,
+          rows: panelRows,
+          cols: panelCols,
+          xPitch: panelXPitch,
+          yPitch: panelYPitch,
+          x0: panelX0,
+          y0: panelY0,
+          side: panelSide,
+        }),
+      });
+      const d = await res.json();
+      if (!res.ok) {
+        setPanelMsg(d.error ?? `panelize failed (HTTP ${res.status})`);
+        return;
+      }
+      const n = panelRows * panelCols;
+      setPanelMsg(
+        `✓ added ${n} board${n === 1 ? "" : "s"} (${panelRows} × ${panelCols}) to the job. Save to keep.`,
+      );
+      loadJobs();
+    } catch (e) {
+      setPanelMsg(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const enabled = status?.enabled ?? false;
   const homed = status?.homed ?? false;
@@ -2504,6 +2727,10 @@ function App() {
     }
   };
 
+  useEffect(() => {
+    editFeederIdRef.current = editFeeder?.id ?? null;
+  }, [editFeeder?.id]);
+
   const setEF = (patch: Partial<FeederConfig>) =>
     setEditFeeder((ef) => (ef ? { ...ef, ...patch } : ef));
   const setPhotonField = (patch: Partial<PhotonCfg>) =>
@@ -2552,6 +2779,51 @@ function App() {
       slotAddress: p.slotAddress,
       offset: p.offset ?? undefined,
       slotLocation: p.slotLocation ?? undefined,
+    });
+  };
+
+  // Feed mode: Normal / SkipNext / Disable (Disable = pick-test without feeding).
+  const setFeedOption = (feedOption: string) => {
+    if (!editFeeder?.photon) return;
+    postFeeder("/api/feeder/feedoption", { id: editFeeder.id, feedOption });
+  };
+
+  // Set uniform pick Z: writes offset.z = pickZ - slotZ (X/Y untouched).
+  const setUniformPickZ = () => {
+    if (!editFeeder?.photon) return;
+    localStorage.setItem("viper.pickZ", String(pickZInput));
+    postFeeder("/api/feeder/pickz", { id: editFeeder.id, pickZmm: pickZInput });
+  };
+
+  // Record this feeder's per-tape vision reference (camera must be centered on
+  // the taught pocket). Result arrives via the feederVisionRecord WS event.
+  const recordVisionRef = () => {
+    if (!editFeeder?.photon) return;
+    setFeederTeachBusy(true);
+    setFeederTeachMsg("Recording vision reference…");
+    fetch("/api/feeder/vision/record", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: editFeeder.id }),
+    }).catch((e) => {
+      setFeederTeachBusy(false);
+      setError(e instanceof Error ? e.message : String(e));
+    });
+  };
+
+  // Re-derive pick offset from the stored vision reference (swap recovery).
+  const relockVision = () => {
+    if (!editFeeder?.photon) return;
+    localStorage.setItem("viper.pickZ", String(pickZInput));
+    setFeederTeachBusy(true);
+    setFeederTeachMsg("Re-locking from vision reference…");
+    fetch("/api/feeder/vision/relock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: editFeeder.id, pickZmm: pickZInput }),
+    }).catch((e) => {
+      setFeederTeachBusy(false);
+      setError(e instanceof Error ? e.message : String(e));
     });
   };
 
@@ -3157,6 +3429,208 @@ function App() {
                 Home now
               </button>
             </div>
+          )}
+
+          {tab === "log" && (
+            <section className="card log-card">
+              <div className="log-controls">
+                <label className="loc-field">
+                  <span>Level</span>
+                  <select
+                    className="type-select"
+                    value={logLevel}
+                    onChange={(e) => setLogLevel(e.currentTarget.value)}
+                  >
+                    <option value="TRACE">Trace</option>
+                    <option value="DEBUG">Debug</option>
+                    <option value="INFO">Info</option>
+                    <option value="WARNING">Warning</option>
+                    <option value="ERROR">Error</option>
+                  </select>
+                </label>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => setLogPaused((p) => !p)}
+                >
+                  {logPaused ? "▶ Resume" : "⏸ Pause"}
+                </button>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => setLogLines([])}
+                >
+                  Clear view
+                </button>
+                <button
+                  className="btn btn-sm"
+                  onClick={downloadLog}
+                  disabled={logLines.length === 0}
+                >
+                  ⭳ Download
+                </button>
+                <input
+                  className="import-input"
+                  style={{ flex: "1 1 160px", minWidth: 120 }}
+                  placeholder="Search…"
+                  value={logSearch}
+                  onChange={(e) => setLogSearch(e.currentTarget.value)}
+                />
+                <span className="muted">
+                  {(() => {
+                    const shown = logSearch
+                      ? logLines.filter((l) =>
+                          l.text.toLowerCase().includes(logSearch.toLowerCase()),
+                        ).length
+                      : logLines.length;
+                    return `${shown}${logSearch ? `/${logLines.length}` : ""} lines${logPaused ? " · paused" : " · live"}`;
+                  })()}
+                </span>
+              </div>
+              <div className="log-view" ref={logViewRef}>
+                {(() => {
+                  const shown = logSearch
+                    ? logLines.filter((l) =>
+                        l.text.toLowerCase().includes(logSearch.toLowerCase()),
+                      )
+                    : logLines;
+                  if (shown.length === 0) {
+                    return (
+                      <div className="muted">
+                        {logSearch
+                          ? "No lines match the search."
+                          : "No log lines at this level yet."}
+                      </div>
+                    );
+                  }
+                  return shown.map((l, i) => (
+                    <div
+                      key={i}
+                      className={`log-line log-${l.level.toLowerCase()}`}
+                    >
+                      {l.text}
+                    </div>
+                  ));
+                })()}
+              </div>
+            </section>
+          )}
+
+          {tab === "panels" && (
+            <section className="card">
+              <h2>Panelize</h2>
+              <p className="muted" style={{ marginBottom: 12 }}>
+                Add an array of one board across a job on a grid. Each copy is a
+                real board the job places. (Shared panel-fiducial alignment is a
+                follow-on; for now each board aligns from its own fiducials.)
+              </p>
+              <div className="field-grid">
+                <label className="loc-field" style={{ gridColumn: "span 2" }}>
+                  <span>Board to array</span>
+                  <select
+                    className="type-select"
+                    value={panelBoard}
+                    onChange={(e) => setPanelBoard(e.currentTarget.value)}
+                  >
+                    <option value="">— pick a board —</option>
+                    {boards
+                      .filter((b) => b.file)
+                      .map((b) => (
+                        <option key={b.file} value={b.file ?? ""}>
+                          {b.name}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+                <label className="loc-field" style={{ gridColumn: "span 2" }}>
+                  <span>Into job</span>
+                  <select
+                    className="type-select"
+                    value={panelJob || activeJobFile || ""}
+                    onChange={(e) => setPanelJob(e.currentTarget.value)}
+                  >
+                    <option value="">
+                      {activeJobFile ? "Active job" : "— pick a job —"}
+                    </option>
+                    {jobs
+                      .filter((jb) => jb.file)
+                      .map((jb) => (
+                        <option key={jb.file} value={jb.file ?? ""}>
+                          {jb.name}
+                          {jb.active ? " (active)" : ""}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+                <label className="loc-field">
+                  <span>Columns</span>
+                  <NumberInput
+                    min={1}
+                    value={panelCols}
+                    onChange={(v) => setPanelCols(v)}
+                  />
+                </label>
+                <label className="loc-field">
+                  <span>Rows</span>
+                  <NumberInput
+                    min={1}
+                    value={panelRows}
+                    onChange={(v) => setPanelRows(v)}
+                  />
+                </label>
+                <label className="loc-field">
+                  <span>X pitch (mm)</span>
+                  <NumberInput
+                    step={0.1}
+                    value={panelXPitch}
+                    onChange={(v) => setPanelXPitch(v)}
+                  />
+                </label>
+                <label className="loc-field">
+                  <span>Y pitch (mm)</span>
+                  <NumberInput
+                    step={0.1}
+                    value={panelYPitch}
+                    onChange={(v) => setPanelYPitch(v)}
+                  />
+                </label>
+                <label className="loc-field">
+                  <span>Origin X (mm)</span>
+                  <NumberInput
+                    step={0.1}
+                    value={panelX0}
+                    onChange={(v) => setPanelX0(v)}
+                  />
+                </label>
+                <label className="loc-field">
+                  <span>Origin Y (mm)</span>
+                  <NumberInput
+                    step={0.1}
+                    value={panelY0}
+                    onChange={(v) => setPanelY0(v)}
+                  />
+                </label>
+                <label className="loc-field">
+                  <span>Side</span>
+                  <select
+                    className="type-select"
+                    value={panelSide}
+                    onChange={(e) => setPanelSide(e.currentTarget.value)}
+                  >
+                    <option value="Top">Top</option>
+                    <option value="Bottom">Bottom</option>
+                  </select>
+                </label>
+              </div>
+              <div className="teach-actions" style={{ marginTop: 12 }}>
+                <button className="btn btn-primary" onClick={applyPanelize}>
+                  Add {panelRows * panelCols} boards to job
+                </button>
+              </div>
+              {panelMsg && (
+                <div className="teach-head" style={{ marginTop: 8 }}>
+                  {panelMsg}
+                </div>
+              )}
+            </section>
           )}
 
           {tab === "machine" &&
@@ -4682,7 +5156,13 @@ function App() {
       </main>
 
       {editFeeder && (
-        <div className="modal-backdrop" onClick={() => setEditFeeder(null)}>
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            setEditFeeder(null);
+            setFeederTeachMsg("");
+          }}
+        >
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
               <h3>
@@ -4690,7 +5170,10 @@ function App() {
               </h3>
               <button
                 className="icon-btn"
-                onClick={() => setEditFeeder(null)}
+                onClick={() => {
+                  setEditFeeder(null);
+                  setFeederTeachMsg("");
+                }}
                 title="Close"
               >
                 ✕
@@ -4809,6 +5292,25 @@ function App() {
                       }
                     />
                   </div>
+                  <div className="field-row">
+                    <label>Feed mode</label>
+                    <select
+                      className="type-select"
+                      value={editFeeder.photon.feedOption ?? "Normal"}
+                      onChange={(e) => setFeedOption(e.currentTarget.value)}
+                      title="Disable = pick-test the presented part repeatedly without advancing the tape; Skip next = skip one feed"
+                    >
+                      <option value="Normal">Normal (production)</option>
+                      <option value="SkipNext">Skip next feed</option>
+                      <option value="Disable">Disabled (test — no feed)</option>
+                    </select>
+                  </div>
+                  {editFeeder.photon.feedOption === "Disable" && (
+                    <div className="teach-head muted">
+                      Test mode: picks the presented part without advancing the
+                      tape. Set back to Normal before a real job.
+                    </div>
+                  )}
                   <TeachLoc
                     label="Slot location (shared by all feeders in this slot)"
                     value={editFeeder.photon.slotLocation}
@@ -4823,6 +5325,72 @@ function App() {
                     onGo={(t) => moveToFeederLoc(t, "offset")}
                     onCapture={(t) => captureFeederLoc(t, "offset")}
                   />
+
+                  <div className="teach-block">
+                    <div className="teach-head">
+                      Pick depth &amp; vision — teach X/Y above by jogging the
+                      camera to the pocket center and Capture. Pick Z is uniform
+                      across feeders (shared nose plate); set it here so Capture
+                      only touches X/Y.
+                    </div>
+                    <div className="field-grid">
+                      <label className="loc-field">
+                        <span>
+                          Uniform pick Z
+                          {editFeeder.photon.pickZ !== undefined && (
+                            <span className="muted">
+                              {" "}
+                              (now {editFeeder.photon.pickZ})
+                            </span>
+                          )}
+                        </span>
+                        <NumberInput
+                          step={0.1}
+                          value={pickZInput}
+                          onChange={(v) => setPickZInput(v)}
+                        />
+                      </label>
+                    </div>
+                    <div className="teach-actions">
+                      <button
+                        className="btn btn-sm"
+                        onClick={setUniformPickZ}
+                        disabled={!editFeeder.photon.slotLocation}
+                        title="Write offset.z = pickZ − slotZ (X/Y untouched)"
+                      >
+                        Set pick Z
+                      </button>
+                      <button
+                        className="btn btn-sm"
+                        onClick={recordVisionRef}
+                        disabled={
+                          feederTeachBusy || !editFeeder.photon.slotLocation
+                        }
+                        title="With the camera centered on the pocket, store this feeder's sprocket-hole→pocket vector"
+                      >
+                        Record vision ref
+                      </button>
+                      <button
+                        className="btn btn-sm"
+                        onClick={relockVision}
+                        disabled={feederTeachBusy || !editFeeder.photon.visionRef}
+                        title="Re-find the pocket from the stored vision reference (after a swap) — no manual jog"
+                      >
+                        Vision re-lock
+                      </button>
+                    </div>
+                    {feederTeachMsg && (
+                      <div className="teach-head" style={{ marginTop: 6 }}>
+                        {feederTeachMsg}
+                      </div>
+                    )}
+                    {!editFeeder.photon.visionRef && (
+                      <div className="teach-head muted" style={{ marginTop: 4 }}>
+                        No vision reference yet — teach X/Y, then Record so future
+                        swaps re-lock automatically.
+                      </div>
+                    )}
+                  </div>
                 </>
               ) : editFeeder.tray ? (
                 <>
@@ -5984,6 +6552,14 @@ function App() {
                   {camReconnecting ? "Reconnecting…" : "↻ Reconnect cameras"}
                 </button>
                 <button
+                  className="btn btn-sm"
+                  onClick={swapCameras}
+                  disabled={camReconnecting}
+                  title="Swap the top and bottom camera bindings (fixes them being crossed after a USB re-plug onto different ports)"
+                >
+                  ⇄ Swap top/bottom
+                </button>
+                <button
                   className="icon-btn"
                   onClick={() => setMachineCard(null)}
                   title="Close"
@@ -7130,6 +7706,52 @@ function App() {
                       calibration to work.
                     </div>
                   </div>
+
+                  <div className="sub-head" style={{ marginTop: 14 }}>
+                    Config backups
+                  </div>
+                  <div className="muted" style={{ marginBottom: 8 }}>
+                    Timestamped snapshots of the machine config (fiducials, nozzle
+                    offsets, feeders). One is taken automatically on every save and
+                    before each nozzle calibration, so a bad calibration is a
+                    one-click restore. Restoring needs a backend restart to apply.
+                  </div>
+                  <div
+                    style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}
+                  >
+                    <button className="btn" onClick={snapshotConfig}>
+                      Snapshot now
+                    </button>
+                    <button className="btn" onClick={loadBackups}>
+                      Refresh
+                    </button>
+                  </div>
+                  {backupMsg && (
+                    <div className="muted" style={{ marginBottom: 8 }}>
+                      {backupMsg}
+                    </div>
+                  )}
+                  {backups.length === 0 ? (
+                    <div className="muted">No backups yet.</div>
+                  ) : (
+                    <div className="backup-list">
+                      {backups.slice(0, 12).map((b) => (
+                        <div key={b.name} className="backup-row">
+                          <span className="backup-when">
+                            {new Date(b.whenMs).toLocaleString()}
+                          </span>
+                          <span className="backup-label mono">{b.label}</span>
+                          <button
+                            className="btn btn-sm"
+                            onClick={() => restoreConfig(b.name)}
+                            title={`Restore ${b.name} (current config is snapshotted first)`}
+                          >
+                            Restore
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </>
               )}
             </div>
