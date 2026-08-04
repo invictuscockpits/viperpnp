@@ -3410,11 +3410,49 @@ public class ViperServer {
             byCam.put(cam, r);
         }
 
-        // Pass A: exact stored device. This must win over name matching: the
-        // LumenPnP cameras can re-enumerate with IDENTICAL names (both
-        // "PnP Bottom Camera" after a power cycle), and a name match would
-        // then cross-bind top/bottom. A saved uniqueId is the user-verified
-        // truth, so honor it whenever the device is present.
+        // Pass 0: distinct name-role match, and it WINS over a stale saved id.
+        // Once the host reports UNAMBIGUOUS device names ("PnP Top Camera" vs
+        // "PnP Bottom Camera"), the name is the reliable identity — a saved
+        // uniqueId goes stale the moment the two cameras swap USB ports (exactly
+        // the cross-bind seen on restart). Binds only when EXACTLY one present
+        // device matches the role; identical/ambiguous names bind nothing here
+        // and fall through to the saved-id + port-path passes (the cross-wire
+        // guard for the old both-named-"PnP Bottom Camera" state).
+        for (OpenPnpCaptureCamera cam : cams) {
+            String role = cam.getName() != null ? cam.getName().toLowerCase() : "";
+            if (role.isEmpty()) {
+                continue;
+            }
+            CaptureDevice match = null;
+            int matches = 0;
+            for (CaptureDevice d : present) {
+                String uid = d.getUniqueId();
+                if (uid == null || claimed.contains(uid)
+                        || !uid.toLowerCase().contains("32e4")) {
+                    continue;
+                }
+                if (d.getName() != null && d.getName().toLowerCase().contains(role)) {
+                    matches++;
+                    match = d;
+                }
+            }
+            if (matches != 1) {
+                continue;
+            }
+            try {
+                if (bindCaptureDevice(cam, match.getUniqueId(), null)) {
+                    claimed.add(match.getUniqueId());
+                    byCam.get(cam).put("bound", true);
+                    byCam.get(cam).put("note", "matched name " + match.getName());
+                }
+            }
+            catch (Exception e) {
+                // fall through to the saved-id / port-path passes
+            }
+        }
+        // Pass A: exact stored device — for cameras Pass 0 left unbound because
+        // their names were identical/ambiguous, honor the saved uniqueId
+        // whenever that device is still present.
         for (OpenPnpCaptureCamera cam : cams) {
             Map<String, Object> r = byCam.get(cam);
             String want = cam.getDevice() != null ? cam.getDevice().getUniqueId()
