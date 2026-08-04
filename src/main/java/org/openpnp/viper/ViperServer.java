@@ -446,6 +446,7 @@ public class ViperServer {
         app.post("/api/aliases/remove", ViperServer::removeAlias);
         app.get("/api/packages", ViperServer::listPackages);
         app.post("/api/package", ViperServer::updatePackage);
+        app.post("/api/packages/bodypads", ViperServer::fillBodyPads);
         app.post("/api/package/add", ViperServer::addPackage);
         app.post("/api/package/delete", ViperServer::deletePackage);
         app.get("/api/boards", ViperServer::listBoards);
@@ -4444,6 +4445,70 @@ public class ViperServer {
             }
             markDirty();
             ctx.result(GSON.toJson(describePackages()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/packages/bodypads — for every package whose footprint has NO pads
+     * but real body dimensions, add one body-sized pad so bottom vision has a
+     * non-zero mask (the "body pad" trick). This stops alignment locking onto the
+     * foam holder for parts we never entered pad geometry for. Body {id?} limits
+     * it to one package; otherwise it fills all pad-less ones. Skips packages that
+     * have no body dimensions (nothing to derive a mask from).
+     */
+    private static void fillBodyPads(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            String onlyId = null;
+            try {
+                Map<?, ?> body = GSON.fromJson(ctx.body(), Map.class);
+                Object o = body != null ? body.get("id") : null;
+                if (o instanceof String && !((String) o).trim().isEmpty()) {
+                    onlyId = (String) o;
+                }
+            }
+            catch (Exception ignore) {
+                // no body / not JSON — treat as "all"
+            }
+            List<String> filled = new ArrayList<>();
+            int skippedNoBody = 0;
+            for (Package pk : Configuration.get().getPackages()) {
+                if (onlyId != null && !pk.getId().equals(onlyId)) {
+                    continue;
+                }
+                org.openpnp.model.Footprint fp = pk.getFootprint();
+                if (fp == null || !fp.getPads().isEmpty()) {
+                    continue;
+                }
+                double bw = fp.getBodyWidth();
+                double bh = fp.getBodyHeight();
+                if (bw <= 0 || bh <= 0) {
+                    skippedNoBody++;
+                    continue;
+                }
+                org.openpnp.model.Footprint.Pad pad =
+                        new org.openpnp.model.Footprint.Pad();
+                pad.setName("BODY");
+                pad.setX(0);
+                pad.setY(0);
+                pad.setWidth(bw);
+                pad.setHeight(bh);
+                pad.setRoundness(0);
+                fp.addPad(pad);
+                filled.add(pk.getId());
+            }
+            if (!filled.isEmpty()) {
+                markDirty();
+            }
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("filled", filled.size());
+            out.put("packages", filled);
+            out.put("skippedNoBody", skippedNoBody);
+            ctx.result(GSON.toJson(out));
         }
         catch (Exception e) {
             ctx.status(500);

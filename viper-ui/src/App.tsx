@@ -780,6 +780,7 @@ function App() {
   const [editPlacement, setEditPlacement] = useState<Placement | null>(null);
   const [partsDetail, setPartsDetail] = useState<PartInfo[]>([]);
   const [packages, setPackages] = useState<PackageInfo[]>([]);
+  const [pkgMsg, setPkgMsg] = useState<string>("");
   const [nozzleTips, setNozzleTips] = useState<NtInfo[]>([]);
   const [editPart, setEditPart] = useState<PartInfo | null>(null);
   const [partIsNew, setPartIsNew] = useState(false);
@@ -2506,6 +2507,34 @@ function App() {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
+  const fillBodyPads = async () => {
+    setPkgMsg("Filling masks…");
+    try {
+      const res = await fetch("/api/packages/bodypads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const d = await res.json();
+      if (!res.ok) {
+        setPkgMsg("");
+        setError(d.error ?? `body-pad fill failed (HTTP ${res.status})`);
+        return;
+      }
+      loadPackages();
+      setPkgMsg(
+        `✓ filled ${d.filled} empty mask${d.filled === 1 ? "" : "s"} with a body pad` +
+          (d.skippedNoBody
+            ? ` · ${d.skippedNoBody} skipped (no body dimensions)`
+            : "") +
+          ". Save to keep.",
+      );
+    } catch (e) {
+      setPkgMsg("");
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const updatePackage = (id: string, patch: object) =>
     postPackages("/api/package", { id, ...patch });
   const deletePackage = (id: string) =>
@@ -5064,6 +5093,13 @@ function App() {
                   )}
                   <button
                     className="btn btn-sm"
+                    onClick={fillBodyPads}
+                    title="For packages with no pads but real body dimensions, add a body-sized pad so bottom vision has a mask (stops alignment locking onto the holder)"
+                  >
+                    Fill empty masks
+                  </button>
+                  <button
+                    className="btn btn-sm"
                     onClick={() => {
                       setEditPackage({ ...NEW_PACKAGE });
                       setPkgIsNew(true);
@@ -5073,6 +5109,11 @@ function App() {
                   </button>
                 </div>
               </div>
+              {pkgMsg && (
+                <div className="muted" style={{ marginBottom: 8 }}>
+                  {pkgMsg}
+                </div>
+              )}
               {packages.length === 0 ? (
                 <div className="muted">No packages yet.</div>
               ) : (
