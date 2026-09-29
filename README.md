@@ -11,7 +11,7 @@
   <a href="https://github.com/invictuscockpits/viperpnp/wiki">Wiki</a>
 </p>
 
-![The Job tab running a board](docs/screenshots/job.png)
+![The Job tab running a board](docs/screenshots/job-tab.png)
 
 ViperPNP is a fork of [OpenPnP](https://openpnp.org) built for day-to-day production work. The machine logic is OpenPnP's: the same drivers, motion planning, vision engine, feeder classes, and configuration format. On top of that core sits a single-window desktop app that puts jogging, cameras, feeders, jobs, and vision in one place, plus a set of machine-side improvements earned by running real production boards.
 
@@ -23,13 +23,13 @@ It was developed on and for the Opulo LumenPnP, but anything OpenPnP can drive, 
 
 **Jobs that survive reality.** Placed status persists per placement and is saved after every step, so an interrupted job resumes exactly where it stopped and never double-places. Failed placements can defer instead of halting the run, and the end-of-job report tells you the actual reason each one was skipped. See [Jobs and Boards](https://github.com/invictuscockpits/viperpnp/wiki/Jobs-and-Boards).
 
-![Feeders with slots, parts, and remaining counts](docs/screenshots/feeders.png)
+![Feeders with slots, parts, and remaining counts](docs/screenshots/feeders-tab.png)
 
 **First-class Photon feeder support.** A hardened bus scan that does not unmap feeders on a single missed reply, a vision rail scan that refines every slot location from the feeder nose-board fiducials, per-tape vision references that re-lock the pocket after a feeder swap, uniform pick depth, and firmware-configurable film peel time. See [Photon Feeders](https://github.com/invictuscockpits/viperpnp/wiki/Photon-Feeders).
 
 **Vision you can see.** Every vision operation publishes its processed working image, masks and detections included, into the UI. A pick-and-align test bench lets you pick a part, hold it over the bottom camera, and tune its pipeline with the real part in view. One click resets bottom vision to the footprint-masked pipeline. See [Vision and Calibration](https://github.com/invictuscockpits/viperpnp/wiki/Vision-and-Calibration).
 
-![The Vision tab with working images and the pick-and-align bench](docs/screenshots/vision.png)
+![The Vision tab with working images and the pick-and-align bench](docs/screenshots/vision-tab.png)
 
 **Guided machine setup.** Connection, motion, nozzles and tips, cameras, tool changer, actuators, and general settings each live in a card with teach buttons that use the machine itself: touch off head offsets on a fiducial, teach the bottom camera position with a nozzle, calibrate vacuum thresholds from live sensor reads.
 
