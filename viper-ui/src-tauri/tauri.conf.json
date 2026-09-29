@@ -6,15 +6,16 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
-    "frontendDist": "../dist"
+    "beforeBuildCommand": "",
+    "frontendDist": "../dist-loader"
   },
   "app": {
     "windows": [
       {
         "title": "ViperPNP",
-        "width": 1100,
-        "height": 760
+        "width": 1400,
+        "height": 900,
+        "maximized": true
       }
     ],
     "security": {
@@ -23,7 +24,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
+    "resources": ["resources"],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerIcon": "icons/icon.ico"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

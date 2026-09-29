@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "remote-ui",
+  "description": "Packaged installs serve the UI from the embedded Java backend at localhost:8077; grant that origin the same IPC surface as the local page (file dialogs etc.).",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://localhost:8077/*", "http://localhost:8077"]
+  },
+  "permissions": ["core:default", "opener:default", "dialog:default"]
+}
