@@ -44,6 +44,28 @@ public class PhotonFeeder extends ReferenceFeeder {
     @Attribute(required = false)
     protected int partPitch = 4;
 
+    /**
+     * DEPRECATED, kept only so older machine.xml files load. The tape-motion
+     * "peel boost" was abandoned (moving the tape back/forward disturbed
+     * pockets); peel tuning now uses peelTimeMsPerTenth + feeder firmware.
+     */
+    @Attribute(required = false)
+    protected double feedOvershootMm = 0.0;
+
+    /** DEPRECATED, see feedOvershootMm. */
+    @Attribute(required = false)
+    protected int peelEveryN = 1;
+
+    /**
+     * Peel-motor run time in ms per 0.1mm of feed, pushed to the feeder's
+     * firmware (vendor option 0x20) on every initialization. 0 = leave the
+     * firmware default (22). Requires feeder firmware with the vendor option;
+     * older firmware silently ignores it. The value follows THIS feeder
+     * (hardware id), so it travels with the feeder across slots.
+     */
+    @Attribute(required = false)
+    protected int peelTimeMsPerTenth = 0;
+
     protected boolean initialized = false;
 
     @Element(required = false)
@@ -224,6 +246,29 @@ public class PhotonFeeder extends ReferenceFeeder {
             otherFeeder.setSlotAddress(response.fromAddress);
         } else {
             initialized = true;
+            // Feeder RAM settings reset on its power-up; re-push our configured
+            // peel time (best effort) every time we (re)initialize it.
+            pushPeelTime();
+        }
+    }
+
+    /**
+     * Send the configured peel-motor time to the feeder (vendor option 0x20).
+     * 0 means "use firmware default" and is not sent. Best effort: an old
+     * firmware without the option ignores it; a comms failure is non-fatal
+     * (the feed itself will surface real bus problems).
+     */
+    public void pushPeelTime() {
+        if (peelTimeMsPerTenth <= 0 || slotAddress == null) {
+            return;
+        }
+        try {
+            VendorOptions cmd = new VendorOptions(slotAddress,
+                    VendorOptions.SUB_SET_PEEL_TIME, peelTimeMsPerTenth);
+            cmd.send(photonBus);
+        }
+        catch (Exception ignore) {
+            // best effort
         }
     }
 
@@ -263,6 +308,10 @@ public class PhotonFeeder extends ReferenceFeeder {
     }
 
     private void feed(Nozzle nozzle, int distance_mm) throws Exception {
+        feedForwardTenths(nozzle, distance_mm * 10);
+    }
+
+    private void feedForwardTenths(Nozzle nozzle, int distanceTenths) throws Exception {
         for (int i = 0; i <= photonProperties.getFeederCommunicationMaxRetry(); i++) {
             findSlotAddressIfNeeded();
             initializeIfNeeded();
@@ -273,7 +322,7 @@ public class PhotonFeeder extends ReferenceFeeder {
 
             verifyFeederLocationIsFullyConfigured();
 
-            MoveFeedForward moveFeedForward = new MoveFeedForward(slotAddress, distance_mm * 10);
+            MoveFeedForward moveFeedForward = new MoveFeedForward(slotAddress, distanceTenths);
             MoveFeedForward.Response moveFeedForwardResponse = moveFeedForward.send(photonBus);
 
             if (moveFeedForwardResponse == null) {
@@ -318,6 +367,44 @@ public class PhotonFeeder extends ReferenceFeeder {
         throw new FeedFailureException("Failed to feed for an unknown reason. Is the feeder inserted?");
     }
 
+    /**
+     * Feed the tape backward. Used by the peel boost to return the tape to the
+     * pitch position after an overshot forward feed. Must succeed — a failure
+     * here leaves the tape overfed, so it surfaces as a feed failure.
+     */
+    private void feedBackwardTenths(int distanceTenths) throws Exception {
+        // May run before any forward feed this session — make sure the feeder
+        // is found and initialized first.
+        findSlotAddressIfNeeded();
+        initializeIfNeeded();
+        if (!initialized || slotAddress == null) {
+            throw new FeedFailureException("Feeder not initialized for peel-boost back-step.");
+        }
+        MoveFeedBackward moveFeedBackward = new MoveFeedBackward(slotAddress, distanceTenths);
+        MoveFeedBackward.Response response = moveFeedBackward.send(photonBus);
+        if (response == null) {
+            throw new FeedFailureException("Peel-boost back-step timed out — feed aborted "
+                    + "before the tape advanced; it will retry.");
+        }
+        Duration expectedFeedDuration = Duration.ofMillis(response.expectedTimeToFeed);
+        long endTimeNanos = System.nanoTime() + expectedFeedDuration.toNanos() * 3;
+        for (int j = 0; j <= photonProperties.getFeederCommunicationMaxRetry()
+                || System.nanoTime() <= endTimeNanos; j++) {
+            Thread.sleep(50);
+            MoveFeedStatus moveFeedStatus = new MoveFeedStatus(slotAddress);
+            MoveFeedStatus.Response status = moveFeedStatus.send(photonBus);
+            if (status == null) {
+                continue;
+            }
+            if (status.error == ErrorTypes.NONE) {
+                return;
+            } else if (status.error == ErrorTypes.COULD_NOT_REACH) {
+                throw new FeedFailureException("Peel-boost backward feed could not reach its destination.");
+            }
+        }
+        throw new FeedFailureException("Peel-boost backward feed timed out waiting for status.");
+    }
+
     @Override
     public void feed(Nozzle nozzle) throws Exception {
         switch (getFeedOptions()) {
@@ -331,6 +418,30 @@ public class PhotonFeeder extends ReferenceFeeder {
         }
 
         feed(nozzle, partPitch);
+    }
+
+    public double getFeedOvershootMm() {
+        return feedOvershootMm;
+    }
+
+    public void setFeedOvershootMm(double feedOvershootMm) {
+        Object oldValue = this.feedOvershootMm;
+        this.feedOvershootMm = Math.max(0, Math.min(10, feedOvershootMm));
+        firePropertyChange("feedOvershootMm", oldValue, this.feedOvershootMm);
+    }
+
+    public int getPeelTimeMsPerTenth() {
+        return peelTimeMsPerTenth;
+    }
+
+    public void setPeelTimeMsPerTenth(int peelTimeMsPerTenth) {
+        Object oldValue = this.peelTimeMsPerTenth;
+        this.peelTimeMsPerTenth = Math.max(0, Math.min(80, peelTimeMsPerTenth));
+        firePropertyChange("peelTimeMsPerTenth", oldValue, this.peelTimeMsPerTenth);
+        // Push immediately if the feeder is live; otherwise the next init sends it.
+        if (initialized) {
+            pushPeelTime();
+        }
     }
 
     public void feedOneMm() throws Exception {
