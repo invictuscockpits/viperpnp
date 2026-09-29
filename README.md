@@ -1,47 +1,62 @@
-![OpenPNP Logo](https://raw.githubusercontent.com/openpnp/openpnp-logo/develop/logo_small.png)
+<p align="center">
+  <img src="viper-ui/src/assets/viperpnp-logo.png" alt="ViperPNP" width="420">
+</p>
 
-# OpenPnP
+<h3 align="center">The OpenPnP machine core with a modern, production-focused interface</h3>
 
-Open Source SMT Pick and Place Hardware and Software
+<p align="center">
+  <a href="https://github.com/invictuscockpits/viperpnp/releases">Download</a> ·
+  <a href="https://github.com/invictuscockpits/viperpnp/wiki/Installation">Installation</a> ·
+  <a href="https://github.com/invictuscockpits/viperpnp/wiki/Migrating-from-OpenPnP">Migrating from OpenPnP</a> ·
+  <a href="https://github.com/invictuscockpits/viperpnp/wiki">Wiki</a>
+</p>
 
-## Introduction
+![The Job tab running a board](docs/screenshots/job.png)
 
-OpenPnP is a project to create the plans, prototype and software for a completely Open Source SMT
-pick and place machine that anyone can afford. I believe that with the ubiquity of cheap, precise
-motion control hardware, some ingenuity and plenty of Open Source software it should be possible
-to build and own a fully functional SMT pick and place machine for under $1000.
+ViperPNP is a fork of [OpenPnP](https://openpnp.org) built for day-to-day production work. The machine logic is OpenPnP's: the same drivers, motion planning, vision engine, feeder classes, and configuration format. On top of that core sits a single-window desktop app that puts jogging, cameras, feeders, jobs, and vision in one place, plus a set of machine-side improvements earned by running real production boards.
 
-## Project Status
+It was developed on and for the Opulo LumenPnP, but anything OpenPnP can drive, ViperPNP can drive. Your existing OpenPnP configuration [carries over directly](https://github.com/invictuscockpits/viperpnp/wiki/Migrating-from-OpenPnP), and knowledge from the OpenPnP community still applies.
 
-OpenPnP is stable and in wide use. It is still under heavy development and new features are added continuously. See the [Downloads](http://openpnp.org/downloads) page to get started.
+## Highlights
 
-If you would like to keep up with our progress you can
-[Watch this project on GitHub](http://github.com/openpnp/openpnp), check out
-[our Twitter](http://twitter.com/openpnp), [join the discussion group](http://groups.google.com/group/openpnp),
-or come chat with us on [Discord](https://discord.gg/EmsrFVx).
+**One window, always oriented.** A persistent sidebar keeps both cameras live with a tool-tracking reticle, jog controls, vacuum and light toggles, and a DRO in view no matter which tab you are on. Keyboard jogging works like a CNC pendant, including a continuous mode where holding an arrow key streams smooth motion. See [The Interface](https://github.com/invictuscockpits/viperpnp/wiki/The-Interface).
 
-## Contributing
+**Jobs that survive reality.** Placed status persists per placement and is saved after every step, so an interrupted job resumes exactly where it stopped and never double-places. Failed placements can defer instead of halting the run, and the end-of-job report tells you the actual reason each one was skipped. See [Jobs and Boards](https://github.com/invictuscockpits/viperpnp/wiki/Jobs-and-Boards).
 
-![Build Status](https://github.com/openpnp/openpnp/workflows/Build%20and%20Deploy%20OpenPnP/badge.svg)
-[![Help Wanted](https://img.shields.io/github/issues-raw/openpnp/openpnp/help-wanted.svg?label=help-wanted&colorB=5319e7)](https://github.com/openpnp/openpnp/labels/help-wanted)
-[![Bugs](https://img.shields.io/github/issues-raw/openpnp/openpnp/bug.svg?label=bugs&colorB=D9472F)](https://github.com/openpnp/openpnp/labels/bug)
-[![Feature Requests](https://img.shields.io/github/issues-raw/openpnp/openpnp/feature-request.svg?label=feature-requests&colorB=bfd4f2)](https://github.com/openpnp/openpnp/labels/feature-request)
-[![Enhancements](https://img.shields.io/github/issues-raw/openpnp/openpnp/enhancement.svg?label=enhancements&colorB=0052cc)](https://github.com/openpnp/openpnp/labels/enhancement)
+![Feeders with slots, parts, and remaining counts](docs/screenshots/feeders.png)
 
+**First-class Photon feeder support.** A hardened bus scan that does not unmap feeders on a single missed reply, a vision rail scan that refines every slot location from the feeder nose-board fiducials, per-tape vision references that re-lock the pocket after a feeder swap, uniform pick depth, and firmware-configurable film peel time. See [Photon Feeders](https://github.com/invictuscockpits/viperpnp/wiki/Photon-Feeders).
 
-Before starting work on a pull request, please read: https://github.com/openpnp/openpnp/wiki/Developers-Guide#contributing
+**Vision you can see.** Every vision operation publishes its processed working image, masks and detections included, into the UI. A pick-and-align test bench lets you pick a part, hold it over the bottom camera, and tune its pipeline with the real part in view. One click resets bottom vision to the footprint-masked pipeline. See [Vision and Calibration](https://github.com/invictuscockpits/viperpnp/wiki/Vision-and-Calibration).
 
-Summary of guidelines:
+![The Vision tab with working images and the pick-and-align bench](docs/screenshots/vision.png)
 
-* One pull request per issue.
-* Describe the change.
-* Follow the coding style.
-* Include tests and documentation.
-* Think of the big picture.
+**Guided machine setup.** Connection, motion, nozzles and tips, cameras, tool changer, actuators, and general settings each live in a card with teach buttons that use the machine itself: touch off head offsets on a fiducial, teach the bottom camera position with a nozzle, calibrate vacuum thresholds from live sensor reads.
 
-## Thanks
+The full list of changes relative to stock OpenPnP is on the wiki: [Improvements over OpenPnP](https://github.com/invictuscockpits/viperpnp/wiki/Improvements-over-OpenPnP).
 
-Many thanks to ej-technologies for providing a complimentary license of install4j. install4j
-creates high quality, professional installers for Java applications.
+## Getting started
 
-More information at http://www.ej-technologies.com/products/install4j/overview.html.
+Download the Windows installer from the [releases page](https://github.com/invictuscockpits/viperpnp/releases) and run it. Everything needed is bundled, including the Java runtime; nothing else has to be installed. First launch creates a default configuration, and the [migration guide](https://github.com/invictuscockpits/viperpnp/wiki/Migrating-from-OpenPnP) covers bringing an existing OpenPnP setup across.
+
+## Building from source
+
+The backend is the OpenPnP core plus an embedded [Javalin](https://javalin.io) server (`org.openpnp.viper.ViperServer`) that exposes a REST and WebSocket API on port 8077. The UI is React inside a Tauri 2 shell that talks to that API.
+
+You need JDK 17, Maven, Node.js, and (for the desktop shell) Rust with the Tauri prerequisites.
+
+```bash
+mvn compile
+```
+
+```bash
+cd viper-ui && npm install && npm run tauri dev
+```
+
+`dev.ps1` at the repo root compiles the backend, starts it, and launches the UI in one step on Windows. `build-installer.ps1` produces the self-contained NSIS installer, including a jlink-trimmed JRE. The backend can also run standalone and serve the built UI itself with `-Dviper.web=<dist dir>`, which is how the packaged app works.
+
+## Relationship to OpenPnP
+
+ViperPNP would not exist without OpenPnP and the years of work behind it. The fork keeps the core intact and current practice is to stay compatible with OpenPnP's configuration format, so a setup can move between the two. Machine-side fixes that make sense upstream are candidates for pull requests to OpenPnP.
+
+ViperPNP is licensed under the [GPL-3.0](LICENSE.txt), the same license as OpenPnP.
