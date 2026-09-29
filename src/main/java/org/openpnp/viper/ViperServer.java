@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Future;
 
 import org.openpnp.gui.importer.EagleMountsmdUlpImporter;
 import org.openpnp.gui.importer.KicadPosImporter;
@@ -63,6 +64,7 @@ import org.openpnp.model.PlacementsHolderLocation;
 import org.openpnp.model.PlacementsHolderLocation.PlacementsTransformStatus;
 import org.openpnp.spi.Actuator;
 import org.openpnp.spi.Axis;
+import org.openpnp.spi.base.AbstractCamera;
 import org.openpnp.spi.base.AbstractHead;
 import org.openpnp.spi.Camera;
 import org.openpnp.spi.FiducialLocator;
@@ -71,6 +73,7 @@ import org.openpnp.spi.Feeder;
 import org.openpnp.spi.Head;
 import org.openpnp.spi.HeadMountable;
 import org.openpnp.spi.JobProcessor;
+import org.openpnp.spi.MotionPlanner.CompletionType;
 import org.openpnp.spi.Machine;
 import org.openpnp.spi.MachineListener;
 import org.openpnp.spi.Nozzle;
@@ -128,6 +131,14 @@ public class ViperServer {
     /** Post-home drift check: re-measure the secondary fiducial and warn on drift. */
     private static volatile boolean verifyFidAfterHome = false;
     /**
+     * Bottom-camera exposure used ONLY during nozzle-tip runout calibration
+     * (restored afterward). The shiny tip and dark parts want opposite
+     * exposures; this lets part vision keep its own setting. null = disabled.
+     */
+    private static volatile Double calExposure = null;
+    /** Whether the runout-cal exposure switch is active (value may be negative). */
+    private static volatile boolean calExposureEnabled = false;
+    /**
      * Per-feeder vision re-lock reference, keyed by hardware id (so it travels
      * with the feeder on a slot swap). aim = slot fiducial -> sprocket hole;
      * v = sprocket hole -> pick pocket. Both are per-tape, captured once when
@@ -149,6 +160,27 @@ public class ViperServer {
     private static PnpJobProcessor jobProcessor;
     private static JobProcessor.TextStatusListener jobStepListener;
     private static volatile boolean configDirty = false;
+    /**
+     * Continuous X/Y jog streamer state. Z is intentionally excluded (its travel
+     * is too short to stream). The stop endpoint just clears jogStreaming; the
+     * running task polls it. Direction/speed/tool are volatile so a held key can
+     * change direction mid-stream without restarting the task.
+     */
+    private static volatile boolean jogStreaming = false;
+    private static volatile double jogStreamDirX = 0;
+    private static volatile double jogStreamDirY = 0;
+    private static volatile double jogStreamSpeed = 1.0;
+    private static volatile String jogStreamTool = null;
+    /**
+     * Distance per streamed segment (mm) and pause between segments (ms) — the
+     * two feel knobs, live-settable from the jog panel. Bigger segment / shorter
+     * pace = faster; the trade is a longer coast on release (larger segment, or a
+     * fuller controller buffer). Defaults chosen for a smooth mid-speed jog.
+     */
+    private static volatile double jogStreamSegmentMm = 0.3;
+    private static volatile long jogStreamPaceMs = 0;
+    /** Safety cap on a single hold, in case a stop is ever missed (lost keyup). */
+    private static final long JOG_STREAM_MAX_MS = 30000;
     /** file-part-id → canonical-part-id remap rules (persisted alongside config). */
     private static final Map<String, String> partAliases = new LinkedHashMap<>();
 
@@ -191,8 +223,22 @@ public class ViperServer {
         machine.addListener(new StatusBroadcastListener());
 
         int port = Integer.getInteger("viper.port", 8077);
+        // Packaged installs serve the built UI straight from this server
+        // (-Dviper.web=<dist dir>), so the app window, fetches, WebSocket and
+        // camera streams are all same-origin with zero frontend changes. Dev
+        // keeps using the Vite server and never sets the property.
+        final String webDir = System.getProperty("viper.web");
         Javalin app = Javalin.create(config -> {
             config.showJavalinBanner = false;
+            if (webDir != null && new java.io.File(webDir, "index.html").isFile()) {
+                config.staticFiles.add(sf -> {
+                    sf.directory = webDir;
+                    sf.location = io.javalin.http.staticfiles.Location.EXTERNAL;
+                });
+                config.spaRoot.addFile("/",
+                        new java.io.File(webDir, "index.html").getAbsolutePath(),
+                        io.javalin.http.staticfiles.Location.EXTERNAL);
+            }
         });
 
         app.get("/api/health", ctx -> ctx.result("ok"));
@@ -336,10 +382,12 @@ public class ViperServer {
         app.post("/api/io", ViperServer::setIo);
 
         app.post("/api/machine/camera-to-nozzle", ctx -> {
+            final String tool = toolParam(ctx);
             machine.submit(() -> {
                 Head head = machine.getDefaultHead();
+                HeadMountable noz = resolveNozzleTool(head, tool);
                 MovableUtils.moveToLocationAtSafeZ(head.getDefaultCamera(),
-                        head.getDefaultNozzle().getLocation());
+                        noz.getLocation());
                 return null;
             }, broadcastCallback());
             ctx.contentType("application/json");
@@ -347,9 +395,11 @@ public class ViperServer {
         });
 
         app.post("/api/machine/nozzle-to-camera", ctx -> {
+            final String tool = toolParam(ctx);
             machine.submit(() -> {
                 Head head = machine.getDefaultHead();
-                MovableUtils.moveToLocationAtSafeZ(head.getDefaultNozzle(),
+                HeadMountable noz = resolveNozzleTool(head, tool);
+                MovableUtils.moveToLocationAtSafeZ(noz,
                         head.getDefaultCamera().getLocation());
                 return null;
             }, broadcastCallback());
@@ -360,7 +410,7 @@ public class ViperServer {
         app.post("/api/jog", ctx -> {
             JogRequest req = GSON.fromJson(ctx.body(), JogRequest.class);
             final JogRequest jog = req != null ? req : new JogRequest();
-            machine.submit(() -> {
+            Future<?> f = machine.submit(() -> {
                 Head head = machine.getDefaultHead();
                 HeadMountable tool;
                 if (jog.tool == null || jog.tool.isEmpty()
@@ -387,8 +437,49 @@ public class ViperServer {
                 tool.moveTo(target, sp, MotionOption.JogMotion);
                 return null;
             }, broadcastCallback());
+            if (jog.wait) {
+                try {
+                    f.get();
+                }
+                catch (Exception e) {
+                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                    ctx.status(500);
+                    ctx.contentType("application/json");
+                    ctx.result(GSON.toJson(java.util.Collections.singletonMap(
+                            "error", String.valueOf(cause.getMessage()))));
+                    return;
+                }
+            }
             ctx.contentType("application/json");
             ctx.result("{\"submitted\":true}");
+        });
+
+        // Continuous X/Y jog: start streaming on key-down, stop on key-up.
+        app.post("/api/jog/stream/start", ctx -> {
+            JogRequest req = GSON.fromJson(ctx.body(), JogRequest.class);
+            JogRequest r = req != null ? req : new JogRequest();
+            jogStreamDirX = Math.signum(r.dx);
+            jogStreamDirY = Math.signum(r.dy);
+            jogStreamSpeed = r.speed > 0 ? r.speed : 1.0;
+            jogStreamTool = r.tool;
+            if (r.segmentMm != null && r.segmentMm > 0) {
+                jogStreamSegmentMm = r.segmentMm;
+            }
+            if (r.paceMs != null && r.paceMs >= 0) {
+                jogStreamPaceMs = (long) (double) r.paceMs;
+            }
+            boolean start = !jogStreaming;
+            jogStreaming = true;
+            if (start) {
+                startJogStream();
+            }
+            ctx.contentType("application/json");
+            ctx.result("{\"streaming\":true}");
+        });
+        app.post("/api/jog/stream/stop", ctx -> {
+            jogStreaming = false;
+            ctx.contentType("application/json");
+            ctx.result("{\"streaming\":false}");
         });
 
         app.post("/api/import/kicad", ViperServer::importKicad);
@@ -411,6 +502,10 @@ public class ViperServer {
         app.get("/api/cameras/devices", ViperServer::listCaptureDevices);
         app.post("/api/camera/bind", ViperServer::bindCamera);
         app.post("/api/cameras/reconnect", ViperServer::reconnectCameras);
+        app.post("/api/devices/reenumerate", ViperServer::reenumerateDevices);
+        app.post("/api/camera/bottom/go", ViperServer::bottomCamGo);
+        app.post("/api/camera/bottom/capture", ViperServer::bottomCamCapture);
+        app.post("/api/camera/bottom/location", ViperServer::bottomCamLocation);
         app.post("/api/cameras/swap", ViperServer::swapCameras);
         app.get("/api/camera/frame", ViperServer::cameraFrame);
         app.get("/api/camera/mjpeg", ViperServer::cameraMjpeg);
@@ -419,14 +514,23 @@ public class ViperServer {
         app.get("/api/vision/image", ViperServer::visionImage);
         app.get("/api/vision/settings", ViperServer::listVisionSettings);
         app.post("/api/vision/test/fiducial", ViperServer::testFiducialVision);
+        app.post("/api/vision/bottom/reset-pipeline", ViperServer::resetBottomPipeline);
         app.get("/api/nozzles/detail", ViperServer::listNozzles);
         app.post("/api/nozzle", ViperServer::updateNozzle);
+        app.post("/api/vacuum/read", ViperServer::readVacuum);
         app.post("/api/nozzletip", ViperServer::updateNozzleTip);
         app.post("/api/nozzletip/calibrate", ViperServer::calibrateNozzleTip);
+        app.post("/api/nozzletip/changer/move", ViperServer::changerMove);
+        app.post("/api/nozzletip/changer/capture", ViperServer::changerCapture);
+        app.post("/api/nozzletip/changer/speeds", ViperServer::changerSpeeds);
+        app.post("/api/nozzletip/load", ViperServer::loadTip);
+        app.post("/api/nozzletip/unload", ViperServer::unloadTip);
         app.post("/api/nozzle/offsets/capture", ViperServer::captureNozzleOffsets);
         app.post("/api/bottomvision", ViperServer::updateBottomVision);
         app.post("/api/test/pick", ViperServer::testPick);
         app.post("/api/test/align", ViperServer::testAlign);
+        app.post("/api/test/hold", ViperServer::testHold);
+        app.post("/api/test/place", ViperServer::testPlace);
         app.post("/api/test/discard", ViperServer::testDiscard);
         app.get("/api/axes/detail", ViperServer::listAxes);
         app.post("/api/axis", ViperServer::updateAxis);
@@ -474,6 +578,7 @@ public class ViperServer {
         app.post("/api/job/board/origin", ViperServer::jobBoardOriginFromPlacement);
         app.post("/api/job/placement/capture", ViperServer::capturePlacementFromCamera);
         app.post("/api/job/board/fiducials", ViperServer::jobBoardFiducials);
+        app.post("/api/job/board/placed/reset", ViperServer::resetPlacedStatus);
         app.post("/api/job/board/align/go", ViperServer::alignGo);
         app.post("/api/job/board/align/capture", ViperServer::alignCapture);
         app.post("/api/job/board/align/auto", ViperServer::alignAuto);
@@ -930,6 +1035,114 @@ public class ViperServer {
         return null;
     }
 
+    /**
+     * Continuous X/Y jog. Streams short JogMotion segments, flushing each with
+     * CompletionType.CommandJog so the controller blends them into constant
+     * velocity instead of decelerating to a stop between moves (which is what
+     * makes discrete-step jog feel rough). Paced by JOG_STREAM_PACE_MS so the
+     * controller's planner buffer stays shallow and releasing the key coasts
+     * only a segment or two before a clean, position-synced WaitForStillstand.
+     *
+     * <p>The whole hold runs inside one machine task, so it owns the serial link
+     * for the duration; the stop endpoint only clears the volatile flag. Z is
+     * excluded on purpose (too little travel to be worth streaming).
+     */
+    private static void startJogStream() {
+        machine.submit(() -> {
+            Head head = machine.getDefaultHead();
+            HeadMountable tool;
+            String t = jogStreamTool;
+            if (t == null || t.isEmpty() || "nozzle".equalsIgnoreCase(t)) {
+                tool = head.getDefaultNozzle();
+            }
+            else if ("camera".equalsIgnoreCase(t)) {
+                tool = head.getDefaultCamera();
+            }
+            else {
+                HeadMountable found = nozzleByIdOrName(t);
+                tool = found != null ? found : head.getDefaultCamera();
+            }
+            long deadline = System.currentTimeMillis() + JOG_STREAM_MAX_MS;
+            double prevX = Double.NaN;
+            double prevY = Double.NaN;
+            try {
+                while (jogStreaming && System.currentTimeMillis() < deadline) {
+                    double seg = jogStreamSegmentMm;
+                    Location cur = tool.getLocation().convertToUnits(LengthUnit.Millimeters);
+                    // Soft limits clamp the planned move; if position stopped
+                    // advancing since the last command, we've hit a limit.
+                    if (!Double.isNaN(prevX)
+                            && Math.abs(cur.getX() - prevX) < 1e-4
+                            && Math.abs(cur.getY() - prevY) < 1e-4) {
+                        break;
+                    }
+                    prevX = cur.getX();
+                    prevY = cur.getY();
+                    Location target = cur.derive(
+                            cur.getX() + jogStreamDirX * seg,
+                            cur.getY() + jogStreamDirY * seg,
+                            null, null);
+                    // SpeedOverPrecision suppresses backlash compensation: without
+                    // it, OneSidedPositioning adds an overshoot + slow (0.25x)
+                    // approach move to EVERY segment, which is what makes the
+                    // stream slow and direction-asymmetric (rough one way, jerky
+                    // the other). Jog is positioned by eye, so precision is moot.
+                    // CommandJog flushes without forcing a decel-to-stop, so the
+                    // controller blends segments into constant velocity as long as
+                    // its planner buffer stays fed (pace 0 = don't throttle it).
+                    tool.moveTo(target, jogStreamSpeed,
+                            MotionOption.JogMotion, MotionOption.SpeedOverPrecision);
+                    machine.getMotionPlanner().waitForCompletion(tool, CompletionType.CommandJog);
+                    long pace = jogStreamPaceMs;
+                    if (pace > 0) {
+                        Thread.sleep(pace);
+                    }
+                }
+            }
+            finally {
+                jogStreaming = false;
+                // Clean, position-synced stop: drains the shallow buffer (M400).
+                machine.getMotionPlanner().waitForCompletion(tool, CompletionType.WaitForStillstand);
+            }
+            return null;
+        }, broadcastCallback());
+    }
+
+    /** The "tool" field from a JSON request body, or null if absent/unparseable. */
+    private static String toolParam(io.javalin.http.Context ctx) {
+        try {
+            Map<?, ?> b = GSON.fromJson(ctx.body(), Map.class);
+            Object t = b != null ? b.get("tool") : null;
+            return t instanceof String ? (String) t : null;
+        }
+        catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * The nozzle a camera-to-nozzle / nozzle-to-camera move should use: the
+     * selected nozzle by id/name, falling back to the head's default nozzle.
+     * "camera"/"nozzle"/blank all resolve to the default nozzle. On a seesaw-Z
+     * machine N1 and N2 have different head offsets, so honoring the selection
+     * is what makes these moves land on the nozzle the user picked.
+     */
+    private static HeadMountable resolveNozzleTool(Head head, String tool) throws Exception {
+        if (tool != null && !tool.isEmpty()
+                && !"camera".equalsIgnoreCase(tool) && !"nozzle".equalsIgnoreCase(tool)) {
+            Nozzle n = nozzleByIdOrName(tool);
+            if (n != null) {
+                return n;
+            }
+        }
+        return head.getDefaultNozzle();
+    }
+
+    /** True when a teach "tool" means the camera (camera or blank), not a nozzle. */
+    private static boolean isCameraTool(String tool) {
+        return tool == null || tool.isEmpty() || "camera".equalsIgnoreCase(tool);
+    }
+
     /** JSON body for POST /api/machine/park. */
     private static class ParkRequest {
         String axes; // "all" (default) | "z" | "c"
@@ -944,6 +1157,14 @@ public class ViperServer {
         double dc;
         double speed;
         String tool;
+        /**
+         * When true, block the response until the move actually completes.
+         * Buttons leave it false (fire-and-forget).
+         */
+        boolean wait;
+        /** Continuous-jog feel knobs (null = keep current). */
+        Double segmentMm;
+        Double paceMs;
     }
 
     /**
@@ -1196,6 +1417,8 @@ public class ViperServer {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("activeJob", activeJobFile != null ? activeJobFile.getAbsolutePath() : null);
             m.put("verifyFidAfterHome", verifyFidAfterHome);
+            m.put("calExposure", calExposure);
+            m.put("calExposureEnabled", calExposureEnabled);
             Map<String, Object> vr = new LinkedHashMap<>();
             for (Map.Entry<String, double[]> e : feederVisionRef.entrySet()) {
                 double[] a = e.getValue();
@@ -1231,6 +1454,17 @@ public class ViperServer {
             Object vf = m != null ? m.get("verifyFidAfterHome") : null;
             if (vf instanceof Boolean) {
                 verifyFidAfterHome = (Boolean) vf;
+            }
+            Object ce = m != null ? m.get("calExposure") : null;
+            if (ce instanceof Number) {
+                calExposure = ((Number) ce).doubleValue();
+            }
+            Object cee = m != null ? m.get("calExposureEnabled") : null;
+            if (cee instanceof Boolean) {
+                calExposureEnabled = (Boolean) cee;
+            }
+            else if (calExposure != null && calExposure > 0) {
+                calExposureEnabled = true; // legacy: value alone meant enabled
             }
             Object vr = m != null ? m.get("feederVisionRef") : null;
             if (vr instanceof Map) {
@@ -1828,6 +2062,12 @@ public class ViperServer {
             tm.put("name", nt.getName());
             if (nt instanceof ReferenceNozzleTip) {
                 ReferenceNozzleTip t = (ReferenceNozzleTip) nt;
+                tm.put("pickDwellMs", t.getPickDwellMilliseconds());
+                tm.put("placeDwellMs", t.getPlaceDwellMilliseconds());
+                tm.put("maxPickToleranceMm", t.getMaxPickTolerance() != null
+                        ? round(t.getMaxPickTolerance()
+                                .convertToUnits(LengthUnit.Millimeters).getValue())
+                        : null);
                 tm.put("methodPartOn", t.getMethodPartOn() != null
                         ? t.getMethodPartOn().name() : "None");
                 tm.put("methodPartOff", t.getMethodPartOff() != null
@@ -1856,6 +2096,18 @@ public class ViperServer {
                 ReferenceNozzle carrier = nozzleWithTip(t);
                 tm.put("calibrated", carrier != null && cal.isCalibrated(carrier));
                 tm.put("loaded", carrier != null);
+                // Automatic tool-changer motion path (passive: 4 taught points + speeds).
+                Map<String, Object> ch = new LinkedHashMap<>();
+                ch.put("start", locMap(t.getChangerStartLocation()));
+                ch.put("mid", locMap(t.getChangerMidLocation()));
+                ch.put("mid2", locMap(t.getChangerMidLocation2()));
+                ch.put("end", locMap(t.getChangerEndLocation()));
+                ch.put("startToMidSpeed", t.getChangerStartToMidSpeed());
+                ch.put("midToMid2Speed", t.getChangerMidToMid2Speed());
+                ch.put("mid2ToEndSpeed", t.getChangerMid2ToEndSpeed());
+                ch.put("configured", locSet(t.getChangerStartLocation())
+                        || locSet(t.getChangerEndLocation()));
+                tm.put("changer", ch);
             }
             tips.add(tm);
         }
@@ -1868,6 +2120,8 @@ public class ViperServer {
             Map<String, Object> bvm = new LinkedHashMap<>();
             bvm.put("preRotate", bv.isPreRotate());
             bvm.put("maxVisionPasses", bv.getMaxVisionPasses());
+            bvm.put("calExposure", calExposure);
+            bvm.put("calExposureEnabled", calExposureEnabled);
             bvm.put("maxLinearOffset", mm(bv.getMaxLinearOffset()));
             bvm.put("maxAngularOffset", bv.getMaxAngularOffset());
             root.put("bottomVision", bvm);
@@ -1914,6 +2168,56 @@ public class ViperServer {
     }
 
     /** POST /api/nozzle — Body: {id, vacuum?, blowOff?, vacuumSense? (actuator ids, "" clears)}. */
+    /**
+     * POST /api/vacuum/read — read the live vacuum sensor level for a nozzle
+     * (its currently loaded tip). Body: {id: nozzleId}. Used to calibrate the
+     * part-on/part-off thresholds: pick a part, read the "part on" level, then
+     * set the threshold below it. Needs the machine enabled.
+     */
+    private static void readVacuum(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            NozzleUpdate req = GSON.fromJson(ctx.body(), NozzleUpdate.class);
+            Nozzle n = req != null ? findNozzle(req.id) : null;
+            if (!(n instanceof ReferenceNozzle)) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle not found\"}");
+                return;
+            }
+            if (!machine.isEnabled()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled to read the vacuum sensor\"}");
+                return;
+            }
+            final ReferenceNozzle rn = (ReferenceNozzle) n;
+            final boolean pulse = req != null && Boolean.TRUE.equals(req.pulse);
+            Future<Double> f = machine.submit(() -> {
+                if (pulse && rn.getVacuumActuator() != null) {
+                    // Bare-nozzle reference: pull vacuum, settle, read, release.
+                    rn.getVacuumActuator().actuate(true);
+                    Thread.sleep(400);
+                    double lv = rn.readVacuumLevel();
+                    rn.getVacuumActuator().actuate(false);
+                    return lv;
+                }
+                return rn.readVacuumLevel();
+            });
+            double level = f.get();
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("level", round(level));
+            m.put("nozzle", rn.getName());
+            NozzleTip nt = rn.getNozzleTip();
+            m.put("tip", nt != null ? nt.getName() : null);
+            m.put("tipId", nt != null ? nt.getId() : null);
+            ctx.result(GSON.toJson(m));
+        }
+        catch (Exception e) {
+            Throwable c = e.getCause() != null ? e.getCause() : e;
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(c)));
+        }
+    }
+
     private static void updateNozzle(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
@@ -1935,7 +2239,24 @@ public class ViperServer {
                 rn.setVacuumSenseActuator(
                         req.vacuumSense.isEmpty() ? null : findActuator(req.vacuumSense));
             }
-            markDirty();
+            // Manually set which nozzle tip is loaded (no auto changer here).
+            if (req.tipId != null) {
+                ReferenceNozzleTip tip = null;
+                for (NozzleTip nt : machine.getNozzleTips()) {
+                    if (nt.getId().equals(req.tipId) && nt instanceof ReferenceNozzleTip) {
+                        tip = (ReferenceNozzleTip) nt;
+                        break;
+                    }
+                }
+                if (tip == null) {
+                    ctx.status(404);
+                    ctx.result("{\"error\":\"nozzle tip '" + req.tipId + "' not found\"}");
+                    return;
+                }
+                rn.setNozzleTip(tip);
+            }
+            Configuration.get().save();
+            configDirty = false;
             ctx.result(GSON.toJson(describeNozzles()));
         }
         catch (Exception e) {
@@ -1966,6 +2287,16 @@ public class ViperServer {
             }
             if (found instanceof ReferenceNozzleTip) {
                 ReferenceNozzleTip t = (ReferenceNozzleTip) found;
+                if (req.pickDwellMs != null) {
+                    t.setPickDwellMilliseconds(Math.max(0, req.pickDwellMs));
+                }
+                if (req.placeDwellMs != null) {
+                    t.setPlaceDwellMilliseconds(Math.max(0, req.placeDwellMs));
+                }
+                if (req.maxPickToleranceMm != null) {
+                    t.setMaxPickTolerance(new Length(
+                            Math.max(0, req.maxPickToleranceMm), LengthUnit.Millimeters));
+                }
                 if (req.methodPartOn != null) {
                     t.setMethodPartOn(VacuumMeasurementMethod.valueOf(req.methodPartOn));
                 }
@@ -2035,7 +2366,10 @@ public class ViperServer {
                     cal.setCalibrationZOffset(new Length(req.calZOffset, LengthUnit.Millimeters));
                 }
             }
-            markDirty();
+            // Persist immediately so calibration survives a restart (markDirty
+            // alone only flags it in memory).
+            Configuration.get().save();
+            configDirty = false;
             ctx.result(GSON.toJson(describeNozzles()));
         }
         catch (Exception e) {
@@ -2076,12 +2410,24 @@ public class ViperServer {
         Double calZOffset;
         // offsets capture: "primary" | "secondary"
         String which;
+        // which nozzle tip is physically loaded on this nozzle (manual swap)
+        String tipId;
+        // dwell at pick/place depth with vacuum on/off, per tip (ms)
+        Integer pickDwellMs;
+        Integer placeDwellMs;
+        // bottom-vision offset accept limit, per tip (mm)
+        Double maxPickToleranceMm;
+        // vacuum read: pulse the valve on (dwell, read, off) to measure the
+        // "vacuum on, no part" level on a bare nozzle. Omit when a part is held.
+        Boolean pulse;
     }
 
     /** JSON body for POST /api/bottomvision — machine-wide alignment settings. */
     private static class BottomVisionUpdate {
         Boolean preRotate;
         Integer maxVisionPasses;
+        Double calExposure;
+        Boolean calExposureEnabled;
         Double maxLinearOffset;
         Double maxAngularOffset;
     }
@@ -2137,6 +2483,261 @@ public class ViperServer {
                 ev.put("calibrated", ftip.getCalibration().isCalibrated(fnoz));
                 ev.put("info", ftip.getCalibration().getCalibrationInformation(fnoz));
                 broadcast(GSON.toJson(ev));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    // -------------------------------------------------- Tool changer (nozzle tips)
+
+    /** True when a Location has any non-zero X/Y/Z (i.e. has been taught). */
+    private static boolean locSet(Location l) {
+        if (l == null) {
+            return false;
+        }
+        Location m = l.convertToUnits(LengthUnit.Millimeters);
+        return m.getX() != 0 || m.getY() != 0 || m.getZ() != 0;
+    }
+
+    /** A ReferenceNozzleTip by id, or null. */
+    private static ReferenceNozzleTip referenceTip(String id) {
+        if (id == null) {
+            return null;
+        }
+        for (NozzleTip nt : machine.getNozzleTips()) {
+            if (nt instanceof ReferenceNozzleTip && id.equals(nt.getId())) {
+                return (ReferenceNozzleTip) nt;
+            }
+        }
+        return null;
+    }
+
+    /** The tip's changer location for a named point (start|mid|mid2|end), or null. */
+    private static Location changerLoc(ReferenceNozzleTip t, String which) {
+        switch (which == null ? "" : which.toLowerCase()) {
+            case "start": return t.getChangerStartLocation();
+            case "mid": return t.getChangerMidLocation();
+            case "mid2": return t.getChangerMidLocation2();
+            case "end": return t.getChangerEndLocation();
+            default: return null;
+        }
+    }
+
+    /** Writes a named changer location; false if the point name is invalid. */
+    private static boolean setChangerLoc(ReferenceNozzleTip t, String which, Location loc) {
+        switch (which == null ? "" : which.toLowerCase()) {
+            case "start":
+                t.setChangerStartLocation(loc);
+                return true;
+            case "mid":
+                t.setChangerMidLocation(loc);
+                return true;
+            case "mid2":
+                t.setChangerMidLocation2(loc);
+                return true;
+            case "end":
+                t.setChangerEndLocation(loc);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** JSON body for the tool-changer teach/config/test actions. */
+    private static class ChangerRequest {
+        String id;        // nozzle tip id
+        String which;     // start | mid | mid2 | end
+        String tool;      // nozzle id/name for move/capture (the selected nozzle)
+        String nozzleId;  // nozzle to load onto / unload from
+        Double startToMidSpeed;
+        Double midToMid2Speed;
+        Double mid2ToEndSpeed;
+    }
+
+    /**
+     * POST /api/nozzletip/changer/move — jog the selected nozzle to one of the
+     * tip's taught changer points (start|mid|mid2|end) at safe Z, for verifying a
+     * taught position during setup. Body: {id, which, tool?}.
+     */
+    private static void changerMove(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            ChangerRequest req = GSON.fromJson(ctx.body(), ChangerRequest.class);
+            ReferenceNozzleTip t = req != null ? referenceTip(req.id) : null;
+            if (t == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle tip not found\"}");
+                return;
+            }
+            final Location target = changerLoc(t, req.which);
+            if (target == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"which must be start|mid|mid2|end\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"enable and home the machine first\"}");
+                return;
+            }
+            final String tool = req.tool;
+            machine.submit(() -> {
+                Head head = machine.getDefaultHead();
+                HeadMountable hm = resolveNozzleTool(head, tool);
+                MovableUtils.moveToLocationAtSafeZ(hm, target);
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/nozzletip/changer/capture — set one of the tip's changer points
+     * from the selected nozzle's current position (full X/Y/Z). Body: {id, which,
+     * tool?}. Reads position, no motion.
+     */
+    private static void changerCapture(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            ChangerRequest req = GSON.fromJson(ctx.body(), ChangerRequest.class);
+            ReferenceNozzleTip t = req != null ? referenceTip(req.id) : null;
+            if (t == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle tip not found\"}");
+                return;
+            }
+            if (changerLoc(t, req.which) == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"which must be start|mid|mid2|end\"}");
+                return;
+            }
+            Head head = machine.getDefaultHead();
+            HeadMountable hm = resolveNozzleTool(head, req.tool);
+            Location cur = hm.getLocation().convertToUnits(LengthUnit.Millimeters);
+            setChangerLoc(t, req.which, cur);
+            markDirty();
+            ctx.result(GSON.toJson(describeNozzles()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/nozzletip/changer/speeds — set the three segment speeds (0..1).
+     * Body: {id, startToMidSpeed?, midToMid2Speed?, mid2ToEndSpeed?}.
+     */
+    private static void changerSpeeds(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            ChangerRequest req = GSON.fromJson(ctx.body(), ChangerRequest.class);
+            ReferenceNozzleTip t = req != null ? referenceTip(req.id) : null;
+            if (t == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle tip not found\"}");
+                return;
+            }
+            if (req.startToMidSpeed != null) {
+                t.setChangerStartToMidSpeed(req.startToMidSpeed);
+            }
+            if (req.midToMid2Speed != null) {
+                t.setChangerMidToMid2Speed(req.midToMid2Speed);
+            }
+            if (req.mid2ToEndSpeed != null) {
+                t.setChangerMid2ToEndSpeed(req.mid2ToEndSpeed);
+            }
+            markDirty();
+            ctx.result(GSON.toJson(describeNozzles()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/nozzletip/load — run the changer to load a tip onto a nozzle,
+     * following the taught Start->Mid->Mid2->End path. Body: {id, nozzleId?}.
+     */
+    private static void loadTip(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            ChangerRequest req = GSON.fromJson(ctx.body(), ChangerRequest.class);
+            ReferenceNozzleTip t = req != null ? referenceTip(req.id) : null;
+            if (t == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle tip not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"enable and home the machine first\"}");
+                return;
+            }
+            Head head = machine.getDefaultHead();
+            HeadMountable hm = resolveNozzleTool(head, req.nozzleId);
+            if (!(hm instanceof ReferenceNozzle)) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no reference nozzle to load onto\"}");
+                return;
+            }
+            final ReferenceNozzle noz = (ReferenceNozzle) hm;
+            final ReferenceNozzleTip ft = t;
+            machine.submit(() -> {
+                noz.loadNozzleTip(ft, false);
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/nozzletip/unload — run the changer to unload the tip on its
+     * nozzle, reversing the taught path. Body: {id} (or {nozzleId}).
+     */
+    private static void unloadTip(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            ChangerRequest req = GSON.fromJson(ctx.body(), ChangerRequest.class);
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"enable and home the machine first\"}");
+                return;
+            }
+            ReferenceNozzle noz = null;
+            ReferenceNozzleTip t = req != null ? referenceTip(req.id) : null;
+            if (t != null) {
+                noz = nozzleWithTip(t);
+            }
+            if (noz == null && req != null && req.nozzleId != null) {
+                Head head = machine.getDefaultHead();
+                HeadMountable hm = resolveNozzleTool(head, req.nozzleId);
+                if (hm instanceof ReferenceNozzle) {
+                    noz = (ReferenceNozzle) hm;
+                }
+            }
+            if (noz == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"tip is not loaded on any nozzle\"}");
+                return;
+            }
+            final ReferenceNozzle fnoz = noz;
+            machine.submit(() -> {
+                fnoz.unloadNozzleTip();
                 return null;
             }, broadcastCallback());
             ctx.result("{\"submitted\":true}");
@@ -2299,6 +2900,11 @@ public class ViperServer {
     private static class TestRequest {
         String feederId;
         String nozzleId;
+        /** Align: leave the part over the bottom camera (skip the safe-Z retreat)
+         *  so the pipeline can be tuned with the real part in view. */
+        boolean hold;
+        /** Place: the Z height to place at (mm, machine coords). */
+        Double z;
     }
 
     private static Feeder findFeederById(String id) {
@@ -2341,6 +2947,8 @@ public class ViperServer {
                 ctx.result("{\"error\":\"feeder has no part assigned\"}");
                 return;
             }
+            // A new pick invalidates any previous bench-align result.
+            lastTestAlign.remove(nozzle.getId());
             if (nozzle.getNozzleTip() == null) {
                 ctx.status(409);
                 ctx.result("{\"error\":\"nozzle " + nozzle.getName()
@@ -2431,6 +3039,7 @@ public class ViperServer {
                         + " — pick one first\"}");
                 return;
             }
+            final boolean hold = req != null && req.hold;
             machine.submit(() -> {
                 ReferenceBottomVision bv = ReferenceBottomVision.getDefault();
                 if (bv == null) {
@@ -2440,7 +3049,12 @@ public class ViperServer {
                 dummy.setLocation(new Location(LengthUnit.Millimeters, 0, 0, 0, 0));
                 org.openpnp.spi.PartAlignment.PartAlignmentOffset off =
                         bv.findOffsets(part, null, dummy, nozzle);
-                nozzle.moveToSafeZ();
+                // Remember for /api/test/place, so the bench can complete a
+                // full pick -> align -> place cycle with the job's correction.
+                lastTestAlign.put(nozzle.getId(), off);
+                if (!hold) {
+                    nozzle.moveToSafeZ();
+                }
                 Location l = off.getLocation().convertToUnits(LengthUnit.Millimeters);
                 Map<String, Object> ev = new LinkedHashMap<>();
                 ev.put("event", "alignTest");
@@ -2451,6 +3065,134 @@ public class ViperServer {
                 ev.put("rotation", round(l.getRotation()));
                 ev.put("preRotated", off.getPreRotated());
                 broadcast(GSON.toJson(ev));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * The last bench-align result per nozzle id, so /api/test/place can apply
+     * the same correction a job would. Cleared on pick/discard.
+     */
+    private static final Map<String, org.openpnp.spi.PartAlignment.PartAlignmentOffset>
+            lastTestAlign = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * POST /api/test/place — place the part on the nozzle at the TOP camera's
+     * current X/Y (jog the camera to the target first), at the given Z, applying
+     * the last bench-align offsets exactly like a job placement would. This is
+     * the single-placement test: pick, align, jog camera to a mark, place, then
+     * measure how far the part landed from the crosshair. Body: {nozzleId, z}.
+     */
+    private static void testPlace(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            TestRequest req = GSON.fromJson(ctx.body(), TestRequest.class);
+            final Nozzle nozzle = req != null ? nozzleByIdOrName(req.nozzleId) : null;
+            if (nozzle == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            if (nozzle.getPart() == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no part on nozzle " + nozzle.getName()
+                        + " — pick one first\"}");
+                return;
+            }
+            if (req.z == null) {
+                ctx.status(400);
+                ctx.result("{\"error\":\"z (place height, mm) required\"}");
+                return;
+            }
+            final double placeZ = req.z;
+            machine.submit(() -> {
+                Camera cam = machine.getDefaultHead().getDefaultCamera();
+                Location target = cam.getLocation().convertToUnits(LengthUnit.Millimeters)
+                        .derive(null, null, placeZ, 0.0);
+                org.openpnp.spi.PartAlignment.PartAlignmentOffset off =
+                        lastTestAlign.remove(nozzle.getId());
+                if (off != null) {
+                    // Same math as the job's getPlacementLocation.
+                    if (off.getPreRotated()) {
+                        target = target.subtractWithRotation(off.getLocation());
+                    }
+                    else {
+                        Location ao = off.getLocation();
+                        Location l = new Location(LengthUnit.Millimeters)
+                                .rotateXyCenterPoint(ao, target.getRotation() - ao.getRotation());
+                        l = l.derive(null, null, null, target.getRotation() - ao.getRotation());
+                        l = l.add(target);
+                        l = l.subtract(ao);
+                        target = l.derive(null, null, placeZ, null);
+                    }
+                }
+                MovableUtils.moveToLocationAtSafeZ(nozzle, target);
+                nozzle.place();
+                nozzle.moveToSafeZ();
+                Map<String, Object> ev = new LinkedHashMap<>();
+                ev.put("event", "testPlace");
+                ev.put("nozzle", nozzle.getName());
+                ev.put("x", round(target.getX()));
+                ev.put("y", round(target.getY()));
+                ev.put("z", round(placeZ));
+                ev.put("aligned", off != null);
+                broadcast(GSON.toJson(ev));
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/test/hold — move the part on the nozzle over the bottom camera
+     * and hold it there (no detection, no safe-Z retreat), so the bottom-vision
+     * pipeline can be tuned with the real part in view. Body: {nozzleId}.
+     */
+    private static void testHold(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            TestRequest req = GSON.fromJson(ctx.body(), TestRequest.class);
+            final Nozzle nozzle = req != null ? nozzleByIdOrName(req.nozzleId) : null;
+            if (nozzle == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"nozzle not found\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            if (nozzle.getPart() == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"no part on nozzle " + nozzle.getName()
+                        + " — pick one first\"}");
+                return;
+            }
+            machine.submit(() -> {
+                Camera camera = VisionUtils.getBottomVisionCamera();
+                if (camera == null) {
+                    throw new Exception("No bottom vision camera configured.");
+                }
+                // Position the nozzle so the part sits centered over the bottom
+                // camera (the same target bottom vision uses), and hold there.
+                Location target = camera.getLocation(nozzle);
+                MovableUtils.moveToLocationAtSafeZ(nozzle, target);
                 return null;
             }, broadcastCallback());
             ctx.result("{\"submitted\":true}");
@@ -2480,6 +3222,7 @@ public class ViperServer {
                 ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
                 return;
             }
+            lastTestAlign.remove(nozzle.getId());
             machine.submit(() -> {
                 org.openpnp.util.Cycles.discard(nozzle);
                 Map<String, Object> ev = new LinkedHashMap<>();
@@ -2521,6 +3264,14 @@ public class ViperServer {
             }
             if (req.maxAngularOffset != null) {
                 bv.setMaxAngularOffset(req.maxAngularOffset);
+            }
+            if (req.calExposure != null) {
+                calExposure = req.calExposure;
+                saveViperState();
+            }
+            if (req.calExposureEnabled != null) {
+                calExposureEnabled = req.calExposureEnabled;
+                saveViperState();
             }
             markDirty();
             ctx.result(GSON.toJson(describeNozzles()));
@@ -2966,7 +3717,12 @@ public class ViperServer {
                 return;
             }
             boolean secondary = fidIsSecondary(req);
-            Nozzle n = machine.getDefaultHead().getDefaultNozzle();
+            // Honor the selected nozzle (N1/N2) so Z touch-off uses the nozzle the
+            // user picked, not always the default.
+            Nozzle n = req != null ? nozzleByIdOrName(req.nozzleId) : null;
+            if (n == null) {
+                n = machine.getDefaultHead().getDefaultNozzle();
+            }
             Location nz = n.getLocation().convertToUnits(LengthUnit.Millimeters);
             Location old = fidLocation(head, secondary).convertToUnits(LengthUnit.Millimeters);
             Location nw = new Location(LengthUnit.Millimeters, old.getX(), old.getY(),
@@ -3092,6 +3848,14 @@ public class ViperServer {
                     ? round(((ReferenceCamera) c).getRotation()) : 0);
             m.put("light", c.getLightActuator() != null ? c.getLightActuator().getName() : null);
             m.put("lightId", c.getLightActuator() != null ? c.getLightActuator().getId() : null);
+            // Machine (up-looking) cameras: their position, teachable like any
+            // other location (X/Y via the top camera; Z stays the focal plane).
+            if ("Machine".equals(mount) && c instanceof ReferenceCamera) {
+                Location loc = ((ReferenceCamera) c).getHeadOffsets();
+                if (loc != null) {
+                    m.put("location", locMap(loc.convertToUnits(LengthUnit.Millimeters)));
+                }
+            }
             if (c instanceof OpenPnpCaptureCamera) {
                 OpenPnpCaptureCamera oc = (OpenPnpCaptureCamera) c;
                 boolean bound = oc.getDevice() != null;
@@ -3179,6 +3943,109 @@ public class ViperServer {
             // ignore
         }
         return null;
+    }
+
+    /** Every OpenPnpCaptureCamera on the machine (machine-level + per-head). */
+    private static List<OpenPnpCaptureCamera> allCaptureCameras() {
+        List<OpenPnpCaptureCamera> out = new ArrayList<>();
+        for (Camera c : machine.getCameras()) {
+            if (c instanceof OpenPnpCaptureCamera) {
+                out.add((OpenPnpCaptureCamera) c);
+            }
+        }
+        try {
+            for (Head h : machine.getHeads()) {
+                for (Camera c : h.getCameras()) {
+                    if (c instanceof OpenPnpCaptureCamera) {
+                        out.add((OpenPnpCaptureCamera) c);
+                    }
+                }
+            }
+        }
+        catch (Exception e) {
+            // ignore
+        }
+        return out;
+    }
+
+    /**
+     * Replace a camera's native capture context with a fresh one — forcing a USB
+     * re-scan so a device reconnected after startup is finally seen — then null
+     * its resolved device/format so open() re-resolves them from the persisted
+     * uniqueId/formatId and reopens the stream. This is what a backend restart
+     * does for cameras, without the restart.
+     */
+    private static void reenumerateCamera(OpenPnpCaptureCamera oc) throws Exception {
+        try {
+            oc.close();
+        }
+        catch (Exception e) {
+            // ignore — we're rebuilding it anyway
+        }
+        java.lang.reflect.Field capF = OpenPnpCaptureCamera.class.getDeclaredField("capture");
+        capF.setAccessible(true);
+        capF.set(oc, new org.openpnp.capture.OpenPnpCapture());
+        for (String fn : new String[] {"device", "format"}) {
+            java.lang.reflect.Field f = OpenPnpCaptureCamera.class.getDeclaredField(fn);
+            f.setAccessible(true);
+            f.set(oc, null);
+        }
+        oc.open();
+    }
+
+    /**
+     * POST /api/devices/reenumerate — force a fresh USB scan in-process: rebuild
+     * every camera's capture context (so cameras reconnected after startup are
+     * seen), rebind by name, and reconnect the machine serial if it dropped.
+     * Avoids a full backend restart after a USB replug.
+     */
+    private static void reenumerateDevices(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            if (jobRunning) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"can't re-enumerate while a job is running\"}");
+                return;
+            }
+            List<String> cams = new ArrayList<>();
+            List<String> failed = new ArrayList<>();
+            for (OpenPnpCaptureCamera oc : allCaptureCameras()) {
+                try {
+                    reenumerateCamera(oc);
+                    cams.add(oc.getName());
+                }
+                catch (Exception e) {
+                    failed.add(oc.getName() + ": "
+                            + (e.getMessage() != null ? e.getMessage() : e.toString()));
+                }
+            }
+            List<Map<String, Object>> bind = autoBindCameras();
+            // Reconnect the machine serial only if it dropped — don't disturb a
+            // working connection (which would force a re-home).
+            String machineMsg;
+            try {
+                if (!machine.isEnabled()) {
+                    machine.setEnabled(true);
+                }
+                machineMsg = machine.isEnabled() ? "connected" : "not connected";
+            }
+            catch (Exception e) {
+                machineMsg = "connect failed: "
+                        + (e.getMessage() != null ? e.getMessage() : e.toString());
+            }
+            markDirty();
+            Map<String, Object> root = new LinkedHashMap<>();
+            root.put("cameras", cams);
+            root.put("failed", failed);
+            root.put("bind", bind);
+            root.put("machine", machineMsg);
+            root.put("machineEnabled", machine.isEnabled());
+            ctx.result(GSON.toJson(root));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
     }
 
     /** GET /api/cameras/devices — enumerate host capture devices (webcams). */
@@ -3694,6 +4561,206 @@ public class ViperServer {
     }
 
     /** The named capture-property holder on a camera, or null. */
+    /** JSON body for the bottom-camera position endpoints. */
+    private static class BottomCamRequest {
+        String tool; // "camera" | nozzle id/name | null (default nozzle)
+        Double x;
+        Double y;
+        Double z;
+    }
+
+    /** The bottom (up-looking) ReferenceCamera, or null. */
+    private static ReferenceCamera bottomRefCamera() {
+        try {
+            Camera c = VisionUtils.getBottomVisionCamera();
+            return c instanceof ReferenceCamera ? (ReferenceCamera) c : null;
+        }
+        catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * POST /api/camera/bottom/go — move a tool over the bottom camera's stored
+     * position. Camera tool: the TOP camera flies there at safe Z (to eyeball /
+     * teach the position). Nozzle tool: X/Y only — the nozzle's Z is left
+     * exactly where it is (never descends toward the camera). Body: {tool}.
+     */
+    private static void bottomCamGo(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            BottomCamRequest req = GSON.fromJson(ctx.body(), BottomCamRequest.class);
+            ReferenceCamera bc = bottomRefCamera();
+            if (bc == null || bc.getHeadOffsets() == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"no bottom camera position configured\"}");
+                return;
+            }
+            if (!machine.isEnabled() || !machine.isHomed()) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"machine must be enabled and homed first\"}");
+                return;
+            }
+            final Location camLoc = bc.getHeadOffsets().convertToUnits(LengthUnit.Millimeters);
+            final boolean cameraTool = req == null || isCameraTool(req.tool);
+            final Head head = machine.getDefaultHead();
+            final HeadMountable hm;
+            if (cameraTool) {
+                hm = head.getDefaultCamera();
+            }
+            else {
+                HeadMountable found = resolveNozzleTool(head, req.tool);
+                if (found == null) {
+                    ctx.status(404);
+                    ctx.result("{\"error\":\"nozzle not found\"}");
+                    return;
+                }
+                hm = found;
+            }
+            machine.submit(() -> {
+                if (cameraTool) {
+                    MovableUtils.moveToLocationAtSafeZ(hm,
+                            camLoc.derive(null, null, null, 0.0));
+                }
+                else {
+                    // Nozzle: X/Y only — hold the current Z and rotation.
+                    Location cur = hm.getLocation().convertToUnits(LengthUnit.Millimeters);
+                    hm.moveTo(cur.derive(camLoc.getX(), camLoc.getY(), null, null),
+                            MotionOption.JogMotion);
+                }
+                return null;
+            }, broadcastCallback());
+            ctx.result("{\"submitted\":true}");
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * POST /api/camera/bottom/capture — set the bottom camera's X/Y from a
+     * tool's current position. Camera tool: jog the TOP camera over the bottom
+     * lens first (rough teach). Nozzle tool: jog the nozzle tip until the
+     * BOTTOM camera sees it dead-center, then capture — this anchors the
+     * position to the camera's own optical axis (the canonical calibration;
+     * residual nozzle-offset error cancels through the align chain). Z and
+     * rotation are always preserved. Body: {tool}.
+     */
+    private static void bottomCamCapture(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            BottomCamRequest req = GSON.fromJson(ctx.body(), BottomCamRequest.class);
+            ReferenceCamera bc = bottomRefCamera();
+            if (bc == null || bc.getHeadOffsets() == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"no bottom camera position configured\"}");
+                return;
+            }
+            Head head = machine.getDefaultHead();
+            boolean cameraTool = req == null || isCameraTool(req.tool);
+            HeadMountable src = cameraTool
+                    ? head.getDefaultCamera()
+                    : resolveNozzleTool(head, req.tool);
+            if (src == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"tool not found\"}");
+                return;
+            }
+            Location cur = src.getLocation().convertToUnits(LengthUnit.Millimeters);
+            Location old = bc.getHeadOffsets().convertToUnits(LengthUnit.Millimeters);
+            bc.setHeadOffsets(old.derive(cur.getX(), cur.getY(), null, null));
+            markDirty();
+            ctx.result(GSON.toJson(describeCameras()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** POST /api/camera/bottom/location — edit the position directly. Body: {x?,y?,z?}. */
+    private static void bottomCamLocation(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            BottomCamRequest req = GSON.fromJson(ctx.body(), BottomCamRequest.class);
+            ReferenceCamera bc = bottomRefCamera();
+            if (bc == null || bc.getHeadOffsets() == null || req == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"no bottom camera position configured\"}");
+                return;
+            }
+            Location old = bc.getHeadOffsets().convertToUnits(LengthUnit.Millimeters);
+            bc.setHeadOffsets(old.derive(req.x, req.y, req.z, null));
+            markDirty();
+            ctx.result(GSON.toJson(describeCameras()));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /** The bottom camera's exposure property, or null if unavailable. */
+    private static OpenPnpCaptureCamera.CapturePropertyHolder bottomExposureProp() {
+        try {
+            Camera c = VisionUtils.getBottomVisionCamera();
+            if (c instanceof OpenPnpCaptureCamera) {
+                return captureProp((OpenPnpCaptureCamera) c, "exposure");
+            }
+        }
+        catch (Exception ignore) {
+            // no bottom capture camera — cal runs with whatever exposure is set
+        }
+        return null;
+    }
+
+    /**
+     * Switch the bottom camera to the dedicated runout-calibration exposure.
+     * Called by ReferenceNozzleTipCalibration.calibrate() itself, so EVERY
+     * calibration path (manual, post-home, and the job processor's mid-job
+     * recalibration) runs at the cal exposure and part vision keeps its own.
+     * Returns a token for {@link #endCalExposure}, or null when disabled.
+     */
+    public static int[] beginCalExposure() {
+        Double exp = calExposureEnabled ? calExposure : null;
+        if (exp == null) {
+            return null;
+        }
+        OpenPnpCaptureCamera.CapturePropertyHolder h = bottomExposureProp();
+        if (h == null) {
+            return null;
+        }
+        try {
+            int prevVal = h.getValue();
+            int prevAuto = h.isAuto() ? 1 : 0;
+            h.setAuto(false);
+            h.setValue((int) Math.round(exp));
+            return new int[] {prevVal, prevAuto};
+        }
+        catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Restore the part-vision exposure captured by {@link #beginCalExposure}. */
+    public static void endCalExposure(int[] token) {
+        if (token == null) {
+            return;
+        }
+        OpenPnpCaptureCamera.CapturePropertyHolder h = bottomExposureProp();
+        if (h == null) {
+            return;
+        }
+        try {
+            h.setAuto(token[1] != 0);
+            h.setValue(token[0]);
+        }
+        catch (Exception ignore) {
+            // restoring exposure is best-effort
+        }
+    }
+
     private static OpenPnpCaptureCamera.CapturePropertyHolder captureProp(
             OpenPnpCaptureCamera c, String name) {
         switch (name == null ? "" : name.toLowerCase()) {
@@ -3821,6 +4888,64 @@ public class ViperServer {
     }
 
     /** GET /api/vision/settings — the configured vision settings (pipelines). */
+    /**
+     * POST /api/vision/bottom/reset-pipeline — reset the default bottom-vision
+     * pipeline to OpenPnP's stock footprint-masked pipeline. The old default
+     * used a fixed rectangle mask + MinAreaRect, so it grabbed the largest
+     * bright blob anywhere in view (e.g. a stray streak) instead of the part.
+     * The stock pipeline sizes a MaskCircle from each part's footprint and
+     * centers detection, so every part is masked to its own footprint.
+     */
+    private static void resetBottomPipeline(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            AbstractVisionSettings stock = Configuration.get()
+                    .getVisionSettings(AbstractVisionSettings.STOCK_BOTTOM_ID);
+            ReferenceBottomVision bv = ReferenceBottomVision.getDefault();
+            BottomVisionSettings def = bv != null ? bv.getBottomVisionSettings() : null;
+            if (stock == null || def == null || stock.getPipeline() == null) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"stock or default bottom-vision settings unavailable\"}");
+                return;
+            }
+            // Share the stock pipeline reference exactly like OpenPnP's own reset
+            // (ReferenceBottomVision line ~880). Do NOT clone()/toXmlString() here:
+            // both call resetToDefaults(), which evaluates mm->px ParameterNumeric
+            // stages needing a live camera and NPEs when disconnected. Config save
+            // serializes via Simple-XML (no resetToDefaults), so this persists —
+            // and on reload the two settings become independent copies.
+            def.setPipeline(stock.getPipeline());
+            // The footprint mask only builds if the bottom camera has a roaming
+            // radius set — otherwise OpenPnP reports NoCameraRoaming and falls
+            // back to a maskless single shot. Set a safe default if unset. This
+            // is best-effort: never let a camera hiccup fail the pipeline reset.
+            double roamMm = 0;
+            try {
+                Camera bcam = VisionUtils.getBottomVisionCamera();
+                if (bcam instanceof AbstractCamera
+                        && !bcam.getRoamingRadius().isInitialized()) {
+                    ((AbstractCamera) bcam).setRoamingRadius(
+                            new Length(7.0, LengthUnit.Millimeters));
+                    roamMm = 7.0;
+                }
+            }
+            catch (Exception ignore) {
+                // roaming radius is best-effort; the pipeline reset still stands
+            }
+            Configuration.get().save();
+            configDirty = false;
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("ok", true);
+            m.put("stages", def.getPipeline().getStages().size());
+            m.put("roamingRadiusMm", round(roamMm));
+            ctx.result(GSON.toJson(m));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
     private static void listVisionSettings(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         List<Map<String, Object>> out = new ArrayList<>();
@@ -4989,6 +6114,67 @@ public class ViperServer {
      * placements) are pushed over the WebSocket. The processor runs on the machine
      * task thread; next() drives motion directly there.
      */
+    /**
+     * POST /api/job/board/placed/reset — clear the placed-status for every
+     * placement on a board location (start a fresh physical board). Saves the
+     * job immediately so the reset survives a restart. Body: {file, uid}.
+     */
+    private static void resetPlacedStatus(io.javalin.http.Context ctx) {
+        ctx.contentType("application/json");
+        try {
+            JobBoardRequest req = GSON.fromJson(ctx.body(), JobBoardRequest.class);
+            Job j = req != null ? findJob(req.file) : null;
+            BoardLocation bl = findBoardLoc(j, req != null ? req.uid : null);
+            if (j == null || bl == null) {
+                ctx.status(404);
+                ctx.result("{\"error\":\"board location not found\"}");
+                return;
+            }
+            if (jobRunning) {
+                ctx.status(409);
+                ctx.result("{\"error\":\"can't reset placed status while a job is running\"}");
+                return;
+            }
+            int n = 0;
+            for (Placement p : bl.getBoard().getPlacements()) {
+                if (j.retrievePlacedStatus(bl, p.getId())) {
+                    j.removePlacedStatus(bl, p.getId());
+                    n++;
+                }
+            }
+            j.setDirty(true);
+            savePlacedProgress(j);
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("ok", true);
+            m.put("cleared", n);
+            ctx.result(GSON.toJson(m));
+        }
+        catch (Exception e) {
+            ctx.status(500);
+            ctx.result(GSON.toJson(errorMap(e)));
+        }
+    }
+
+    /**
+     * Persist the job's placed-status to disk if a processor step changed it
+     * (storePlacedStatus marks the job dirty). Called after every job step so a
+     * crash, power cut, or backend restart mid-run can't lose the record of
+     * what's already on the board — the guard against double-placing. Best
+     * effort: a save hiccup must not abort a running job.
+     */
+    private static void savePlacedProgress(Job job) {
+        try {
+            if (job != null && job.isDirty() && job.getFile() != null) {
+                Configuration.get().saveJob(job, job.getFile());
+                job.setDirty(false);
+            }
+        }
+        catch (Exception e) {
+            // stderr lands in viper-server.err.log
+            System.err.println("[viper] could not persist job placed-status: " + e);
+        }
+    }
+
     private static void runJob(io.javalin.http.Context ctx) {
         ctx.contentType("application/json");
         try {
@@ -5028,12 +6214,15 @@ public class ViperServer {
                 try {
                     while (jobRunning && jp.next()) {
                         // next() advances one step and drives its own motion.
+                        // Persist placed-status as soon as a step records it.
+                        savePlacedProgress(job);
                     }
                 }
                 catch (Exception e) {
                     error = e.getMessage() != null ? e.getMessage() : e.toString();
                 }
                 finally {
+                    savePlacedProgress(job);
                     jobRunning = false;
                     jp.removeTextStatusListener(tsl);
                     broadcast(GSON.toJson(jobEvent("jobComplete", "Job complete",
@@ -5093,6 +6282,7 @@ public class ViperServer {
                     more = false;
                     broadcast(GSON.toJson(errorMap(e)));
                 }
+                savePlacedProgress(job);
                 if (!more) {
                     endStepping(job);
                 }
@@ -5160,6 +6350,36 @@ public class ViperServer {
      * ones skipped during the run (feeder faults, alignment failures, etc.).
      */
     private static List<Map<String, Object>> collectSkipped(Job job) {
+        // Per-placement reasons from the processor's last run: Errored carries
+        // the real exception (feed failure, vision reject, vacuum check...).
+        Map<String, String> reasons = new LinkedHashMap<>();
+        try {
+            if (jobProcessor instanceof ReferencePnpJobProcessor) {
+                for (PnpJobProcessor.JobPlacement jp
+                        : ((ReferencePnpJobProcessor) jobProcessor).getJobPlacementResults()) {
+                    String key = jp.getBoardLocation().getUniqueId()
+                            + "|" + jp.getPlacement().getId();
+                    String reason = null;
+                    if (jp.getStatus() == PnpJobProcessor.JobPlacement.Status.Errored) {
+                        Exception err = jp.getError();
+                        reason = err != null && err.getMessage() != null
+                                ? err.getMessage() : "errored (no detail)";
+                    }
+                    else if (jp.getStatus() == PnpJobProcessor.JobPlacement.Status.Pending) {
+                        reason = "never attempted — job ended (or was aborted) first";
+                    }
+                    else if (jp.getStatus() == PnpJobProcessor.JobPlacement.Status.Processing) {
+                        reason = "interrupted mid-placement";
+                    }
+                    if (reason != null) {
+                        reasons.put(key, reason);
+                    }
+                }
+            }
+        }
+        catch (Exception ignore) {
+            // reasons are best-effort; the skipped list itself must always work
+        }
         List<Map<String, Object>> out = new ArrayList<>();
         for (BoardLocation bl : job.getBoardLocations()) {
             for (Placement p : bl.getBoard().getPlacements()) {
@@ -5171,6 +6391,9 @@ public class ViperServer {
                     m.put("id", p.getId());
                     m.put("part", p.getPart() != null ? p.getPart().getId() : null);
                     m.put("board", bl.getBoard().getName());
+                    m.put("reason", reasons.getOrDefault(
+                            bl.getUniqueId() + "|" + p.getId(),
+                            "not planned — check the part has an enabled feeder and a compatible nozzle tip"));
                     out.add(m);
                 }
             }
@@ -5617,10 +6840,11 @@ public class ViperServer {
             return;
         }
         final Location target = bl.getLocation();
-        final boolean nozzle = "nozzle".equalsIgnoreCase(req.tool);
+        final String tool = req.tool;
         machine.submit(() -> {
             Head head = machine.getDefaultHead();
-            HeadMountable hm = nozzle ? head.getDefaultNozzle() : head.getDefaultCamera();
+            HeadMountable hm = isCameraTool(tool) ? head.getDefaultCamera()
+                    : resolveNozzleTool(head, tool);
             MovableUtils.moveToLocationAtSafeZ(hm, target);
             return null;
         }, broadcastCallback());
@@ -5727,8 +6951,9 @@ public class ViperServer {
                 return;
             }
             Head head = machine.getDefaultHead();
-            boolean nozzle = "nozzle".equalsIgnoreCase(req.tool);
-            HeadMountable hm = nozzle ? head.getDefaultNozzle() : head.getDefaultCamera();
+            boolean nozzle = !isCameraTool(req.tool);
+            HeadMountable hm = nozzle ? resolveNozzleTool(head, req.tool)
+                    : head.getDefaultCamera();
             Location cur = hm.getLocation().convertToUnits(LengthUnit.Millimeters);
             Location prior = bl.getLocation() != null
                     ? bl.getLocation().convertToUnits(LengthUnit.Millimeters)
@@ -5796,12 +7021,33 @@ public class ViperServer {
             if (p.getPart() == null) {
                 return "No part";
             }
+            if (!hasEnabledFeeder(p.getPart())) {
+                return "No feeder";
+            }
             if (p.getPart().getHeight() == null
                     || p.getPart().getHeight().getValue() == 0) {
                 return "No height";
             }
         }
         return "Ready";
+    }
+
+    /**
+     * True when at least one enabled feeder currently holds this part. Mirrors
+     * OpenPnP's JobPlacementsPanel/PlacementsHolderPlacementsTableModel
+     * MissingFeeder check: an enabled feeder whose part is this part. Does not
+     * probe the bus for Photon presence; matches OpenPnP's static status.
+     */
+    private static boolean hasEnabledFeeder(Part part) {
+        if (machine == null || part == null) {
+            return false;
+        }
+        for (Feeder feeder : machine.getFeeders()) {
+            if (feeder.isEnabled() && feeder.getPart() == part) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** JSON body for job board-location endpoints. */
@@ -6239,6 +7485,17 @@ public class ViperServer {
             }
             if (req.enabled != null) {
                 f.setEnabled(req.enabled);
+                // Re-enabling a feeder whose part counter reads empty means the
+                // user physically reloaded it — reset the counter too. Otherwise
+                // the first feed throws "tray empty" and the job processor
+                // instantly auto-disables the feeder again (invisible-state trap).
+                if (req.enabled) {
+                    Integer fc = feederFeedCount(f);
+                    Integer cap = feederCapacity(f);
+                    if (fc != null && cap != null && fc >= cap) {
+                        setFeederFeedCount(f, 0);
+                    }
+                }
             }
             if (req.name != null && !req.name.trim().isEmpty()) {
                 f.setName(req.name.trim());
@@ -6445,6 +7702,7 @@ public class ViperServer {
             // a part repeatedly without advancing the tape (Disable), then set
             // back to Normal. Also drives whether Recycle/take-back is available.
             ph.put("feedOption", pf.getFeedOptions().name());
+            ph.put("peelTimeMsPerTenth", pf.getPeelTimeMsPerTenth());
             m.put("photon", ph);
             m.put("editableLocation", false);
         }
@@ -6686,6 +7944,10 @@ public class ViperServer {
                 }
                 pf.getSlot().setLocation(loc(req.slotLocation));
             }
+            if (req.peelTimeMsPerTenth != null) {
+                pf.setPeelTimeMsPerTenth(req.peelTimeMsPerTenth);
+            }
+            markDirty();
             ctx.result(GSON.toJson(feederConfig(f)));
         }
         catch (Exception e) {
@@ -7537,10 +8799,11 @@ public class ViperServer {
             ctx.result("{\"error\":\"location not set for target '" + tgt + "'\"}");
             return;
         }
-        final boolean nozzle = "nozzle".equalsIgnoreCase(req.tool);
+        final String tool = req.tool;
         machine.submit(() -> {
             Head head = machine.getDefaultHead();
-            HeadMountable hm = nozzle ? head.getDefaultNozzle() : head.getDefaultCamera();
+            HeadMountable hm = isCameraTool(tool) ? head.getDefaultCamera()
+                    : resolveNozzleTool(head, tool);
             MovableUtils.moveToLocationAtSafeZ(hm, target);
             return null;
         }, broadcastCallback());
@@ -7564,14 +8827,18 @@ public class ViperServer {
                 return;
             }
             Head head = machine.getDefaultHead();
-            boolean nozzle = "nozzle".equalsIgnoreCase(req.tool);
-            HeadMountable hm = nozzle ? head.getDefaultNozzle() : head.getDefaultCamera();
+            boolean nozzle = !isCameraTool(req.tool);
+            HeadMountable hm = nozzle ? resolveNozzleTool(head, req.tool)
+                    : head.getDefaultCamera();
             Location cur = hm.getLocation().convertToUnits(LengthUnit.Millimeters);
             Location existing = namedLocation(f, req.target);
             Location prior = existing != null ? existing.convertToUnits(LengthUnit.Millimeters) : cur;
             double z = nozzle ? cur.getZ() : prior.getZ();
+            // Feeder rotation encodes how the part sits in the feeder — never
+            // inherit the tool's C axis, not even on a first-ever capture.
+            double rot = existing != null ? prior.getRotation() : 0.0;
             Location updated = new Location(LengthUnit.Millimeters, cur.getX(), cur.getY(), z,
-                    prior.getRotation());
+                    rot);
             if (!writeNamedLocation(f, req.target, updated)) {
                 ctx.status(400);
                 ctx.result("{\"error\":\"cannot capture into target '" + req.target
@@ -7898,6 +9165,8 @@ public class ViperServer {
         Integer slotAddress;
         LocDto offset;
         LocDto slotLocation;
+        /** Peel-motor ms per 0.1mm, pushed to feeder firmware (0 = firmware default). */
+        Integer peelTimeMsPerTenth;
     }
 
     /** JSON body for POST /api/feeder/strip. */

@@ -90,6 +90,7 @@ interface PhotonCfg {
   pickZ?: number;
   visionRef?: boolean;
   feedOption?: string;
+  peelTimeMsPerTenth?: number;
 }
 
 interface StripCfg {
@@ -238,6 +239,7 @@ interface CameraInfo {
   deviceName?: string | null;
   deviceUniqueId?: string | null;
   formatName?: string | null;
+  location?: { x: number; y: number; z: number; rotation: number } | null;
 }
 
 interface CaptureDeviceInfo {
@@ -260,6 +262,9 @@ interface NozzleInfo {
 interface NozzleTipInfo {
   id: string;
   name: string;
+  pickDwellMs?: number;
+  placeDwellMs?: number;
+  maxPickToleranceMm?: number;
   methodPartOn?: string;
   methodPartOff?: string;
   establishPartOnLevel?: boolean;
@@ -285,14 +290,49 @@ interface NozzleTipInfo {
   calZOffset?: number;
   calibrated?: boolean;
   loaded?: boolean;
+  // automatic tool-changer motion path (passive)
+  changer?: {
+    start: FeederLoc | null;
+    mid: FeederLoc | null;
+    mid2: FeederLoc | null;
+    end: FeederLoc | null;
+    startToMidSpeed: number;
+    midToMid2Speed: number;
+    mid2ToEndSpeed: number;
+    configured: boolean;
+  };
 }
 interface BottomVisionInfo {
   preRotate: boolean;
   maxVisionPasses: number;
   maxLinearOffset: number;
   maxAngularOffset: number;
+  calExposure?: number | null;
+  calExposureEnabled?: boolean;
 }
 const VAC_METHODS = ["None", "Absolute", "Difference"];
+const CHANGER_STEPS = [
+  {
+    which: "start",
+    label: "Start",
+    hint: "Safe approach point above the tip's slot, at travel Z.",
+  },
+  {
+    which: "mid",
+    label: "Mid",
+    hint: "First descent point, lined up over the slot.",
+  },
+  {
+    which: "mid2",
+    label: "Mid 2",
+    hint: "Engage point where the nozzle seats onto the tip.",
+  },
+  {
+    which: "end",
+    label: "End",
+    hint: "Final seated point, clear to lift the loaded tip away.",
+  },
+] as const;
 const RECAL_TRIGGERS = [
   "NozzleTipChange",
   "NozzleTipChangeInJob",
@@ -425,6 +465,12 @@ const MACHINE_CARDS: {
     ready: true,
   },
   {
+    id: "toolchanger",
+    title: "Tool Changer",
+    desc: "Automatic nozzle-tip change",
+    ready: true,
+  },
+  {
     id: "actuators",
     title: "Actuators & I/O",
     desc: "Vacuum, lights, valves",
@@ -449,12 +495,15 @@ function CameraFeed({
   id,
   w,
   className,
+  zoomable = true,
 }: {
   id: string;
   w: number;
   className: string;
+  zoomable?: boolean;
 }) {
   const [src, setSrc] = useState(`/api/camera/frame?id=${id}&w=${w}&t=0`);
+  const [zoom, setZoom] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const next = (delay: number) => {
     if (timer.current) clearTimeout(timer.current);
@@ -471,14 +520,32 @@ function CameraFeed({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, w]);
   return (
-    <img
-      className={className}
-      src={src}
-      alt=""
-      draggable={false}
-      onLoad={() => next(180)}
-      onError={() => next(1200)}
-    />
+    <>
+      <img
+        className={`${className}${zoomable ? " cam-zoomable" : ""}`}
+        src={src}
+        alt=""
+        draggable={false}
+        title={zoomable ? "Click to enlarge" : undefined}
+        onClick={zoomable ? () => setZoom(true) : undefined}
+        onLoad={() => next(180)}
+        onError={() => next(1200)}
+      />
+      {zoom && (
+        <div
+          className="cam-lightbox"
+          title="Click to close"
+          onClick={() => setZoom(false)}
+        >
+          <CameraFeed
+            id={id}
+            w={1280}
+            className="cam-lightbox-img"
+            zoomable={false}
+          />
+        </div>
+      )}
+    </>
   );
 }
 
@@ -616,6 +683,39 @@ function NumberInput({
   );
 }
 
+/** Substring filter box for a list tab (Parts / Feeders / Packages). */
+function ListSearch({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+}) {
+  return (
+    <div className="list-search">
+      <SearchIcon size={13} />
+      <input
+        className="plc-search-input"
+        placeholder={placeholder}
+        value={value}
+        onChange={(e) => onChange(e.currentTarget.value)}
+      />
+      {value && (
+        <button
+          className="list-search-clear"
+          onClick={() => onChange("")}
+          title="Clear search"
+          aria-label="Clear search"
+        >
+          ×
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** A 4-axis location editor with optional Go-to / Capture teach buttons. */
 function TeachLoc({
   label,
@@ -701,6 +801,15 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [step, setStep] = useState(1);
   const [speed, setSpeed] = useState(1);
+  // Jog mode: false = discrete step (one move per keypress), true = continuous
+  // (repeated moves while a direction key is held). heldKeyRef tracks the
+  // active continuous key so the paced loop knows when to stop (on keyup).
+  const [continuous, setContinuous] = useState(false);
+  // Continuous-jog feel knobs (sent to the backend streamer). Bigger segment /
+  // shorter pace = faster, at the cost of a longer coast when the key is let go.
+  const [jogSeg, setJogSeg] = useState(0.3);
+  const [jogPace, setJogPace] = useState(0);
+  const heldKeyRef = useRef<string | null>(null);
   const [importPath, setImportPath] = useState(
     "C:/dev/viperpnp/samples/kicad-example-F.Cu.pos",
   );
@@ -759,6 +868,21 @@ function App() {
     residual?: number;
     points?: number;
   } | null>(null);
+  // Multi-placement board location (OpenPnP's MultiPlacementBoardLocationProcess):
+  // pick 3+ ordinary placements, visit each, jog the camera to its true center and
+  // capture, then compute the board transform from the design->measured points.
+  const [mpbActive, setMpbActive] = useState(false);
+  const [mpbPhase, setMpbPhase] = useState<"select" | "walk" | "done">("select");
+  const [mpbSel, setMpbSel] = useState<string[]>([]);
+  const [mpbStep, setMpbStep] = useState(0);
+  const [mpbMeasured, setMpbMeasured] = useState<
+    Record<string, { x: number; y: number }>
+  >({});
+  const [mpbResult, setMpbResult] = useState<{
+    angle: number;
+    residual?: number;
+    points?: number;
+  } | null>(null);
   const [jobBoardsRefresh, setJobBoardsRefresh] = useState(0);
   const [selectedBoardUid, setSelectedBoardUid] = useState<string | null>(null);
   const [jobBoardPlc, setJobBoardPlc] = useState<JobPlacement[]>([]);
@@ -774,13 +898,18 @@ function App() {
   const [jobStatus, setJobStatus] = useState("");
   const [keepGoing, setKeepGoing] = useState(true);
   const [jobSkipped, setJobSkipped] = useState<
-    { id: string; part: string | null; board: string }[] | null
+    { id: string; part: string | null; board: string; reason?: string }[] | null
   >(null);
   const [jobAborted, setJobAborted] = useState(false);
   const [editPlacement, setEditPlacement] = useState<Placement | null>(null);
   const [partsDetail, setPartsDetail] = useState<PartInfo[]>([]);
   const [packages, setPackages] = useState<PackageInfo[]>([]);
   const [pkgMsg, setPkgMsg] = useState<string>("");
+  // Substring search on the Parts / Feeders / Packages tabs. Matches any run
+  // of characters anywhere in the name (parts are named inconsistently).
+  const [partSearch, setPartSearch] = useState("");
+  const [feederSearch, setFeederSearch] = useState("");
+  const [pkgSearch, setPkgSearch] = useState("");
   const [nozzleTips, setNozzleTips] = useState<NtInfo[]>([]);
   const [editPart, setEditPart] = useState<PartInfo | null>(null);
   const [partIsNew, setPartIsNew] = useState(false);
@@ -816,6 +945,10 @@ function App() {
   >([]);
   const [nozzles, setNozzles] = useState<NozzleInfo[]>([]);
   const [nzTips, setNzTips] = useState<NozzleTipInfo[]>([]);
+  // Tool-changer setup wizard: which tip is being taught, and the current step.
+  const [tcTip, setTcTip] = useState<string | null>(null);
+  const [tcStep, setTcStep] = useState(0);
+  const [tcMsg, setTcMsg] = useState("");
   const [nozzleActs, setNozzleActs] = useState<ActuatorOpt[]>([]);
   const [bottomVision, setBottomVision] = useState<BottomVisionInfo | null>(null);
   const [calibrating, setCalibrating] = useState<string | null>(null);
@@ -831,6 +964,21 @@ function App() {
   const [pickFeederId, setPickFeederId] = useState("");
   const [pickNozzleId, setPickNozzleId] = useState("");
   const [pickMsg, setPickMsg] = useState<string | null>(null);
+  // Keep the part parked over the bottom camera after Align (skip the safe-Z
+  // retreat) so the pipeline can be tuned with the real part in view.
+  const [pickHold, setPickHold] = useState(true);
+  // Sidebar camera pane enlarged view (keeps the crosshair overlay) — cam id.
+  const [zoomPane, setZoomPane] = useState<string | null>(null);
+  // Single-placement test: Z height for "Place @ camera" (part lands at the top
+  // camera's crosshair, corrected by the last bench Align).
+  const [placeZInput, setPlaceZInput] = useState<number>(() => {
+    const v = parseFloat(localStorage.getItem("viper.placeZ") ?? "");
+    return Number.isFinite(v) ? v : 1.6;
+  });
+  // Vacuum part-detect calibration: live reading + captured part-on/off levels.
+  const [vacReading, setVacReading] = useState<number | null>(null);
+  const [vacOn, setVacOn] = useState<number | null>(null);
+  const [vacOff, setVacOff] = useState<number | null>(null);
   const [axes, setAxes] = useState<AxisInfo[]>([]);
   const [general, setGeneral] = useState<GeneralInfo | null>(null);
   const [backups, setBackups] = useState<
@@ -1237,6 +1385,98 @@ function App() {
     }
   };
 
+  const openMpb = () => {
+    setMpbActive(true);
+    setMpbPhase("select");
+    setMpbSel([]);
+    setMpbMeasured({});
+    setMpbResult(null);
+    setMpbStep(0);
+  };
+  const closeMpb = () => setMpbActive(false);
+  const toggleMpbSel = (id: string) =>
+    setMpbSel((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  // Move the camera to a selected placement's expected (design) location.
+  const mpbGo = (step: number) => {
+    const id = mpbSel[step];
+    if (!id || !jobEditFile || !selectedBoardUid) return;
+    post("/api/job/board/align/go", {
+      file: jobEditFile,
+      uid: selectedBoardUid,
+      placementId: id,
+    });
+  };
+  const startMpbWalk = () => {
+    if (mpbSel.length < 2) {
+      setError("Pick at least 2 placements (3+ recommended).");
+      return;
+    }
+    setMpbMeasured({});
+    setMpbStep(0);
+    setMpbPhase("walk");
+    mpbGo(0);
+  };
+  const mpbCompute = async (measured: Record<string, { x: number; y: number }>) => {
+    if (!jobEditFile || !selectedBoardUid) return;
+    const points = Object.entries(measured).map(([placementId, p]) => ({
+      placementId,
+      x: p.x,
+      y: p.y,
+    }));
+    if (points.length < 2) {
+      setError("Capture at least 2 placements first.");
+      return;
+    }
+    try {
+      const res = await fetch("/api/job/board/align", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: jobEditFile, uid: selectedBoardUid, points }),
+      });
+      const d = await res.json();
+      if (!res.ok) {
+        setError(d.error ?? "Board location failed.");
+        return;
+      }
+      applyJobBoards(d);
+      loadJobs();
+      if (d.align) setMpbResult(d.align);
+      setMpbPhase("done");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  // Capture the current camera position as this placement's true center, then
+  // advance to the next (auto-moving the camera there); compute after the last.
+  const mpbCapture = async () => {
+    const id = mpbSel[mpbStep];
+    if (!id || !jobEditFile || !selectedBoardUid) return;
+    try {
+      const d = await (
+        await fetch("/api/job/board/align/capture", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            file: jobEditFile,
+            uid: selectedBoardUid,
+            placementId: id,
+          }),
+        })
+      ).json();
+      const measured = { ...mpbMeasured, [id]: { x: d.x, y: d.y } };
+      setMpbMeasured(measured);
+      if (mpbStep < mpbSel.length - 1) {
+        const next = mpbStep + 1;
+        setMpbStep(next);
+        mpbGo(next);
+      } else {
+        mpbCompute(measured);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const selectedBoard = jobBoards.find((b) => b.uid === selectedBoardUid) ?? null;
 
   const editJobPlacement = (id: string, patch: object) => {
@@ -1246,6 +1486,31 @@ function App() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ board: bf, id, ...patch }),
+    })
+      .then(() => loadJobPlacements(activeJobFile, selectedBoardUid))
+      .catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
+  };
+
+  // The Job-tab placements list after the search filter (shared by the table
+  // body and the enable-all header checkbox).
+  const filteredJobPlc = jobBoardPlc.filter((p) => {
+    const q = plcSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      p.id.toLowerCase().includes(q) ||
+      (p.part ?? "").toLowerCase().includes(q)
+    );
+  });
+
+  // Header checkbox: enable/disable every placement currently shown (respects
+  // the search filter, so a filtered search + toggle = bulk edit of the match).
+  const setAllJobPlacements = (ids: string[], enabled: boolean) => {
+    const bf = selectedBoard?.boardFile;
+    if (!bf || ids.length === 0) return;
+    fetch("/api/job/placement/batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ board: bf, ids, enabled }),
     })
       .then(() => loadJobPlacements(activeJobFile, selectedBoardUid))
       .catch((e) => setJobErr(e instanceof Error ? e.message : String(e)));
@@ -1476,6 +1741,31 @@ function App() {
     }
   };
 
+  const reenumerateDevices = async () => {
+    setCamReconnecting(true);
+    try {
+      const res = await fetch("/api/devices/reenumerate", { method: "POST" });
+      const d = await res.json();
+      if (!res.ok) {
+        setError(d.error ?? `re-enumerate failed (HTTP ${res.status})`);
+        return;
+      }
+      await loadCameras();
+      await loadCaptureDevices();
+      if (d.failed?.length) {
+        setError(
+          `Re-enumerate: ${d.failed.join("; ")} · machine ${d.machine}`,
+        );
+      } else {
+        setError(null);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCamReconnecting(false);
+    }
+  };
+
   const swapCameras = async () => {
     setCamReconnecting(true);
     try {
@@ -1500,6 +1790,47 @@ function App() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id, uniqueId }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.cameras) setCameras(d.cameras);
+        else if (d.error) setError(String(d.error));
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
+  // Bottom-camera position teach: Go (top camera or selected nozzle), Grab
+  // (top camera X/Y -> camera position), and direct field edits.
+  const bottomCamGo = (tool: "camera" | "nozzle") => {
+    post("/api/camera/bottom/go", {
+      tool: tool === "camera" ? "camera" : reference === "camera" ? "nozzle" : reference,
+    });
+  };
+  const bottomCamGrab = (tool: "camera" | "nozzle") => {
+    fetch("/api/camera/bottom/capture", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tool:
+          tool === "camera"
+            ? "camera"
+            : reference === "camera"
+              ? "nozzle"
+              : reference,
+      }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.cameras) setCameras(d.cameras);
+        else if (d.error) setError(String(d.error));
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+  const bottomCamSetLoc = (patch: { x?: number; y?: number; z?: number }) => {
+    fetch("/api/camera/bottom/location", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
     })
       .then((r) => r.json())
       .then((d) => {
@@ -1551,6 +1882,49 @@ function App() {
     if (d.bottomVision) setBottomVision(d.bottomVision);
   };
 
+  // Tool-changer teach/test. Uses the sidebar-selected nozzle (reference).
+  const changerMove = (id: string, which: string) =>
+    post("/api/nozzletip/changer/move", { id, which, tool: reference });
+  const changerCapture = async (id: string, which: string) => {
+    try {
+      const res = await fetch("/api/nozzletip/changer/capture", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, which, tool: reference }),
+      });
+      const d = await res.json();
+      if (!res.ok) {
+        setTcMsg(d.error ?? `capture failed (HTTP ${res.status})`);
+        return;
+      }
+      applyNozzleResp(d);
+      setTcMsg(`✓ captured ${which}. Save to keep.`);
+    } catch (e) {
+      setTcMsg(e instanceof Error ? e.message : String(e));
+    }
+  };
+  const changerSpeeds = (id: string, patch: object) => {
+    fetch("/api/nozzletip/changer/speeds", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, ...patch }),
+    })
+      .then((r) => r.json())
+      .then(applyNozzleResp)
+      .catch(() => {});
+  };
+  const loadTip = (id: string) => {
+    setTcMsg("Loading tip (running the changer path)…");
+    post("/api/nozzletip/load", {
+      id,
+      nozzleId: reference !== "camera" ? reference : undefined,
+    });
+  };
+  const unloadTip = (id: string) => {
+    setTcMsg("Unloading tip (running the changer path)…");
+    post("/api/nozzletip/unload", { id });
+  };
+
   const updateBottomVision = (patch: Partial<BottomVisionInfo>) => {
     fetch("/api/bottomvision", {
       method: "POST",
@@ -1562,14 +1936,24 @@ function App() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
 
-  const pickTest = (path: "pick" | "align" | "discard") => {
+  const pickTest = (path: "pick" | "align" | "discard" | "hold") => {
     setPickMsg(
-      path === "pick" ? "picking…" : path === "align" ? "aligning…" : "discarding…",
+      path === "pick"
+        ? "picking…"
+        : path === "align"
+          ? "aligning…"
+          : path === "hold"
+            ? "holding over camera…"
+            : "discarding…",
     );
     fetch(`/api/test/${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ feederId: pickFeederId, nozzleId: pickNozzleId }),
+      body: JSON.stringify({
+        feederId: pickFeederId,
+        nozzleId: pickNozzleId,
+        hold: path === "align" ? pickHold : undefined,
+      }),
     })
       .then(async (r) => {
         if (!r.ok) {
@@ -1581,6 +1965,107 @@ function App() {
         setPickMsg(null);
         setError(e instanceof Error ? e.message : String(e));
       });
+  };
+
+  const resetBottomVisionPipeline = async () => {
+    setPickMsg("resetting bottom-vision pipeline…");
+    try {
+      const r = await fetch("/api/vision/bottom/reset-pipeline", {
+        method: "POST",
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        setPickMsg(null);
+        setError(d.error ?? "reset failed");
+        return;
+      }
+      setPickMsg(
+        `✓ bottom vision reset to the footprint-masked pipeline (${d.stages} stages)` +
+          (d.roamingRadiusMm
+            ? ` — set bottom-camera roaming radius ${d.roamingRadiusMm}mm so the footprint mask can build`
+            : "") +
+          ". Every part now masks to its own footprint.",
+      );
+      fetch("/api/vision/settings")
+        .then((res) => res.json())
+        .then((d2) => setVisionSettings(d2.settings ?? []))
+        .catch(() => {});
+    } catch (e) {
+      setPickMsg(null);
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  // Set which nozzle tip is physically loaded on a nozzle (manual swap).
+  const setLoadedTip = (nozzleId: string, tipId: string) => {
+    if (!nozzleId) return;
+    fetch("/api/nozzle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: nozzleId, tipId }),
+    })
+      .then((r) => r.json())
+      .then(applyNozzleResp)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+  // Read the live vacuum sensor for a nozzle; optionally capture it as the
+  // part-on or part-off reference for threshold calibration.
+  const readVacuum = async (nozzleId: string, store?: "on" | "off") => {
+    if (!nozzleId) return;
+    try {
+      const r = await fetch("/api/vacuum/read", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // Part-off = bare nozzle, so pulse the valve to get the "vacuum on, no
+        // part" level. Part-on reads the part already held (valve already on).
+        body: JSON.stringify({ id: nozzleId, pulse: store === "off" }),
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        setError(d.error ?? "vacuum read failed");
+        return;
+      }
+      setVacReading(d.level);
+      if (store === "on") setVacOn(d.level);
+      if (store === "off") setVacOff(d.level);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  // Set the Absolute part-on window from the captured part-on/off levels. The
+  // sensor direction isn't fixed (a good seal can read higher OR lower than the
+  // bare-nozzle level), so build a window that contains part-on and excludes
+  // part-off, split at the midpoint.
+  const applyVacThresholds = (tipId: string) => {
+    if (vacOn == null || vacOff == null) {
+      setError(
+        "Capture both readings first: pick a part → Read → part on, then bare nozzle → Read → part off.",
+      );
+      return;
+    }
+    const mid = (vacOn + vacOff) / 2;
+    const margin = 8;
+    const low = Math.round(vacOn < vacOff ? vacOn - margin : mid);
+    const high = Math.round(vacOn < vacOff ? mid : vacOn + margin);
+    updateTip(tipId, {
+      methodPartOn: "Absolute",
+      vacuumLevelPartOnLow: low,
+      vacuumLevelPartOnHigh: high,
+    });
+  };
+
+  // Step through the feeders that have a part loaded, to run every part in turn.
+  const stepPart = (dir: 1 | -1) => {
+    const list = feeders.filter((f) => f.part);
+    if (list.length === 0) return;
+    const i = list.findIndex((f) => f.id === pickFeederId);
+    const next =
+      i < 0
+        ? dir === 1
+          ? 0
+          : list.length - 1
+        : (i + dir + list.length) % list.length;
+    setPickFeederId(list[next].id);
   };
 
   const nozzleOverFid = (nozzleId: string, which: "primary" | "secondary") => {
@@ -1786,6 +2271,13 @@ function App() {
     const body: Record<string, unknown> = { which: "secondary" };
     if (action === "locate") body.featureDiameterPx = fidPx;
     if (action === "nozzleGo") body.tool = "nozzle";
+    // Nozzle actions honor the sidebar-selected nozzle (N1/N2), not the default.
+    if (
+      (action === "nozzleGo" || action === "zFromNozzle") &&
+      reference !== "camera"
+    ) {
+      body.nozzleId = reference;
+    }
     fetch(`/api/head/fiducial/${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1819,7 +2311,7 @@ function App() {
       loadCameras();
       loadCaptureDevices();
     }
-    if (id === "nozzles") loadNozzles();
+    if (id === "nozzles" || id === "toolchanger") loadNozzles();
     if (id === "motion") loadAxes();
     if (id === "general") {
       loadGeneral();
@@ -1874,6 +2366,10 @@ function App() {
     if (tab === "jobs") {
       loadJobs();
       loadParts();
+      // Recompute placement status (backend recomputes per fetch), so "No
+      // feeder" clears as soon as you return to the Job tab after adding or
+      // enabling a feeder — matching OpenPnP's on-focus refresh.
+      setPlcRefresh((n) => n + 1);
     }
     if (tab === "parts") {
       loadParts();
@@ -1987,6 +2483,14 @@ function App() {
           setPickMsg(
             `✓ ${data.part}: offset X ${data.x} · Y ${data.y} · rotation ${data.rotation}°` +
               (data.preRotated ? " (pre-rotated)" : ""),
+          );
+        } else if (data && data.event === "testPlace") {
+          setPickMsg(
+            `✓ ${data.nozzle} placed at (${data.x}, ${data.y}, Z ${data.z})` +
+              (data.aligned
+                ? " with the Align correction applied"
+                : " — NO align correction (run Align between Pick and Place)") +
+              ". Jog the camera over it and measure the landing against the crosshair.",
           );
         } else if (data && data.event === "testDiscard") {
           setPickMsg(`✓ ${data.nozzle} discarded the part`);
@@ -2227,19 +2731,22 @@ function App() {
   const home = () => post("/api/machine/home");
   const park = (axes: "all" | "z" | "c" = "all") =>
     post("/api/machine/park", { axes, tool: reference });
-  const cameraToNozzle = () => post("/api/machine/camera-to-nozzle");
-  const nozzleToCamera = () => post("/api/machine/nozzle-to-camera");
+  const cameraToNozzle = () =>
+    post("/api/machine/camera-to-nozzle", { tool: reference });
+  const nozzleToCamera = () =>
+    post("/api/machine/nozzle-to-camera", { tool: reference });
   const toggleIo = (target: keyof IoState, on: boolean) =>
     post("/api/io", { target, on });
-  const jog = (ax: "x" | "y" | "z" | "c", dir: 1 | -1) => {
+  const jog = (ax: "x" | "y" | "z" | "c", dir: 1 | -1, wait = false) => {
     const d = dir * step;
-    post("/api/jog", {
+    return post("/api/jog", {
       dx: ax === "x" ? d : 0,
       dy: ax === "y" ? d : 0,
       dz: ax === "z" ? d : 0,
       dc: ax === "c" ? d : 0,
       speed,
       tool: reference,
+      wait,
     });
   };
 
@@ -2808,6 +3315,7 @@ function App() {
       slotAddress: p.slotAddress,
       offset: p.offset ?? undefined,
       slotLocation: p.slotLocation ?? undefined,
+      peelTimeMsPerTenth: p.peelTimeMsPerTenth ?? 0,
     });
   };
 
@@ -2978,9 +3486,18 @@ function App() {
       });
   };
 
+  // Resolve a teach "nozzle" action to the SELECTED nozzle so go/grab honors the
+  // sidebar tool choice (N1 vs N2) instead of always using the default nozzle.
+  const teachTool = (t: TeachTool): string =>
+    t === "nozzle" && reference !== "camera" ? reference : t;
+
   const captureFeederLoc = (tool: TeachTool, target: TeachTarget) => {
     if (!editFeeder) return;
-    postFeeder("/api/feeder/capture", { id: editFeeder.id, tool, target });
+    postFeeder("/api/feeder/capture", {
+      id: editFeeder.id,
+      tool: teachTool(tool),
+      target,
+    });
   };
 
   const moveToFeederLoc = (tool: TeachTool, target: TeachTarget) => {
@@ -2988,7 +3505,7 @@ function App() {
     fetch("/api/feeder/move", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: editFeeder.id, tool, target }),
+      body: JSON.stringify({ id: editFeeder.id, tool: teachTool(tool), target }),
     }).catch(() => {
       /* ignore */
     });
@@ -3045,7 +3562,132 @@ function App() {
   const headName = inventory?.heads?.[0]?.name ?? "H1";
   const isCamera = reference === "camera";
   const zcEnabled = enabled && !isCamera;
-  const camToNozEnabled = enabled && isCamera;
+
+  // Ordered tool cycle for the Numpad-9 hotkey: camera, then each nozzle.
+  const toolIds = useMemo(
+    () => ["camera", ...(inventory?.heads?.[0]?.nozzles ?? [])],
+    [inventory],
+  );
+
+  // Keyboard jog and hotkeys. Keyed off e.code (physical key) so the numpad
+  // works regardless of NumLock and never collides with the arrow cluster:
+  //   Arrows      -> X/Y,  PageUp/PageDown -> Z
+  //   Numpad 5    -> cycle step size
+  //   Numpad 8    -> toggle step / continuous jog
+  //   Numpad 9    -> cycle tool (camera -> N1 -> N2 -> ...)
+  // Ignored while typing in a field or when a modifier is held, and gated on
+  // the same enable state as the on-screen jog buttons. In continuous mode a
+  // held X/Y key streams a velocity-blended jog from the backend (stop on
+  // key-up); Z stays a discrete step.
+  useEffect(() => {
+    const MOVES: Record<string, { ax: "x" | "y" | "z"; dir: 1 | -1 }> = {
+      ArrowUp: { ax: "y", dir: 1 },
+      ArrowDown: { ax: "y", dir: -1 },
+      ArrowRight: { ax: "x", dir: 1 },
+      ArrowLeft: { ax: "x", dir: -1 },
+      PageUp: { ax: "z", dir: 1 },
+      PageDown: { ax: "z", dir: -1 },
+    };
+    const typing = (t: HTMLElement | null) => {
+      const tag = t?.tagName;
+      return (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        !!t?.isContentEditable
+      );
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) {
+        return;
+      }
+      if (typing(e.target as HTMLElement | null)) {
+        return;
+      }
+      // Single-press hotkeys: ignore OS auto-repeat so a held key fires once.
+      if (e.code === "Numpad5") {
+        e.preventDefault();
+        if (!e.repeat) {
+          setStep((prev) => STEPS[(STEPS.indexOf(prev) + 1) % STEPS.length]);
+        }
+        return;
+      }
+      if (e.code === "Numpad8") {
+        e.preventDefault();
+        if (!e.repeat) {
+          setContinuous((c) => !c);
+        }
+        return;
+      }
+      if (e.code === "Numpad9") {
+        e.preventDefault();
+        if (!e.repeat) {
+          setReference((prev) => {
+            const i = toolIds.indexOf(prev);
+            return toolIds[(i + 1) % toolIds.length] ?? "camera";
+          });
+        }
+        return;
+      }
+      const mv = MOVES[e.code];
+      if (!mv) {
+        return;
+      }
+      const allowed = mv.ax === "z" ? zcEnabled : enabled;
+      if (!allowed) {
+        return;
+      }
+      e.preventDefault();
+      // OS auto-repeat never drives motion: step mode is one move per press,
+      // and continuous mode streams from the backend once the key is down.
+      if (e.repeat) {
+        return;
+      }
+      // Continuous mode streams X/Y from the backend (smooth, velocity-blended)
+      // while the key is held. Z is always a discrete step (its travel is too
+      // short to stream), as is everything in step mode.
+      if (continuous && mv.ax !== "z") {
+        heldKeyRef.current = e.code;
+        void post("/api/jog/stream/start", {
+          dx: mv.ax === "x" ? mv.dir : 0,
+          dy: mv.ax === "y" ? mv.dir : 0,
+          speed,
+          tool: reference,
+          segmentMm: jogSeg,
+          paceMs: jogPace,
+        });
+      } else {
+        jog(mv.ax, mv.dir);
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (heldKeyRef.current === e.code) {
+        heldKeyRef.current = null;
+        void post("/api/jog/stream/stop");
+      }
+    };
+    const stopHold = () => {
+      if (heldKeyRef.current) {
+        heldKeyRef.current = null;
+        void post("/api/jog/stream/stop");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("keyup", onKeyUp);
+    // Losing focus (alt-tab) never delivers keyup, so stop any hold.
+    window.addEventListener("blur", stopHold);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", stopHold);
+      heldKeyRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, zcEnabled, step, speed, reference, continuous, toolIds, jogSeg, jogPace]);
+
+  // Both moves operate on the SELECTED nozzle, so both need a nozzle selected
+  // (not the camera). Pick N1 or N2, then move the camera to it or it to the camera.
+  const camToNozEnabled = enabled && !isCamera;
   const nozToCamEnabled = enabled && !isCamera;
   const refOptions = [
     { id: "camera", label: `Camera: ${cameraName}` },
@@ -3064,6 +3706,31 @@ function App() {
           .map((p) => p.id)
           .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
       : parts;
+  // Substring filters for the list tabs. A single run of characters is matched
+  // anywhere across the row's text fields (ids are named inconsistently, so we
+  // search the whole thing, not a prefix).
+  const partQuery = partSearch.trim().toLowerCase();
+  const filteredParts = partQuery
+    ? partsDetail.filter((p) =>
+        `${p.id} ${p.name ?? ""} ${p.package ?? ""}`
+          .toLowerCase()
+          .includes(partQuery),
+      )
+    : partsDetail;
+  const feederQuery = feederSearch.trim().toLowerCase();
+  const filteredFeeders = feederQuery
+    ? feeders.filter((f) =>
+        `${f.id} ${f.name} ${f.part ?? ""} ${f.type}`
+          .toLowerCase()
+          .includes(feederQuery),
+      )
+    : feeders;
+  const pkgQuery = pkgSearch.trim().toLowerCase();
+  const filteredPackages = pkgQuery
+    ? packages.filter((p) =>
+        `${p.id} ${p.description ?? ""}`.toLowerCase().includes(pkgQuery),
+      )
+    : packages;
   // The selected tool's own coordinates: on a seesaw-Z machine the nozzles'
   // Z axes are mapped/inverted, so the DRO must show the SELECTED nozzle,
   // not the default one.
@@ -3119,13 +3786,18 @@ function App() {
                       </button>
                     )}
                   </div>
-                  <div className="camera-view">
+                  <div
+                    className={`camera-view${live ? " cam-zoomable" : ""}`}
+                    title={live ? "Click to enlarge (with crosshair)" : undefined}
+                    onClick={() => live && cam && setZoomPane(cam.id)}
+                  >
                     {live && cam && (
                       <CameraFeed
                         key={cam.id}
                         id={cam.id}
                         w={480}
                         className="camera-live"
+                        zoomable={false}
                       />
                     )}
                     {live && cam && visionFlash[cam.id] && visionFrames[cam.id] && (
@@ -3169,6 +3841,55 @@ function App() {
             })}
           </div>
         </div>
+
+        {zoomPane &&
+          (() => {
+            const cam = cameras.find((x) => x.id === zoomPane);
+            if (!cam) return null;
+            return (
+              <div
+                className="cam-lightbox"
+                title="Click to close"
+                onClick={() => setZoomPane(null)}
+              >
+                <div className="camera-view camera-view-zoom">
+                  <CameraFeed
+                    id={cam.id}
+                    w={1280}
+                    className="camera-live"
+                    zoomable={false}
+                  />
+                  {visionFlash[cam.id] && visionFrames[cam.id] && (
+                    <img
+                      className="camera-live vision-overlay"
+                      src={`/api/vision/image?camera=${cam.id}&seq=${visionFrames[cam.id].seq}`}
+                      alt=""
+                      draggable={false}
+                    />
+                  )}
+                  <svg
+                    className="reticle"
+                    viewBox="0 0 200 150"
+                    preserveAspectRatio="xMidYMid meet"
+                  >
+                    <g transform={`rotate(${-toolC} 100 75)`}>
+                      <line x1="100" y1="75" x2="194" y2="75" />
+                      <line x1="100" y1="75" x2="6" y2="75" />
+                      <line x1="100" y1="75" x2="100" y2="144" />
+                      <line
+                        className="reticle-n"
+                        x1="100"
+                        y1="75"
+                        x2="100"
+                        y2="6"
+                      />
+                      <circle cx="100" cy="75" r="26" />
+                    </g>
+                  </svg>
+                </div>
+              </div>
+            );
+          })()}
 
         <div className="jog-panel">
           <div className="btn-row">
@@ -3275,6 +3996,35 @@ function App() {
                   </button>
                 ))}
               </div>
+              <button
+                className={`chip-btn jog-mode ${continuous ? "cont" : ""}`}
+                onClick={() => setContinuous((c) => !c)}
+                title="Toggle step / continuous jog (Numpad 8). Continuous jogs while a direction key is held."
+              >
+                {continuous ? "Cont." : "Step"}
+              </button>
+              {continuous && (
+                <div className="jog-tune">
+                  <label title="Distance per streamed segment (mm). Bigger = faster, longer coast on release.">
+                    <span>Seg</span>
+                    <NumberInput
+                      min={0.1}
+                      step={0.1}
+                      value={jogSeg}
+                      onChange={(v) => setJogSeg(Math.max(0.1, v))}
+                    />
+                  </label>
+                  <label title="Pause between segments (ms). 0 = smoothest (keeps the controller buffer full); higher trims the release coast but can bring back the accel/decel pulsing.">
+                    <span>Pace</span>
+                    <NumberInput
+                      min={0}
+                      step={1}
+                      value={jogPace}
+                      onChange={(v) => setJogPace(Math.max(0, v))}
+                    />
+                  </label>
+                </div>
+              )}
             </div>
             <div className="speedcol">
               <div className="col-label">Speed</div>
@@ -3293,8 +4043,8 @@ function App() {
                 className="jbtn cn-btn cn-noz"
                 onClick={nozzleToCamera}
                 disabled={!nozToCamEnabled}
-                title="Move nozzle to camera"
-                aria-label="Move nozzle to camera"
+                title="Move the selected nozzle to the camera location"
+                aria-label="Move the selected nozzle to the camera location"
               >
                 <NozzleIcon size={22} />
               </button>
@@ -3302,8 +4052,8 @@ function App() {
                 className="jbtn cn-btn cn-cam"
                 onClick={cameraToNozzle}
                 disabled={!camToNozEnabled}
-                title="Move camera to nozzle"
-                aria-label="Move camera to nozzle"
+                title="Move the camera to the selected nozzle location"
+                aria-label="Move the camera to the selected nozzle location"
               >
                 <CameraIcon size={22} />
               </button>
@@ -3373,6 +4123,7 @@ function App() {
             </div>
           ))}
         </div>
+
       </aside>
 
       <main className="content">
@@ -4016,6 +4767,9 @@ function App() {
                             <span className="mono">{s.id}</span>
                             {s.part ? ` · ${s.part}` : ""} ·{" "}
                             <span className="muted">{s.board}</span>
+                            {s.reason && (
+                              <div className="skip-reason">{s.reason}</div>
+                            )}
                           </li>
                         ))}
                       </ul>
@@ -4306,6 +5060,134 @@ function App() {
                     </div>
                   )}
 
+                  {selectedBoard && !mpbActive && (
+                    <div className="mpb-launch">
+                      <button
+                        className="btn btn-sm"
+                        onClick={openMpb}
+                        title="Set the board location from 3+ ordinary placements: visit each, jog the camera to its true center, capture. No dedicated fiducials needed."
+                      >
+                        <CrosshairIcon size={12} /> Set location by placements
+                      </button>
+                    </div>
+                  )}
+
+                  {mpbActive && selectedBoard && (
+                    <div className="detect-grp align-panel">
+                      <div className="detect-title">
+                        Set board location by placements —{" "}
+                        {selectedBoard.boardName}
+                        {!teachReady && (
+                          <span className="cam-unbound-tag">
+                            {" "}
+                            · {!enabled
+                              ? "machine offline — connect to move"
+                              : "not homed — home first"}
+                          </span>
+                        )}
+                      </div>
+                      {mpbPhase === "select" && (
+                        <>
+                          <div className="muted mpb-hint">
+                            Pick 3+ placements spread across the board (corners
+                            work best). The camera visits each; jog to its true
+                            center and capture.
+                          </div>
+                          <div className="mpb-picklist">
+                            {jobBoardPlc.map((p) => (
+                              <label key={p.id} className="mpb-pick">
+                                <input
+                                  type="checkbox"
+                                  checked={mpbSel.includes(p.id)}
+                                  onChange={() => toggleMpbSel(p.id)}
+                                />
+                                <span className="mono mpb-pick-id">{p.id}</span>
+                                <span className="muted mpb-pick-xy">
+                                  {p.part ?? ""} ({p.x}, {p.y})
+                                </span>
+                              </label>
+                            ))}
+                          </div>
+                          <div className="teach-actions align-actions">
+                            <button
+                              className="btn btn-sm btn-primary"
+                              onClick={startMpbWalk}
+                              disabled={mpbSel.length < 2 || !teachReady}
+                            >
+                              Start ({mpbSel.length})
+                            </button>
+                            {mpbSel.length > 0 && mpbSel.length < 3 && (
+                              <span className="muted">3+ recommended</span>
+                            )}
+                            <button className="btn btn-sm" onClick={closeMpb}>
+                              Cancel
+                            </button>
+                          </div>
+                        </>
+                      )}
+                      {mpbPhase === "walk" && (
+                        <>
+                          <div className="mpb-step">
+                            Point {mpbStep + 1} of {mpbSel.length}:{" "}
+                            <span className="mono">{mpbSel[mpbStep]}</span>
+                            {mpbMeasured[mpbSel[mpbStep]] && (
+                              <span className="align-fid-cap ok"> ✓ captured</span>
+                            )}
+                          </div>
+                          <div className="muted mpb-hint">
+                            Jog the camera to the true center of this footprint,
+                            then Capture.
+                          </div>
+                          <div className="teach-actions align-actions">
+                            <button
+                              className="btn btn-sm"
+                              onClick={() => mpbGo(mpbStep)}
+                              disabled={!teachReady}
+                            >
+                              <CrosshairIcon size={12} /> Go here
+                            </button>
+                            <button
+                              className="btn btn-sm btn-primary"
+                              onClick={mpbCapture}
+                              disabled={!teachReady}
+                            >
+                              <CameraIcon size={12} /> Capture center
+                            </button>
+                            <button className="btn btn-sm" onClick={closeMpb}>
+                              Cancel
+                            </button>
+                          </div>
+                          <div className="muted mpb-progress">
+                            {Object.keys(mpbMeasured).length}/{mpbSel.length}{" "}
+                            captured
+                          </div>
+                        </>
+                      )}
+                      {mpbPhase === "done" && (
+                        <>
+                          {mpbResult && (
+                            <div
+                              className={`banner ${
+                                (mpbResult.residual ?? 0) > 0.5
+                                  ? "banner-warn"
+                                  : "banner-ok"
+                              }`}
+                            >
+                              {mpbResult.residual != null
+                                ? `Board located from ${mpbResult.points} placements — rotation ${mpbResult.angle}°, residual ${mpbResult.residual} mm`
+                                : `Board located — rotation ${mpbResult.angle}°`}
+                            </div>
+                          )}
+                          <div className="teach-actions align-actions">
+                            <button className="btn btn-sm" onClick={closeMpb}>
+                              Done
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
+
                   <div className="pane-head pane-head-plc">
                     <span className="pane-title">
                       Placements
@@ -4317,6 +5199,41 @@ function App() {
                       disabled={!selectedBoard}
                     >
                       + Add
+                    </button>
+                    <button
+                      className="btn btn-sm"
+                      disabled={!selectedBoard || jobRunning}
+                      title="Clear the placed checkmarks on this board — use when loading a fresh blank board so the job places everything again"
+                      onClick={async () => {
+                        if (!jobEditFile || !selectedBoardUid) return;
+                        if (
+                          !window.confirm(
+                            "Reset placed status for this board? The next run will place ALL placements again.",
+                          )
+                        )
+                          return;
+                        try {
+                          const r = await fetch("/api/job/board/placed/reset", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                              file: jobEditFile,
+                              uid: selectedBoardUid,
+                            }),
+                          });
+                          const d = await r.json();
+                          if (!r.ok) {
+                            setJobErr(d.error ?? "reset failed");
+                            return;
+                          }
+                          setPlcRefresh((n) => n + 1);
+                          loadJobs();
+                        } catch (e) {
+                          setJobErr(e instanceof Error ? e.message : String(e));
+                        }
+                      }}
+                    >
+                      ↺ Reset placed
                     </button>
                     <div className="plc-search">
                       <SearchIcon size={13} />
@@ -4332,7 +5249,23 @@ function App() {
                     <table className="ptable jobs-plc">
                       <thead>
                         <tr>
-                          <th>En</th>
+                          <th>
+                            <input
+                              type="checkbox"
+                              title="Enable/disable ALL placements shown below (respects the search filter)"
+                              checked={
+                                filteredJobPlc.length > 0 &&
+                                filteredJobPlc.every((p) => p.enabled)
+                              }
+                              onChange={(e) =>
+                                setAllJobPlacements(
+                                  filteredJobPlc.map((p) => p.id),
+                                  e.currentTarget.checked,
+                                )
+                              }
+                            />{" "}
+                            En
+                          </th>
                           <th>ID</th>
                           <th>Part</th>
                           <th>Side</th>
@@ -4355,16 +5288,7 @@ function App() {
                             </td>
                           </tr>
                         )}
-                        {jobBoardPlc
-                          .filter((p) => {
-                            const q = plcSearch.trim().toLowerCase();
-                            if (!q) return true;
-                            return (
-                              p.id.toLowerCase().includes(q) ||
-                              (p.part ?? "").toLowerCase().includes(q)
-                            );
-                          })
-                          .map((p) => (
+                        {filteredJobPlc.map((p) => (
                             <tr
                               key={p.id}
                               onContextMenu={(e) => {
@@ -4591,11 +5515,11 @@ function App() {
                 <span className="pane-title">Pick &amp; align test</span>
               </div>
               <p className="muted job-hint">
-                Job-identical feed → pick → bottom-vision alignment, one step at
-                a time. The alignment's masked working image appears above and
-                flashes in the camera panes; the reported offsets are what a job
-                would correct by. Discard drops the part at the discard
-                location.
+                Run every part in turn: step to a feeder, Pick, Hold over camera,
+                then tune its bottom-vision pipeline with the real part in view.
+                With “keep over camera” on, Align leaves the part parked so you
+                can adjust and re-Align without it retreating. Discard drops it,
+                then step to the next part.
               </p>
               <div
                 style={{
@@ -4605,6 +5529,15 @@ function App() {
                   alignItems: "center",
                 }}
               >
+                <button
+                  className="btn btn-sm"
+                  onClick={() => stepPart(-1)}
+                  disabled={feeders.filter((f) => f.part).length === 0}
+                  title="Previous part (feeder)"
+                  aria-label="Previous part"
+                >
+                  ◀
+                </button>
                 <select
                   className="type-select"
                   value={pickFeederId}
@@ -4619,6 +5552,15 @@ function App() {
                       </option>
                     ))}
                 </select>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => stepPart(1)}
+                  disabled={feeders.filter((f) => f.part).length === 0}
+                  title="Next part (feeder)"
+                  aria-label="Next part"
+                >
+                  ▶
+                </button>
                 <select
                   className="type-select"
                   value={pickNozzleId}
@@ -4644,6 +5586,18 @@ function App() {
                   Pick
                 </button>
                 <button
+                  className="btn"
+                  disabled={!teachReady || !pickNozzleId}
+                  title={
+                    teachReady
+                      ? "Park the picked part over the bottom camera and hold it there for tuning"
+                      : "enable + home the machine first"
+                  }
+                  onClick={() => pickTest("hold")}
+                >
+                  Hold over camera
+                </button>
+                <button
                   className="btn btn-primary"
                   disabled={!teachReady || !pickNozzleId}
                   title={
@@ -4655,6 +5609,17 @@ function App() {
                 >
                   Align
                 </button>
+                <label
+                  className="pick-hold-chk"
+                  title="Leave the part over the camera after Align (skip the safe-Z retreat) so you can tune and re-Align"
+                >
+                  <input
+                    type="checkbox"
+                    checked={pickHold}
+                    onChange={(e) => setPickHold(e.currentTarget.checked)}
+                  />
+                  keep over camera
+                </label>
                 <button
                   className="btn"
                   disabled={!teachReady || !pickNozzleId}
@@ -4667,6 +5632,51 @@ function App() {
                 >
                   Discard
                 </button>
+                <label
+                  className="pick-hold-chk"
+                  title="Z height (mm) the single-placement test places at — the surface you're placing onto (tape/board top)"
+                >
+                  place Z
+                  <NumberInput
+                    className="num-sm"
+                    step={0.1}
+                    value={placeZInput}
+                    onChange={(v) => setPlaceZInput(v)}
+                  />
+                </label>
+                <button
+                  className="btn btn-primary"
+                  disabled={!teachReady || !pickNozzleId}
+                  title={
+                    teachReady
+                      ? "Single-placement test: places the part at the TOP camera's current crosshair position (jog the camera to a mark first), applying the last Align's correction exactly like a job would. Then measure the landing against the crosshair."
+                      : "enable + home the machine first"
+                  }
+                  onClick={() => {
+                    localStorage.setItem("viper.placeZ", String(placeZInput));
+                    setPickMsg("placing at camera position…");
+                    fetch("/api/test/place", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        nozzleId: pickNozzleId,
+                        z: placeZInput,
+                      }),
+                    })
+                      .then(async (r) => {
+                        if (!r.ok) {
+                          const e = await r.json().catch(() => ({}));
+                          throw new Error(e.error ?? `place failed (${r.status})`);
+                        }
+                      })
+                      .catch((e) => {
+                        setPickMsg(null);
+                        setError(e instanceof Error ? e.message : String(e));
+                      });
+                  }}
+                >
+                  Place @ camera
+                </button>
               </div>
               {pickMsg && (
                 <div className="muted" style={{ marginTop: 6 }}>
@@ -4676,6 +5686,13 @@ function App() {
 
               <div className="pane-head pane-head-plc">
                 <span className="pane-title">Vision settings (pipelines)</span>
+                <button
+                  className="btn btn-sm"
+                  onClick={resetBottomVisionPipeline}
+                  title="Reset the default bottom-vision pipeline to OpenPnP's stock footprint-masked pipeline, so every part is masked to its own footprint (fixes detection latching onto stray bright features)."
+                >
+                  Reset bottom vision to footprint-masked
+                </button>
               </div>
               <div className="ptable-wrap">
                 <table className="ptable">
@@ -4789,22 +5806,39 @@ function App() {
                   feeders also appear automatically when the machine scans the bus.
                 </div>
               ) : (
-                <div className="ptable-wrap">
-                  <table className="ptable">
-                    <thead>
-                      <tr>
-                        <th></th>
-                        <th>Active</th>
-                        <th>Name</th>
-                        <th>Type</th>
-                        <th>Slot</th>
-                        <th>Part</th>
-                        <th>Left</th>
-                        <th></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {feeders.map((f, i) => (
+                <>
+                  <ListSearch
+                    value={feederSearch}
+                    onChange={setFeederSearch}
+                    placeholder="search feeders by name, part, or type"
+                  />
+                  <div className="ptable-wrap">
+                    <table className="ptable">
+                      <thead>
+                        <tr>
+                          <th></th>
+                          <th>Active</th>
+                          <th>Name</th>
+                          <th>Type</th>
+                          <th>Slot</th>
+                          <th>Part</th>
+                          <th>Left</th>
+                          <th></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                      {filteredFeeders.length === 0 && (
+                        <tr>
+                          <td colSpan={8} className="muted list-nomatch">
+                            No feeders match “{feederSearch}”.
+                          </td>
+                        </tr>
+                      )}
+                      {filteredFeeders.map((f) => {
+                        // Drag-reorder operates on the full list, so resolve the
+                        // row's real index even when the view is filtered.
+                        const i = feeders.indexOf(f);
+                        return (
                         <tr
                           key={f.id}
                           className={f.enabled ? "" : "row-off"}
@@ -4852,8 +5886,20 @@ function App() {
                               )}
                             </span>
                           </td>
-                          <td className="mono">{f.name}</td>
-                          <td className="muted">{f.type}</td>
+                          <td
+                            className="mono feeder-click"
+                            onClick={() => openEditFeeder(f.id)}
+                            title="Edit feeder settings"
+                          >
+                            {f.name}
+                          </td>
+                          <td
+                            className="muted feeder-click"
+                            onClick={() => openEditFeeder(f.id)}
+                            title="Edit feeder settings"
+                          >
+                            {f.type}
+                          </td>
                           <td className="mono cell-center">
                             {f.type === "PhotonFeeder" ? (
                               f.slot != null ? (
@@ -4959,10 +6005,12 @@ function App() {
                             </button>
                           </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
-                </div>
+                  </div>
+                </>
               )}
             </section>
           )}
@@ -4998,20 +6046,33 @@ function App() {
                   add one.
                 </div>
               ) : (
-                <div className="ptable-wrap">
-                  <table className="ptable">
-                    <thead>
-                      <tr>
-                        <th className="chk-col"></th>
-                        <th>ID</th>
-                        <th>Name</th>
-                        <th>Package</th>
-                        <th>Height mm</th>
-                        <th></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {partsDetail.map((p) => (
+                <>
+                  <ListSearch
+                    value={partSearch}
+                    onChange={setPartSearch}
+                    placeholder="search parts by id, name, or package"
+                  />
+                  <div className="ptable-wrap">
+                    <table className="ptable">
+                      <thead>
+                        <tr>
+                          <th className="chk-col"></th>
+                          <th>ID</th>
+                          <th>Name</th>
+                          <th>Package</th>
+                          <th>Height mm</th>
+                          <th></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                      {filteredParts.length === 0 && (
+                        <tr>
+                          <td colSpan={6} className="muted list-nomatch">
+                            No parts match “{partSearch}”.
+                          </td>
+                        </tr>
+                      )}
+                      {filteredParts.map((p) => (
                         <tr key={p.id}>
                           <td className="chk-col">
                             {!p.hasHeight && (
@@ -5072,7 +6133,8 @@ function App() {
                       ))}
                     </tbody>
                   </table>
-                </div>
+                  </div>
+                </>
               )}
             </section>
           )}
@@ -5117,19 +6179,32 @@ function App() {
               {packages.length === 0 ? (
                 <div className="muted">No packages yet.</div>
               ) : (
-                <div className="ptable-wrap">
-                  <table className="ptable">
-                    <thead>
-                      <tr>
-                        <th className="chk-col"></th>
-                        <th>ID</th>
-                        <th>Description</th>
-                        <th>Nozzle tips</th>
-                        <th></th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {packages.map((p) => (
+                <>
+                  <ListSearch
+                    value={pkgSearch}
+                    onChange={setPkgSearch}
+                    placeholder="search packages by id or description"
+                  />
+                  <div className="ptable-wrap">
+                    <table className="ptable">
+                      <thead>
+                        <tr>
+                          <th className="chk-col"></th>
+                          <th>ID</th>
+                          <th>Description</th>
+                          <th>Nozzle tips</th>
+                          <th></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                      {filteredPackages.length === 0 && (
+                        <tr>
+                          <td colSpan={5} className="muted list-nomatch">
+                            No packages match “{pkgSearch}”.
+                          </td>
+                        </tr>
+                      )}
+                      {filteredPackages.map((p) => (
                         <tr key={p.id}>
                           <td className="chk-col">
                             {!p.hasNozzle && (
@@ -5189,7 +6264,8 @@ function App() {
                       ))}
                     </tbody>
                   </table>
-                </div>
+                  </div>
+                </>
               )}
             </section>
           )}
@@ -5352,6 +6428,19 @@ function App() {
                       tape. Set back to Normal before a real job.
                     </div>
                   )}
+                  <div
+                    className="field-row"
+                    title="Peel-motor run time in ms per 0.1mm of feed, sent to this feeder's firmware on every init. Firmware default is 22; raise it (e.g. 26-30) on a feeder whose cover film goes slack. 0 = leave firmware default. Requires the peel-configurable firmware; older firmware ignores it. No extra tape motion involved."
+                  >
+                    <label>Peel time (ms/0.1mm)</label>
+                    <NumberInput
+                      className="num-sm"
+                      step={1}
+                      min={0}
+                      value={editFeeder.photon.peelTimeMsPerTenth ?? 0}
+                      onChange={(v) => setPhotonField({ peelTimeMsPerTenth: v })}
+                    />
+                  </div>
                   <TeachLoc
                     label="Slot location (shared by all feeders in this slot)"
                     value={editFeeder.photon.slotLocation}
@@ -6374,13 +7463,23 @@ function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
               <h3>Connection</h3>
-              <button
-                className="icon-btn"
-                onClick={() => setMachineCard(null)}
-                title="Close"
-              >
-                ✕
-              </button>
+              <div className="modal-head-actions">
+                <button
+                  className="btn btn-sm"
+                  onClick={reenumerateDevices}
+                  disabled={camReconnecting}
+                  title="Force a fresh USB scan in-process (cameras + machine serial). Use after a USB unplug/replug instead of restarting the backend."
+                >
+                  {camReconnecting ? "Working…" : "⟳ Re-enumerate USB"}
+                </button>
+                <button
+                  className="icon-btn"
+                  onClick={() => setMachineCard(null)}
+                  title="Close"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
             <div className="modal-body">
               <div className="field-row">
@@ -6585,12 +7684,20 @@ function App() {
               <h3>Cameras</h3>
               <div className="modal-head-actions">
                 <button
+                  className="btn btn-sm btn-primary"
+                  onClick={reenumerateDevices}
+                  disabled={camReconnecting}
+                  title="Force a fresh USB scan in-process: rebuilds each camera's capture context AND reconnects the machine serial. Use after a USB unplug/replug — this is the in-app equivalent of restarting the backend, and the only thing that recovers devices reconnected after startup."
+                >
+                  {camReconnecting ? "Working…" : "⟳ Re-enumerate USB"}
+                </button>
+                <button
                   className="btn btn-sm"
                   onClick={reconnectCameras}
                   disabled={camReconnecting}
-                  title="Re-scan host devices and re-bind cameras (fixes dropped feeds after a USB re-plug or power-cycle)"
+                  title="Re-bind the cameras from the current device list (does NOT re-scan USB — use Re-enumerate for a reconnected device)"
                 >
-                  {camReconnecting ? "Reconnecting…" : "↻ Reconnect cameras"}
+                  {camReconnecting ? "…" : "↻ Rebind cameras"}
                 </button>
                 <button
                   className="btn btn-sm"
@@ -6705,6 +7812,76 @@ function App() {
                       </select>
                     </label>
                   </div>
+                  {c.location && (
+                    <div className="detect-grp">
+                      <div className="detect-title">
+                        Camera position — teach X/Y with the top camera; Z is the
+                        focal plane (set by the Z frame, not taught here)
+                      </div>
+                      <div className="field-grid">
+                        {(["x", "y", "z"] as const).map((k) => (
+                          <label key={k} className="loc-field">
+                            <span>{k.toUpperCase()}</span>
+                            <NumberInput
+                              step={0.01}
+                              value={c.location?.[k] ?? 0}
+                              onChange={(v) => bottomCamSetLoc({ [k]: v })}
+                            />
+                          </label>
+                        ))}
+                      </div>
+                      <div className="teach-actions">
+                        <button
+                          className="btn btn-sm"
+                          onClick={() => bottomCamGo("camera")}
+                          disabled={!teachReady}
+                          title={
+                            teachReady
+                              ? "Fly the top camera over the bottom camera's stored position"
+                              : teachHint
+                          }
+                        >
+                          <CameraIcon size={14} /> Go
+                        </button>
+                        <button
+                          className="btn btn-sm"
+                          onClick={() => bottomCamGrab("camera")}
+                          disabled={!teachReady}
+                          title={
+                            teachReady
+                              ? "Rough teach: capture the top camera's current X/Y as this camera's position (jog the crosshair onto the bottom lens first). Z is preserved."
+                              : teachHint
+                          }
+                        >
+                          <CameraIcon size={14} /> Grab
+                        </button>
+                        <button
+                          className="btn btn-sm"
+                          onClick={() => bottomCamGo("nozzle")}
+                          disabled={!teachReady}
+                          title={
+                            teachReady
+                              ? "Move the SELECTED nozzle over the bottom camera — X/Y only, Z stays exactly where it is"
+                              : teachHint
+                          }
+                        >
+                          <NozzleIcon size={14} /> Go
+                        </button>
+                        <button
+                          className="btn btn-sm"
+                          onClick={() => bottomCamGrab("nozzle")}
+                          disabled={!teachReady}
+                          title={
+                            teachReady
+                              ? "Precise teach: jog the SELECTED nozzle tip until this camera sees it dead-center, then capture the nozzle's X/Y as the camera position. Anchors to the camera's own optical axis — re-run runout cal afterward."
+                              : teachHint
+                          }
+                        >
+                          <NozzleIcon size={14} /> Grab
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -6715,6 +7892,292 @@ function App() {
               >
                 Done
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {machineCard === "toolchanger" && (
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            setMachineCard(null);
+            setTcTip(null);
+            setTcMsg("");
+          }}
+        >
+          <div
+            className="modal modal-wide"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3>
+                Tool Changer
+                {tcTip
+                  ? ` — ${nzTips.find((t) => t.id === tcTip)?.name ?? ""}`
+                  : ""}
+              </h3>
+              <button
+                className="icon-btn"
+                onClick={() => {
+                  setMachineCard(null);
+                  setTcTip(null);
+                  setTcMsg("");
+                }}
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="modal-body plc-body">
+              {(!enabled || !homed) && (
+                <div className="banner" style={{ marginBottom: 10 }}>
+                  Enable and home the machine to teach or test the changer.
+                </div>
+              )}
+              {tcTip === null ? (
+                <>
+                  <p className="muted" style={{ marginBottom: 10 }}>
+                    Automatic nozzle-tip changer. Teach each tip's four-point
+                    load/unload path, then test. Moves use the{" "}
+                    {reference === "camera"
+                      ? "selected nozzle (pick N1/N2 in the sidebar first)"
+                      : "selected nozzle"}
+                    .
+                  </p>
+                  {nzTips.length === 0 ? (
+                    <div className="muted">No nozzle tips defined.</div>
+                  ) : (
+                    <div className="tc-list">
+                      {nzTips.map((t) => (
+                        <div key={t.id} className="tc-row">
+                          <span className="tc-name mono">{t.name}</span>
+                          <span
+                            className={`badge ${t.changer?.configured ? "on" : ""}`}
+                          >
+                            {t.changer?.configured ? "Configured" : "Not set up"}
+                          </span>
+                          {t.loaded && <span className="badge on">Loaded</span>}
+                          <div className="tc-actions">
+                            <button
+                              className="btn btn-sm"
+                              onClick={() => {
+                                setTcTip(t.id);
+                                setTcStep(0);
+                                setTcMsg("");
+                              }}
+                            >
+                              {t.changer?.configured ? "Edit" : "Set up"}
+                            </button>
+                            <button
+                              className="btn btn-sm"
+                              disabled={!teachReady || !t.changer?.configured}
+                              onClick={() => loadTip(t.id)}
+                              title="Run the changer to load this tip"
+                            >
+                              Load
+                            </button>
+                            <button
+                              className="btn btn-sm"
+                              disabled={!teachReady}
+                              onClick={() => unloadTip(t.id)}
+                              title="Run the changer to unload"
+                            >
+                              Unload
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {tcMsg && (
+                    <div className="teach-head" style={{ marginTop: 8 }}>
+                      {tcMsg}
+                    </div>
+                  )}
+                </>
+              ) : (
+                (() => {
+                  const tip = nzTips.find((t) => t.id === tcTip);
+                  if (!tip) return <div className="muted">Tip not found.</div>;
+                  const onSpeeds = tcStep >= CHANGER_STEPS.length;
+                  const step = CHANGER_STEPS[tcStep];
+                  const loc = step
+                    ? (tip.changer?.[step.which] ?? null)
+                    : null;
+                  const set = (l: FeederLoc | null | undefined) =>
+                    !!l && (l.x !== 0 || l.y !== 0 || l.z !== 0);
+                  return (
+                    <>
+                      <div className="tc-steps">
+                        {CHANGER_STEPS.map((s, i) => (
+                          <span
+                            key={s.which}
+                            className={`tc-pill ${i === tcStep ? "active" : ""} ${
+                              set(tip.changer?.[s.which]) ? "done" : ""
+                            }`}
+                          >
+                            {i + 1}. {s.label}
+                          </span>
+                        ))}
+                        <span className={`tc-pill ${onSpeeds ? "active" : ""}`}>
+                          Speeds & test
+                        </span>
+                      </div>
+                      {!onSpeeds ? (
+                        <>
+                          <div className="teach-head">
+                            Step {tcStep + 1} of 4 — {step.label}
+                          </div>
+                          <p className="muted">{step.hint}</p>
+                          <p className="muted">
+                            Jog the selected nozzle to this point, then Grab. Go
+                            re-drives to the stored point.
+                          </p>
+                          <div className="teach-block">
+                            <div className="loc-grid">
+                              {(["x", "y", "z", "rotation"] as const).map((k) => (
+                                <label key={k} className="loc-field">
+                                  <span>
+                                    {k === "rotation" ? "Rot°" : k.toUpperCase()}
+                                  </span>
+                                  <input
+                                    type="number"
+                                    step="0.01"
+                                    disabled
+                                    value={loc ? loc[k] : 0}
+                                  />
+                                </label>
+                              ))}
+                            </div>
+                            <div className="teach-actions">
+                              <button
+                                className="btn btn-sm"
+                                disabled={!teachReady}
+                                onClick={() => changerMove(tip.id, step.which)}
+                              >
+                                <NozzleIcon size={14} /> Go
+                              </button>
+                              <button
+                                className="btn btn-sm"
+                                disabled={!teachReady}
+                                onClick={() => changerCapture(tip.id, step.which)}
+                              >
+                                <NozzleIcon size={14} /> Grab
+                              </button>
+                            </div>
+                          </div>
+                          <div className="teach-actions">
+                            <button
+                              className="btn btn-sm"
+                              disabled={tcStep === 0}
+                              onClick={() => setTcStep((s) => s - 1)}
+                            >
+                              ← Back
+                            </button>
+                            <button
+                              className="btn btn-sm btn-primary"
+                              onClick={() => setTcStep((s) => s + 1)}
+                            >
+                              Next →
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="teach-head">
+                            Segment speeds (0.01–1.0)
+                          </div>
+                          <div className="field-grid">
+                            <label className="loc-field">
+                              <span>Start → Mid</span>
+                              <NumberInput
+                                step={0.05}
+                                min={0.01}
+                                value={tip.changer?.startToMidSpeed ?? 1}
+                                onChange={(v) =>
+                                  changerSpeeds(tip.id, { startToMidSpeed: v })
+                                }
+                              />
+                            </label>
+                            <label className="loc-field">
+                              <span>Mid → Mid 2</span>
+                              <NumberInput
+                                step={0.05}
+                                min={0.01}
+                                value={tip.changer?.midToMid2Speed ?? 1}
+                                onChange={(v) =>
+                                  changerSpeeds(tip.id, { midToMid2Speed: v })
+                                }
+                              />
+                            </label>
+                            <label className="loc-field">
+                              <span>Mid 2 → End</span>
+                              <NumberInput
+                                step={0.05}
+                                min={0.01}
+                                value={tip.changer?.mid2ToEndSpeed ?? 1}
+                                onChange={(v) =>
+                                  changerSpeeds(tip.id, { mid2ToEndSpeed: v })
+                                }
+                              />
+                            </label>
+                          </div>
+                          <div
+                            className="teach-head"
+                            style={{ marginTop: 10 }}
+                          >
+                            Test the changer
+                          </div>
+                          <div className="teach-actions">
+                            <button
+                              className="btn btn-sm"
+                              disabled={!teachReady}
+                              onClick={() => loadTip(tip.id)}
+                            >
+                              Test Load
+                            </button>
+                            <button
+                              className="btn btn-sm"
+                              disabled={!teachReady}
+                              onClick={() => unloadTip(tip.id)}
+                            >
+                              Test Unload
+                            </button>
+                          </div>
+                          <div
+                            className="teach-actions"
+                            style={{ marginTop: 10 }}
+                          >
+                            <button
+                              className="btn btn-sm"
+                              onClick={() => setTcStep((s) => s - 1)}
+                            >
+                              ← Back
+                            </button>
+                            <button
+                              className="btn btn-sm btn-primary"
+                              onClick={() => {
+                                setTcTip(null);
+                                setTcMsg(
+                                  "Setup done. Use Save in the header to keep it.",
+                                );
+                              }}
+                            >
+                              Done
+                            </button>
+                          </div>
+                        </>
+                      )}
+                      {tcMsg && (
+                        <div className="teach-head" style={{ marginTop: 8 }}>
+                          {tcMsg}
+                        </div>
+                      )}
+                    </>
+                  );
+                })()
+              )}
             </div>
           </div>
         </div>
@@ -6801,6 +8264,80 @@ function App() {
                         ))}
                       </select>
                     </label>
+                  </div>
+
+                  <div className="detect-grp">
+                    <div className="detect-title">
+                      Loaded tip &amp; vacuum calibration
+                    </div>
+                    <div className="field-grid">
+                      <label className="loc-field">
+                        <span>Loaded tip (manual swap)</span>
+                        <select
+                          className="type-select"
+                          value={nzTips.find((t) => t.name === n.tip)?.id ?? ""}
+                          onChange={(e) => setLoadedTip(n.id, e.currentTarget.value)}
+                        >
+                          <option value="">— none —</option>
+                          {nzTips.map((t) => (
+                            <option key={t.id} value={t.id}>
+                              {t.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <p className="muted job-hint">
+                      Pick a part (Vision tab), then Read → part on. Bare nozzle
+                      with vacuum on, Read → part off. Apply sets the loaded tip’s
+                      part-on window between them (edit exact thresholds under Tips
+                      below, or switch method to Difference for tiny parts).
+                    </p>
+                    <div className="vac-row">
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => readVacuum(n.id)}
+                        disabled={!teachReady}
+                        title="Read the live vacuum sensor now"
+                      >
+                        Read vacuum
+                      </button>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => readVacuum(n.id, "on")}
+                        disabled={!teachReady}
+                        title="Read now and capture as the part-ON level (part held)"
+                      >
+                        Read → part on
+                      </button>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => readVacuum(n.id, "off")}
+                        disabled={!teachReady}
+                        title="Read now and capture as the part-OFF level (no part)"
+                      >
+                        Read → part off
+                      </button>
+                      <span className="vac-readout">
+                        {vacReading != null ? `reading: ${vacReading}` : "—"}
+                        {vacOn != null ? ` · on: ${vacOn}` : ""}
+                        {vacOff != null ? ` · off: ${vacOff}` : ""}
+                      </span>
+                      <button
+                        className="btn btn-sm btn-primary"
+                        onClick={() => {
+                          const tipId = nzTips.find(
+                            (t) => t.name === n.tip,
+                          )?.id;
+                          if (tipId) applyVacThresholds(tipId);
+                          else setError("No tip loaded on this nozzle.");
+                        }}
+                        disabled={vacOn == null || vacOff == null || !n.tip}
+                        title="Set the loaded tip's part-on window from the captured on/off levels"
+                      >
+                        Apply to loaded tip
+                      </button>
+                    </div>
                   </div>
 
                   <div className="detect-grp">
@@ -6914,6 +8451,47 @@ function App() {
                         />
                       </label>
                       <span className="muted mono nt-id">{t.id}</span>
+                    </div>
+
+                    <div className="field-grid">
+                      <label
+                        className="loc-field"
+                        title="How long the nozzle stays at pick depth with vacuum on before lifting. 0 = lifts the instant the valve fires — vacuum never builds and the part stays behind. 500 is a good default."
+                      >
+                        <span>Pick dwell (ms)</span>
+                        <NumberInput
+                          step={50}
+                          min={0}
+                          value={t.pickDwellMs ?? 0}
+                          onChange={(v) => updateTip(t.id, { pickDwellMs: v })}
+                        />
+                      </label>
+                      <label
+                        className="loc-field"
+                        title="How long the nozzle stays at place depth after vacuum off (blow-off) before lifting"
+                      >
+                        <span>Place dwell (ms)</span>
+                        <NumberInput
+                          step={50}
+                          min={0}
+                          value={t.placeDwellMs ?? 0}
+                          onChange={(v) => updateTip(t.id, { placeDwellMs: v })}
+                        />
+                      </label>
+                      <label
+                        className="loc-field"
+                        title="Bottom vision measures how far off-center the part sits on the nozzle and corrects it at placement. Picks offset by MORE than this are treated as bad picks (corner grip / tilt / misdetection) and discarded. Size to the part: ~1mm for small passives, 2mm+ for large-bodied ICs."
+                      >
+                        <span>Max pick tolerance (mm)</span>
+                        <NumberInput
+                          step={0.1}
+                          min={0}
+                          value={t.maxPickToleranceMm ?? 0}
+                          onChange={(v) =>
+                            updateTip(t.id, { maxPickToleranceMm: v })
+                          }
+                        />
+                      </label>
                     </div>
 
                     <div className="detect-grp">
@@ -7323,11 +8901,37 @@ function App() {
                           }
                         />
                       </label>
+                      <label
+                        className="loc-field"
+                        title="Bottom-camera exposure used ONLY during nozzle-tip runout calibration, then restored. The shiny tip wants a different exposure than dark parts — set the part-friendly exposure on the camera itself and put the runout-friendly value here. Negative values are normal (UVC exposure is a log scale). The checkbox turns the switch on/off."
+                      >
+                        <span>Runout cal exposure</span>
+                        <span className="cal-exp-row">
+                          <input
+                            type="checkbox"
+                            checked={bottomVision.calExposureEnabled ?? false}
+                            onChange={(e) =>
+                              updateBottomVision({
+                                calExposureEnabled: e.currentTarget.checked,
+                              })
+                            }
+                          />
+                          <NumberInput
+                            step={1}
+                            value={bottomVision.calExposure ?? 0}
+                            onChange={(v) =>
+                              updateBottomVision({ calExposure: v })
+                            }
+                          />
+                        </span>
+                      </label>
                     </div>
                     <div className="muted" style={{ marginTop: 6 }}>
                       Pre-rotate images the part at its final angle so residual
                       nozzle runout is measured out. Multi-pass re-centers the
-                      part until offsets fall under these thresholds.
+                      part until offsets fall under these thresholds. Runout cal
+                      exposure switches the bottom camera to that exposure only
+                      while calibrating the tip, so part vision keeps its own.
                     </div>
                   </div>
                 </>

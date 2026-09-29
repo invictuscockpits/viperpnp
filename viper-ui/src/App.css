@@ -86,6 +86,29 @@ body {
   gap: 2px;
 }
 
+/* Press feedback: every button dips + brightens briefly on click so a tap
+   visibly registers (the app had hover states but no active state). The
+   :active:not(:disabled) selector outranks per-class rules, and no button
+   uses transform elsewhere, so nothing collides. */
+button {
+  transition: transform 0.07s ease, filter 0.07s ease;
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.96);
+  filter: brightness(1.15);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button {
+    transition: none;
+  }
+  button:active:not(:disabled) {
+    transform: none;
+    filter: brightness(1.15);
+  }
+}
+
 .nav-item {
   text-align: left;
   background: none;
@@ -167,6 +190,10 @@ body {
   flex-direction: column;
   padding: 1rem 0.9rem 1.4rem;
   gap: 1rem;
+  /* Stay above the modal backdrop (z-index 50) so jog/connect/home remain usable
+     while a teach popup is open — you need to position the camera to reference. */
+  position: relative;
+  z-index: 60;
 }
 
 .control-panel .brand {
@@ -532,6 +559,44 @@ body {
   width: 50px;
   padding: 5px 0;
   text-align: center;
+}
+
+.jog-mode {
+  width: 50px;
+  padding: 4px 0;
+  margin-top: 2px;
+  text-align: center;
+  font-size: 0.6rem;
+  letter-spacing: 0.02em;
+}
+
+.jog-mode.cont {
+  background: #16261c;
+  color: #a8e0bc;
+  border-color: #2f5a3d;
+}
+
+.jog-tune {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 5px;
+  width: 5rem;
+}
+
+.jog-tune label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.jog-tune .num-input > input {
+  padding: 0.25rem 1rem 0.25rem 0.35rem;
+  font-size: 0.72rem;
 }
 
 .speed-vert {
@@ -1690,6 +1755,143 @@ input[type="number"] {
   margin-top: 0.5rem;
 }
 
+.mpb-launch {
+  margin-top: 0.6rem;
+}
+
+.mpb-hint {
+  font-size: 0.78rem;
+  margin: 0.2rem 0 0.4rem;
+}
+
+.mpb-picklist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 12rem;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.35rem 0.5rem;
+  background: var(--panel-2);
+}
+
+.mpb-pick {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.mpb-pick-id {
+  min-width: 4rem;
+}
+
+.mpb-pick-xy {
+  font-size: 0.74rem;
+}
+
+.mpb-step {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-top: 0.2rem;
+}
+
+.mpb-progress {
+  font-size: 0.76rem;
+  margin-top: 0.35rem;
+}
+
+.cam-zoomable {
+  cursor: zoom-in;
+}
+
+.cam-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+
+.cam-lightbox-img {
+  max-width: 94vw;
+  max-height: 94vh;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+/* Enlarged sidebar camera pane — same composite as the small cell (feed +
+   vision overlay + rotating reticle), sized to the screen. */
+.camera-view-zoom {
+  width: min(94vw, calc(94vh * 4 / 3));
+  cursor: zoom-out;
+}
+
+.camera-view-zoom .reticle {
+  stroke-width: 0.9;
+}
+
+.skip-reason {
+  font-size: 0.76rem;
+  color: #f0dca8;
+  margin: 1px 0 3px 1.1rem;
+}
+
+.pick-hold-chk {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.vac-cal {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.vac-head {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.vac-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.vac-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.vac-field .num-input {
+  width: 5rem;
+}
+
+.vac-readout {
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  color: var(--text);
+}
+
 /* ---- Integrated Jobs page ---- */
 .jobs-toolbar {
   display: flex;
@@ -1754,6 +1956,39 @@ input[type="number"] {
   padding: 0.25rem 0.5rem;
   font-size: 0.8rem;
   width: 12rem;
+}
+
+.list-search {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--muted);
+  margin: 0 0 0.6rem;
+}
+
+.list-search .plc-search-input {
+  width: 18rem;
+  max-width: 100%;
+}
+
+
+.list-search-clear {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 1.1rem;
+  line-height: 1;
+  padding: 0 0.2rem;
+}
+
+.list-search-clear:hover {
+  color: var(--text);
+}
+
+.list-nomatch {
+  text-align: center;
+  padding: 0.8rem;
 }
 
 .plc-scroll {
@@ -1845,6 +2080,11 @@ input[type="number"] {
 .plc-status.status-no-height {
   background: #2a2417;
   color: #f0dca8;
+}
+
+.plc-status.status-no-feeder {
+  background: #341a1a;
+  color: #f0a8a8;
 }
 
 .detect-grp {
@@ -2415,3 +2655,29 @@ input[type="number"] {
 .log-line.log-warning { color: #e9c46a; }
 .log-line.log-error { color: #ff6b6b; }
 .log-line.log-debug, .log-line.log-trace { color: #7d8792; }
+
+/* Clickable feeder name/type cells open the edit modal */
+.feeder-click { cursor: pointer; }
+.feeder-click:hover { text-decoration: underline; color: var(--accent, #05AA3D); }
+
+/* Tool changer card + wizard */
+.tc-list { display: flex; flex-direction: column; gap: 6px; }
+.tc-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 10px; border: 1px solid var(--border, #2a2f37); border-radius: 7px;
+}
+.tc-name { flex: 1 1 auto; }
+.tc-actions { display: flex; gap: 6px; }
+.tc-steps { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.tc-pill {
+  font-size: 12px; padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--border, #2a2f37); color: var(--muted, #8a949e);
+}
+.tc-pill.done { border-color: color-mix(in srgb, #05AA3D 45%, transparent); color: #05AA3D; }
+.tc-pill.active { background: #05AA3D; border-color: #05AA3D; color: #06210f; font-weight: 600; }
+
+.cal-exp-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
