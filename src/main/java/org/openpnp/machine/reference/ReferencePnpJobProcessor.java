@@ -164,6 +164,14 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
     
     protected List<JobPlacement> jobPlacements = new ArrayList<>();
 
+    /**
+     * The per-placement results of the last run (status + error), so a headless
+     * client can report WHY each unplaced placement was skipped.
+     */
+    public List<JobPlacement> getJobPlacementResults() {
+        return jobPlacements;
+    }
+
     private Step currentStep = null;
 
     // This remembers the location of the first feeder in the first TSM plan of a cycle. It is used

@@ -292,6 +292,12 @@ public class Job extends AbstractModelObject implements PropertyChangeListener {
     public void storePlacedStatus(PlacementsHolderLocation<?> placementsHolderLocation, String placementId, boolean placed) {
         String key = placementsHolderLocation.getUniqueId() + PlacementsHolderLocation.ID_DELIMITTER + placementId;
         this.placedStatusMap.put(key, placed);
+        // Mark the job dirty so headless saves persist the placed status. In the
+        // Swing GUI the JobPanel does this via the property-change listener, but
+        // headless (ViperPNP) nothing listens — without this, placed flags only
+        // ever reached disk when an unrelated edit happened to dirty the job,
+        // and a backend restart lost the run's placed record (double-place risk).
+        setDirty(true);
         firePropertyChange("placed", null, this.placedStatusMap);
     }
 
