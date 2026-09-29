@@ -681,10 +681,15 @@ public class ReferenceNozzleTipCalibration extends AbstractModelObject {
         if (cbo!=null) {
             cbo.startBatchOperation("nozzle");
         }
+        // ViperPNP: switch the bottom camera to the dedicated calibration
+        // exposure for the duration (restored in the finally). This covers every
+        // calibration path, including the job processor's mid-job recalibration.
+        int[] expToken = org.openpnp.viper.ViperServer.beginCalExposure();
         try {
             calibrateInBatch(nozzle,homing,calibrateCamera);
         }
         finally {
+            org.openpnp.viper.ViperServer.endCalExposure(expToken);
             if (cbo!=null) {
                 cbo.endBatchOperation("nozzle");
             }

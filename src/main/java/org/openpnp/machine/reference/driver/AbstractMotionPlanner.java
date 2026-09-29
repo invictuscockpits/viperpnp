@@ -784,8 +784,9 @@ public abstract class AbstractMotionPlanner extends AbstractModelObject implemen
                             if (silent) {
                                 return null;    
                             }
-                            throw new Exception(String.format("Can't move %s to %s, lower than soft limit %s.",
-                                    refAxis.getName(), coordinate, limit));
+                            throw new Exception(String.format("Can't move %s to %s, lower than soft limit %s (moving %s).",
+                                    refAxis.getName(), coordinate, limit,
+                                    hm != null ? hm.getName() : "machine"));
                         }
                     }
                     if (refAxis.isSoftLimitHighEnabled()) {
@@ -796,8 +797,9 @@ public abstract class AbstractMotionPlanner extends AbstractModelObject implemen
                             if (silent) {
                                 return null;    
                             }
-                            throw new Exception(String.format("Can't move %s to %s, higher than soft limit %s.",
-                                    refAxis.getName(), coordinate, limit));
+                            throw new Exception(String.format("Can't move %s to %s, higher than soft limit %s (moving %s).",
+                                    refAxis.getName(), coordinate, limit,
+                                    hm != null ? hm.getName() : "machine"));
                         }
                     }
                 }
