@@ -6145,6 +6145,7 @@ public class ViperServer {
             }
             j.setDirty(true);
             savePlacedProgress(j);
+            lastRunErrors.keySet().removeIf(k -> k.startsWith(bl.getUniqueId() + "|"));
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("ok", true);
             m.put("cleared", n);
@@ -6209,6 +6210,7 @@ public class ViperServer {
             jobProcessor = jp;
             jobAbortRequested = false;
             jobRunning = true;
+            lastRunErrors.clear();
             broadcast(GSON.toJson(jobEvent("jobStarted", "Job started", null, false)));
             machine.submit(() -> {
                 String error = null;
@@ -6217,6 +6219,7 @@ public class ViperServer {
                         // next() advances one step and drives its own motion.
                         // Persist placed-status as soon as a step records it.
                         savePlacedProgress(job);
+                        broadcastCurrentPlacements();
                     }
                 }
                 catch (Exception e) {
@@ -6228,6 +6231,7 @@ public class ViperServer {
                     jp.removeTextStatusListener(tsl);
                     broadcast(GSON.toJson(jobEvent("jobComplete", "Job complete",
                             collectSkipped(job), jobAbortRequested)));
+                    clearCurrentPlacements();
                 }
                 if (error != null) {
                     broadcast(GSON.toJson(errorMap(new Exception(error))));
@@ -6272,6 +6276,7 @@ public class ViperServer {
                 jobProcessor = jp;
                 jobAbortRequested = false;
                 jobStepping = true;
+                lastRunErrors.clear();
                 broadcast(GSON.toJson(jobEvent("jobStarted", "Stepping", null, false)));
             }
             machine.submit(() -> {
@@ -6284,6 +6289,7 @@ public class ViperServer {
                     broadcast(GSON.toJson(errorMap(e)));
                 }
                 savePlacedProgress(job);
+                broadcastCurrentPlacements();
                 if (!more) {
                     endStepping(job);
                 }
@@ -6306,6 +6312,7 @@ public class ViperServer {
         jobStepListener = null;
         broadcast(GSON.toJson(jobEvent("jobComplete", "Job complete",
                 collectSkipped(job), jobAbortRequested)));
+        clearCurrentPlacements();
     }
 
     /** POST /api/job/abort — requests a graceful abort of the running (or stepping) job. */
@@ -6346,6 +6353,51 @@ public class ViperServer {
         return m;
     }
 
+    /** Last run's per-placement failures: boardLocationUid|placementId -> reason. */
+    private static final Map<String, String> lastRunErrors =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** De-dupe for jobCurrent broadcasts. */
+    private static volatile String lastCurrentJson = "";
+
+    /** Broadcast which placements the processor is working on right now. */
+    private static void broadcastCurrentPlacements() {
+        try {
+            if (!(jobProcessor instanceof ReferencePnpJobProcessor)) {
+                return;
+            }
+            List<Map<String, Object>> items = new ArrayList<>();
+            for (PnpJobProcessor.JobPlacement p
+                    : ((ReferencePnpJobProcessor) jobProcessor).getJobPlacementResults()) {
+                if (p.getStatus() == PnpJobProcessor.JobPlacement.Status.Processing) {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("uid", p.getBoardLocation().getUniqueId());
+                    m.put("id", p.getPlacement().getId());
+                    items.add(m);
+                }
+            }
+            Map<String, Object> ev = new LinkedHashMap<>();
+            ev.put("event", "jobCurrent");
+            ev.put("items", items);
+            String json = GSON.toJson(ev);
+            if (!json.equals(lastCurrentJson)) {
+                lastCurrentJson = json;
+                broadcast(json);
+            }
+        }
+        catch (Exception ignore) {
+            // progress decoration only — never let it break the run
+        }
+    }
+
+    /** Broadcast an empty jobCurrent (no placement in flight). */
+    private static void clearCurrentPlacements() {
+        lastCurrentJson = "";
+        Map<String, Object> ev = new LinkedHashMap<>();
+        ev.put("event", "jobCurrent");
+        ev.put("items", new ArrayList<>());
+        broadcast(GSON.toJson(ev));
+    }
+
     /**
      * Enabled placements (type Placement) that did not end up placed — i.e. the
      * ones skipped during the run (feeder faults, alignment failures, etc.).
@@ -6365,12 +6417,14 @@ public class ViperServer {
                         Exception err = jp.getError();
                         reason = err != null && err.getMessage() != null
                                 ? err.getMessage() : "errored (no detail)";
+                        lastRunErrors.put(key, reason);
                     }
                     else if (jp.getStatus() == PnpJobProcessor.JobPlacement.Status.Pending) {
                         reason = "never attempted — job ended (or was aborted) first";
                     }
                     else if (jp.getStatus() == PnpJobProcessor.JobPlacement.Status.Processing) {
                         reason = "interrupted mid-placement";
+                        lastRunErrors.put(key, reason);
                     }
                     if (reason != null) {
                         reasons.put(key, reason);
@@ -6994,7 +7048,15 @@ public class ViperServer {
             Map<String, Object> pm = placementMap(p);
             boolean placed = j.retrievePlacedStatus(bl, p.getId());
             pm.put("placed", placed);
-            pm.put("status", placementStatus(p, placed, fiducialIds));
+            String status = placementStatus(p, placed, fiducialIds);
+            if (!placed && p.isEnabled()) {
+                String lastErr = lastRunErrors.get(bl.getUniqueId() + "|" + p.getId());
+                if (lastErr != null) {
+                    status = "Error";
+                    pm.put("lastError", lastErr);
+                }
+            }
+            pm.put("status", status);
             placements.add(pm);
         }
         Map<String, Object> root = new LinkedHashMap<>();

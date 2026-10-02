@@ -2087,6 +2087,23 @@ input[type="number"] {
   color: #f0a8a8;
 }
 
+.plc-status.status-error {
+  background: #3a1620;
+  color: #ff9cab;
+  cursor: help;
+}
+
+/* The placement the job processor is working on right now. */
+tr.plc-current {
+  background: var(--green-dim);
+  box-shadow: inset 3px 0 0 var(--green);
+}
+
+tr.plc-current td:nth-child(2) {
+  font-weight: 700;
+  color: var(--green);
+}
+
 .detect-grp {
   border-left: 2px solid var(--border);
   padding-left: 0.7rem;

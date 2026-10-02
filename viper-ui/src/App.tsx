@@ -157,6 +157,8 @@ interface JobPlacement extends Placement {
   placed?: boolean;
   status?: string;
   comments?: string;
+  /** Why this placement failed or was interrupted during the last run. */
+  lastError?: string;
 }
 
 interface JobBoardLoc {
@@ -886,6 +888,8 @@ function App() {
   const [jobBoardsRefresh, setJobBoardsRefresh] = useState(0);
   const [selectedBoardUid, setSelectedBoardUid] = useState<string | null>(null);
   const [jobBoardPlc, setJobBoardPlc] = useState<JobPlacement[]>([]);
+  // "uid|placementId" keys for the placements the processor is working on now.
+  const [jobCurrent, setJobCurrent] = useState<Set<string>>(new Set());
   const [plcSearch, setPlcSearch] = useState("");
   const [plcRefresh, setPlcRefresh] = useState(0);
   const [plcMenu, setPlcMenu] = useState<{
@@ -2576,10 +2580,19 @@ function App() {
                 `re-run Auto-locate or recalibrate.`,
             );
           }
+        } else if (data && data.event === "jobCurrent") {
+          setJobCurrent(
+            new Set(
+              ((data.items ?? []) as { uid: string; id: string }[]).map(
+                (i) => `${i.uid}|${i.id}`,
+              ),
+            ),
+          );
         } else if (data && data.event === "jobComplete") {
           setJobStatus(data.aborted ? "Job aborted" : "Job complete");
           setJobSkipped(data.skipped ?? []);
           setJobAborted(!!data.aborted);
+          setJobCurrent(new Set());
           syncJobState();
           loadJobs();
           setPlcRefresh((n) => n + 1);
@@ -5302,6 +5315,11 @@ function App() {
                         {filteredJobPlc.map((p) => (
                             <tr
                               key={p.id}
+                              className={
+                                jobCurrent.has(`${selectedBoardUid}|${p.id}`)
+                                  ? "plc-current"
+                                  : undefined
+                              }
                               onContextMenu={(e) => {
                                 e.preventDefault();
                                 setPlcMenu({
@@ -5396,6 +5414,7 @@ function App() {
                                   )
                                     .toLowerCase()
                                     .replace(/ /g, "-")}`}
+                                  title={p.lastError ?? undefined}
                                 >
                                   {p.status}
                                 </span>
