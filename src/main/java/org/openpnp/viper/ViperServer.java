@@ -2194,8 +2194,10 @@ public class ViperServer {
             Future<Double> f = machine.submit(() -> {
                 if (pulse && rn.getVacuumActuator() != null) {
                     // Bare-nozzle reference: pull vacuum, settle, read, release.
+                    // 400 ms reads noticeably low before the level stabilizes
+                    // (hard-learned); match the longest pick dwell instead.
                     rn.getVacuumActuator().actuate(true);
-                    Thread.sleep(400);
+                    Thread.sleep(2000);
                     double lv = rn.readVacuumLevel();
                     rn.getVacuumActuator().actuate(false);
                     return lv;
