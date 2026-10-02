@@ -4753,6 +4753,17 @@ function App() {
                         : "banner-ok"
                     }`}
                   >
+                    <button
+                      className="icon-btn"
+                      onClick={() => {
+                        setJobSkipped(null);
+                        setJobStatus("");
+                      }}
+                      title="Dismiss report"
+                      style={{ float: "right", marginLeft: 8 }}
+                    >
+                      ✕
+                    </button>
                     {jobAborted
                       ? "Job aborted. "
                       : jobSkipped.length === 0
