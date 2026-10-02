@@ -2992,8 +2992,9 @@ public class ViperServer {
                 if (nozzle.isPartOnEnabled(Nozzle.PartOnStep.AfterPick)) {
                     if (!nozzle.isPartOn()) {
                         throw new Exception("No part detected on the nozzle after pick "
-                                + "(vacuum check). The pocket may be empty or the pick "
-                                + "Z/location off.");
+                                + "(vacuum check): " + part.getId() + " from "
+                                + feeder.getName() + " on nozzle " + nozzle.getName()
+                                + ". The pocket may be empty or the pick Z/location off.");
                     }
                 }
                 Map<String, Object> ev = new LinkedHashMap<>();
