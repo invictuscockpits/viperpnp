@@ -7550,6 +7550,8 @@ public class ViperServer {
             }
             if (req.enabled != null) {
                 f.setEnabled(req.enabled);
+                // A manual enable/disable supersedes any auto-disable record.
+                ReferencePnpJobProcessor.AUTO_DISABLED_FEEDERS.remove(f.getId());
                 // Re-enabling a feeder whose part counter reads empty means the
                 // user physically reloaded it — reset the counter too. Otherwise
                 // the first feed throws "tray empty" and the job processor
@@ -8124,6 +8126,21 @@ public class ViperServer {
             }
             recovered.add(shortUuid(pf.getHardwareId()) + "@" + claimed);
         }
+        // A feeder the job processor auto-disabled after a feed failure is
+        // trustworthy again once the scan confirms it on the bus — re-enable
+        // it so the user doesn't have to. User-disabled feeders are untouched.
+        List<String> reEnabled = new ArrayList<>();
+        for (Feeder f : machine.getFeeders()) {
+            if (!(f instanceof PhotonFeeder)) {
+                continue;
+            }
+            PhotonFeeder pf = (PhotonFeeder) f;
+            if (!pf.isEnabled() && pf.getSlotAddress() != null
+                    && ReferencePnpJobProcessor.AUTO_DISABLED_FEEDERS.remove(pf.getId())) {
+                pf.setEnabled(true);
+                reEnabled.add(pf.getName() + "@" + pf.getSlotAddress());
+            }
+        }
         // Default presentation: automatic feeders in slot order.
         sortFeedersBySlot();
         Map<String, Object> ev = new LinkedHashMap<>();
@@ -8133,6 +8150,7 @@ public class ViperServer {
         ev.put("unresponsive", unresponsive);
         ev.put("recovered", recovered);
         ev.put("conflicts", conflicts);
+        ev.put("reEnabled", reEnabled);
         broadcast(GSON.toJson(ev));
     }
 

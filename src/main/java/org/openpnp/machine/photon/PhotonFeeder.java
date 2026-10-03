@@ -312,11 +312,20 @@ public class PhotonFeeder extends ReferenceFeeder {
     }
 
     private void feedForwardTenths(Nozzle nozzle, int distanceTenths) throws Exception {
+        String lastProblem = null;
         for (int i = 0; i <= photonProperties.getFeederCommunicationMaxRetry(); i++) {
+            if (i > 0) {
+                // Transient bus noise (motion in progress, feeder rebooting)
+                // usually clears within a moment. Without this backoff every
+                // retry fires in one burst and a single bad moment on the
+                // RS-485 bus exhausts them all.
+                Thread.sleep(250L * i);
+            }
             findSlotAddressIfNeeded();
             initializeIfNeeded();
 
             if (!initialized) {
+                lastProblem = "Feeder did not answer on the bus (find/initialize failed).";
                 continue;
             }
 
@@ -326,9 +335,11 @@ public class PhotonFeeder extends ReferenceFeeder {
             MoveFeedForward.Response moveFeedForwardResponse = moveFeedForward.send(photonBus);
 
             if (moveFeedForwardResponse == null) {
+                // Comms timeout, not a mechanical fault — re-find and retry.
                 slotAddress = null;
                 initialized = false;
-                throw new FeedFailureException("Feed command timed out");
+                lastProblem = "Feed command timed out.";
+                continue;
             } else if (moveFeedForwardResponse.error == ErrorTypes.UNINITIALIZED_FEEDER) {
                 slotAddress = null;
                 initialized = false;
@@ -357,14 +368,21 @@ public class PhotonFeeder extends ReferenceFeeder {
                 if (moveFeedStatusResponse.error == ErrorTypes.NONE) {
                     return;
                 } else if (moveFeedStatusResponse.error == ErrorTypes.COULD_NOT_REACH) {
+                    // The feeder answered and its motor could not complete the
+                    // move — a real mechanical fault, retrying won't help.
                     throw new FeedFailureException("Feeder could not reach its destination.");
                 }
             }
 
-            throw new FeedFailureException("Feeder timed out when we requested a feed status update.");
+            // Status never came back — treat as comms, re-find and retry.
+            slotAddress = null;
+            initialized = false;
+            lastProblem = "Feeder timed out when we requested a feed status update.";
         }
 
-        throw new FeedFailureException("Failed to feed for an unknown reason. Is the feeder inserted?");
+        throw new FeedFailureException(lastProblem != null
+                ? lastProblem + " Retries exhausted — check the feeder's slot contacts."
+                : "Failed to feed for an unknown reason. Is the feeder inserted?");
     }
 
     /**

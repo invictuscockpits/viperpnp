@@ -81,6 +81,14 @@ import org.simpleframework.xml.Root;
 
 @Root
 public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
+    /**
+     * Ids of feeders this processor auto-disabled after a feed failure, as
+     * opposed to feeders the user disabled on purpose. A bus scan that finds
+     * one of these again may re-enable it without overriding user intent.
+     */
+    public static final java.util.Set<String> AUTO_DISABLED_FEEDERS =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     interface Step {
         public Step step() throws JobProcessorException;
     }
@@ -1454,6 +1462,9 @@ public class ReferencePnpJobProcessor extends AbstractPnpJobProcessor {
             }
             Logger.info("{} disabled due to feed error {}",feeder,lastException);
             feeder.setEnabled(false);
+            // Remember that WE disabled it (vs. the user), so a later bus scan
+            // that finds the feeder again may safely re-enable it.
+            AUTO_DISABLED_FEEDERS.add(feeder.getId());
             throw new JobProcessorException(feeder, lastException);
         }
         
